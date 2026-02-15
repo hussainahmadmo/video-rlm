@@ -7,6 +7,85 @@ from clip_encoder import Clip
 from env import VideoEnv
 
 
+class JsonToolLLM:
+    """
+    Stub interface: swap implementation with vLLM/OpenAI client.
+    Must return a single dict tool-call, e.g.:
+      {"tool":"search_segments","query":"...","top_k":3}
+    """
+    def __init__(self, client=None, model: str = ""):
+        self.client = client
+        self.model = model
+
+    def decide(self, prompt: Dict[str, Any]) -> Dict[str, Any]:
+        # ---- Replace this stub with real model call ----
+        # For now, raise to make sure you don't think it's "LLM driven" when it isn't.
+        raise NotImplementedError("Wire this to vLLM/OpenAI. Must return JSON tool call.")
+
+def compact_slice(cs_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep evidence compact so the LLM doesn't drown."""
+    out = {"tool": cs_dict.get("tool")}
+    if "window" in cs_dict: out["window"] = cs_dict["window"]
+    if "stats" in cs_dict: out["stats"] = cs_dict["stats"]
+
+    ev = cs_dict.get("evidence", []) or []
+    # keep only top few items
+    out["evidence"] = ev[:5]
+    return out
+
+
+def run_llm_controller(env, llm: JsonToolLLM, query: str, max_iters: int = 6) -> List[Dict[str, Any]]:
+    memory: List[Dict[str, Any]] = []
+
+    TOOL_SCHEMA = {
+        "search_segments": ["tool", "query", "top_k"],
+        "refine_in_segment": ["tool", "query", "seg_idx", "dense_fps", "window_s"],
+        "inspect_window": ["tool", "query", "t0", "t1", "fps", "top_m"],
+        "summarize_answer": ["tool", "answer"],
+    }
+
+    for it in range(max_iters):
+        prompt = {
+            "system": (
+                "You are a video controller. Output ONLY a single JSON object.\n"
+                "Pick exactly ONE tool call.\n"
+                "Use only seg_idx/timestamps that appear in memory evidence.\n"
+                "If enough evidence exists, call summarize_answer."
+            ),
+            "goal": query,
+            "available_tools": list(TOOL_SCHEMA.keys()),
+            "memory": memory[-4:],  # keep last few steps
+        }
+
+        print("\n" + "=" * 90)
+        print(f"ITER {it} - LLM INPUT")
+        print(json.dumps(prompt, indent=2))
+
+        tool_call = llm.decide(prompt)
+
+        print(f"\nITER {it} - LLM OUTPUT (tool call)")
+        print(json.dumps(tool_call, indent=2))
+
+        if not isinstance(tool_call, dict) or "tool" not in tool_call:
+            raise ValueError(f"LLM output must be dict with 'tool'. Got: {tool_call}")
+
+        # Execute
+        cs = env.act(tool_call)
+        cs_dict = env.context_to_dict(cs)
+
+        print(f"\nITER {it} - ENV OUTPUT (evidence)")
+        print(json.dumps(cs_dict, indent=2))
+
+        memory.append(compact_slice(cs_dict))
+
+        if tool_call["tool"] == "summarize_answer":
+            break
+
+    print("\n=== TOOL TRACE (env.trace) ===")
+    print(json.dumps(env.trace, indent=2))
+
+    return memory
+
 def minimal_video_rlm(video_path: str, query: str):
     clip = Clip()
     env = VideoEnv(video_path, clip, seg_len_s=60.0, base_fps=1.0)
@@ -14,114 +93,10 @@ def minimal_video_rlm(video_path: str, query: str):
     print("Building index (1 FPS CLIP + motion)...")
     env.build_index()
 
-    # -------------------------
-    # Step 1: coarse search (TOOL)
-    # -------------------------
-    top_k = 3
-    cs1 = env.act({"tool": "search_segments", "query": query, "top_k": top_k})
+    llm = JsonToolLLM(client=None, model="")  # <-- wire real vLLM client here
+    memory = run_llm_controller(env, llm, query=query, max_iters=6)
+    return memory
 
-    print("\n[ContextSlice] search_segments")
-    print(env.context_to_dict(cs1))  # JSON-serializable
-
-    # pick best seg from evidence note (or parse from your SearchResult if you prefer)
-    # easiest: call search_segments directly only to get seg_idx OR change act() to also return seg_idx list.
-    # BUT since you already have env.trace + evidence notes, we can parse seg idx from the first evidence note:
-    if not cs1.evidence:
-        print("\nNo segments returned. Exiting.")
-        return None, None
-
-    # note looks like: "seg=3, window=[60.00,120.00]"
-    best_note = cs1.evidence[0].note
-    best_seg_idx = int(best_note.split("seg=")[1].split(",")[0])
-
-    # -------------------------
-    # Step 2: refine best segment (TOOL)
-    # -------------------------
-    cs2 = env.act({
-        "tool": "refine_in_segment",
-        "query": query,
-        "seg_idx": best_seg_idx,
-        "dense_fps": 8.0,
-        "window_s": 2.0,
-    })
-
-    print("\n[ContextSlice] refine_in_segment")
-    print(env.context_to_dict(cs2))
-
-
-    # Step 3: hypothesis-driven S1 inspection (adaptive FPS + zoom)
-    # -------------------------
-    if cs2.evidence:
-        t0 = cs2.window.get("t0")
-        t1 = cs2.window.get("t1")
-
-        if t0 is not None and t1 is not None:
-            # Guard: avoid empty/degenerate windows
-            if t1 <= t0:
-                # expand to a small valid window
-                t0 = max(0.0, float(t0) - 1.0)
-                t1 = min(env.duration, float(t0) + 2.0)
-
-            hypothesis = "S1"                 # microevent regime
-            fps_schedule = [4.0, 16.0, 24.0]  # escalate if uncertain
-            sharpness_tau = 0.03              # tune: max-mean threshold
-            zoom_s = 1.0                      # zoom window size around best evidence
-
-            def sharpness(stats: Dict[str, Any]) -> float:
-                ss = stats.get("score_stats")
-                if not ss:
-                    return -1e9
-                return float(ss["max"] - ss["mean"])
-
-            best = None
-            best_sharp = -1e9
-
-            for fps in fps_schedule:
-                cs3 = env.act({
-                    "tool": "inspect_window",
-                    "query": query,
-                    "t0": t0,
-                    "t1": t1,
-                    "fps": fps,
-                    "top_m": 5,
-                })
-                d3 = env.context_to_dict(cs3)
-
-                print(f"\n[ContextSlice] inspect_window @ fps={fps}")
-                print(d3)
-
-                sh = sharpness(d3["stats"])
-                if sh > best_sharp:
-                    best_sharp = sh
-                    best = d3
-
-                # Stop early if we have a sharp peak (microevent-like evidence)
-                if hypothesis == "S1" and sh >= sharpness_tau and d3["stats"]["n_samples"] > 0:
-                    # Zoom around the top evidence time and re-inspect once
-                    if d3["evidence"]:
-                        t_star = float(d3["evidence"][0]["t"])
-                        z0 = max(0.0, t_star - zoom_s / 2)
-                        z1 = min(env.duration, t_star + zoom_s / 2)
-
-                        cs4 = env.act({
-                            "tool": "inspect_window",
-                            "query": query,
-                            "t0": z0,
-                            "t1": z1,
-                            "fps": max(16.0, fps),
-                            "top_m": 5,
-                        })
-                        print(f"\n[ContextSlice] zoom_inspect @ [{z0:.2f},{z1:.2f}] fps={max(16.0,fps)}")
-                        print(env.context_to_dict(cs4))
-                    break
-
-    # -------------------------
-    # Verify tool usage: env.trace
-    # -------------------------
-    print("\n=== TOOL TRACE ===")
-    print(json.dumps(env.trace, indent=2))
-
-    return cs1, cs2
 
 
 if __name__ == "__main__":
