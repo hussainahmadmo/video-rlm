@@ -39,6 +39,7 @@ class Node:
     depth: int
     memory: List[Dict[str, Any]]
     tried: set = field(default_factory=set)
+    plan: Optional[TaxonomyPlan] = None
 
     branch_score: float = float("-inf")
     chosen_seg: Optional[int] = None
@@ -228,6 +229,7 @@ def dfs_backtracking_controller(
             allowed_tools=["search_segments", "refine_in_segment", "inspect_window"],
             tool_schema=TOOL_SCHEMA,
             temperature=0.0,
+            taxonomy_plan=node.plan
         )
 
         node.hypothesis = j.get("hypothesis", "")
@@ -338,9 +340,53 @@ def dfs_backtracking_controller(
 
     return None
 
+from dataclasses import dataclass
+from typing import Literal, Optional
+
+Tax = Literal["S1","S2","S3","S4","S5"]
+
+@dataclass
+class TaxonomyPlan:
+    tax: Tax
+    intent: str
+    # knobs your controller will enforce
+    coarse_top_k: int = 3
+    refine_dense_fps: float = 30.0
+    refine_window_s: float = 5.0
+    inspect_fps: float = 30.0
+    # extra policy
+    require_before_after: bool = False   # S5
+    require_lookback: bool = False       # S3
+    require_multiple_windows: bool = False  # S4/S5
+
+
+def classify_query_to_taxonomy(q: str) -> TaxonomyPlan:
+    ql = q.lower()
+
+    # S5: ordering/contrast
+    if any(x in ql for x in ["before", "after", "change", "difference", "compared", "when did", "first", "then"]):
+        return TaxonomyPlan(tax="S5", intent="temporal ordering/contrast", require_before_after=True, require_multiple_windows=True)
+
+    # S3: delayed relevance / why/how
+    if any(x in ql for x in ["why", "how did", "how was", "what caused", "explain", "enable"]):
+        return TaxonomyPlan(tax="S3", intent="delayed causal evidence", require_lookback=True, coarse_top_k=6)
+
+    # S2: microevents/transient
+    if any(x in ql for x in ["press", "tap", "hit", "strike", "flip", "turn", "flick", "exact moment"]):
+        return TaxonomyPlan(tax="S2", intent="microevent/transient", refine_dense_fps=30.0, refine_window_s=2.0, inspect_fps=30.0)
+
+    # S4: distributed evidence / counts / repeated actions
+    if any(x in ql for x in ["how many", "every time", "repeated", "pattern", "throughout", "all the times"]):
+        return TaxonomyPlan(tax="S4", intent="distributed evidence across time", coarse_top_k=6, require_multiple_windows=True)
+
+    # default S1: fine-grained attribute/binding
+    return TaxonomyPlan(tax="S1", intent="fine-grained attribute/binding", refine_dense_fps=30.0, refine_window_s=5.0, inspect_fps=30.0)
+
 
 def run_recursive_controller(env: VideoEnv, llm: VLLMJsonToolLLM, query: str) -> str:
     root = Node(depth=0, memory=[])
+    plan = classify_query_to_taxonomy(query)
+
     ans = dfs_backtracking_controller(env, llm, query, root)
     if ans is None:
         # last resort: summarize what we have (or return unsure)
