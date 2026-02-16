@@ -178,6 +178,9 @@ def _validate_tool_call(
     if tool == "refine_in_segment":
         if not isinstance(call["window_s"], (int, float)):
             raise ValueError(f"refine_in_segment.window_s must be number. Got: {call}")
+        if not isinstance(call["dense_fps"], (int, float)):
+            raise ValueError(f"refine_in_segment.dense_fps must be number. Got: {call}")
+        
 
     if tool == "inspect_window":
         for k in ("t0", "t1", "fps", "top_m"):
@@ -434,6 +437,14 @@ class VLLMJsonToolLLM:
             "  (B) request backtrack if evidence is insufficient or contradictory\n"
             "Stop only when convinced.\n"
             "Output ONLY valid JSON.\n"
+            "IMPORTANT TOOL RULES (do not violate):\n"
+            "- refine_in_segment parameters:\n"
+            "    * seg_idx: int\n"
+            "    * dense_fps: float\n"
+            "    * window_s: float DURATION IN SECONDS (e.g., 1.0, 2.0, 5.0). NOT a [t0,t1] list.\n"
+            "- inspect_window parameters:\n"
+            "    * t0,t1: floats ABSOLUTE TIMES in seconds from video start. Use this when you want a [start,end] window.\n"
+            "- Never output window_s as a list. If you have a time range [t0,t1], you must call inspect_window instead.\n"
         )
 
         user_payload = {
