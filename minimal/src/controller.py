@@ -39,7 +39,7 @@ class Node:
     depth: int
     memory: List[Dict[str, Any]]
     tried: set = field(default_factory=set)
-    plan: Optional[TaxonomyPlan] = None
+    plan: Optional["TaxonomyPlan"] = None  # forward reference avoids ordering issues
 
     branch_score: float = float("-inf")
     chosen_seg: Optional[int] = None
@@ -314,6 +314,7 @@ def dfs_backtracking_controller(
             allowed_tools=["search_segments", "refine_in_segment", "inspect_window"],
             tool_schema=TOOL_SCHEMA,
             temperature=0.0,
+            taxonomy_plan=child.plan
         )
         child.hypothesis = j2.get("hypothesis", "")
         child.critique = j2.get("critique", "")
@@ -384,9 +385,8 @@ def classify_query_to_taxonomy(q: str) -> TaxonomyPlan:
 
 
 def run_recursive_controller(env: VideoEnv, llm: VLLMJsonToolLLM, query: str) -> str:
-    root = Node(depth=0, memory=[])
-    plan = classify_query_to_taxonomy(query)
-
+    plan = classify_query_to_taxonomy(query)  # classify query into S1–S5 and set policy knobs (fps/window/top_k)
+    root = Node(depth=0, memory=[], plan=plan)  # store the plan on the root so the judge/controller can use it
     ans = dfs_backtracking_controller(env, llm, query, root)
     if ans is None:
         # last resort: summarize what we have (or return unsure)
@@ -466,6 +466,8 @@ class VLLMJsonToolLLM:
         allowed_tools: List[str],
         tool_schema: Dict[str, List[str]],
         temperature: float = 0.0,
+        taxonomy_plan: Optional["TaxonomyPlan"] = None,  # allow passing S1–S5 policy into the judge prompt
+
     ) -> Dict[str, Any]:
         """
         Text-RLM-style judge:
@@ -478,11 +480,26 @@ class VLLMJsonToolLLM:
         judge_system = (
             "You are a recursive judge/controller for video reasoning.\n"
             "You maintain a hypothesis and request evidence to confirm/refute it.\n"
+            "Your reasoning MUST be grounded in the Signal Taxonomy S1–S5.\n"
+            "\n"
+            "Signal Taxonomy (use these labels explicitly):\n"
+            "S1 Perceptual availability: signal is sampled but visually subtle/ambiguous -> need higher spatial detail / better view.\n"
+            "S2 Microevent/transient: event is brief and may be missed by low FPS -> need temporal zoom / higher FPS around change.\n"
+            "S3 Delayed relevance: early event matters only after later outcome -> reason from outcome then backtrack earlier.\n"
+            "S4 Distributed evidence: no single moment suffices; answer requires aggregating multiple weak signals across time.\n"
+            "S5 Ordering/contrast: answer depends on before/after comparison or relative order between states.\n"
+            "\n"
             "You may:\n"
             "  (A) propose next_call (one tool call) using ONLY allowed seg/window ids from allowlist\n"
             "  (B) request backtrack if evidence is insufficient or contradictory\n"
             "Stop only when convinced.\n"
-            "Output ONLY valid JSON.\n"
+            "\n"
+            "Output ONLY valid JSON with keys:\n"
+            "hypothesis, critique, convinced, signal_type, missing_signal, next_call, backtrack\n"
+            "Where:\n"
+            "- signal_type is one of: 'S1','S2','S3','S4','S5'\n"
+            "- missing_signal is a short string describing exactly what evidence is missing.\n"
+            "\n"
             "IMPORTANT TOOL RULES (do not violate):\n"
             "- refine_in_segment parameters:\n"
             "    * seg_idx: int\n"
@@ -491,6 +508,13 @@ class VLLMJsonToolLLM:
             "- inspect_window parameters:\n"
             "    * t0,t1: floats ABSOLUTE TIMES in seconds from video start. Use this when you want a [start,end] window.\n"
             "- Never output window_s as a list. If you have a time range [t0,t1], you must call inspect_window instead.\n"
+            "\n"
+            "Selection policy by taxonomy:\n"
+            "- If S1: prefer inspect_window on a *short* interval but with higher visual certainty (you may tighten window).\n"
+            "- If S2: prefer inspect_window with higher fps (temporal zoom) near a transition window.\n"
+            "- If S3: backtrack to earlier windows/segments than the current best evidence.\n"
+            "- If S4: request multiple windows across time (or expand_search / try_next_segment) until evidence stabilizes.\n"
+            "- If S5: explicitly retrieve two windows: BEFORE and AFTER, and compare ordering.\n"
         )
 
         user_payload = {
@@ -499,6 +523,7 @@ class VLLMJsonToolLLM:
             "tool_schema": tool_schema,
             "memory": memory[-6:],     # keep it small
             "allowlist": allowlist,    # allowed_seg_idx, allowed_windows
+            "taxonomy_plan": None if taxonomy_plan is None else taxonomy_plan.__dict__,  # expose plan knobs to judge
             "output_format": {
                 "hypothesis": "string (your current best guess)",
                 "critique": "string (what's missing / what conflicts)",
@@ -615,6 +640,10 @@ class VLLMJsonToolLLM:
             raise ValueError(f"Tool '{tool}' missing required keys: {missing}. Got: {call}")
 
         return call
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Optional
+
     
 
 def compact_slice(cs_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -627,6 +656,97 @@ def compact_slice(cs_dict: Dict[str, Any]) -> Dict[str, Any]:
     # keep only top few items
     out["evidence"] = ev[:5]
     return out
+
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Optional
+
+def _round_win(t0: float, t1: float, ndigits: int = 2) -> Tuple[float, float]:
+    # rounding makes “unique windows” robust to tiny float diffs
+    return (round(float(t0), ndigits), round(float(t1), ndigits))
+
+def compute_trace_metrics(
+    trace: List[Dict[str, Any]],
+    video_duration_s: float,
+) -> Dict[str, Any]:
+    tool_counts: Dict[str, int] = {}
+    inspect_windows: List[Tuple[float, float]] = []
+    unique_inspect_windows = set()
+
+    n_inspect_calls = 0
+    n_refine_calls = 0
+    n_search_calls = 0
+
+    inspect_seconds_total = 0.0
+    refine_seconds_total = 0.0
+
+    # If you want a proxy for “how much expensive encoding happened”:
+    # - refine_in_segment: typically *leads to* a window, and you later inspect it
+    # - inspect_window: is the expensive high-fps sampling + captioning
+    # We’ll treat inspect_window windows as “dense seconds”.
+    dense_seconds_encoded = 0.0
+
+    # Optional: count unique inspected frames (rough)
+    approx_inspected_frames = 0
+
+    for step in trace:
+        tool = step.get("tool", "UNKNOWN")
+        tool_counts[tool] = tool_counts.get(tool, 0) + 1
+
+        call = step.get("call", {}) or {}
+        stats = step.get("stats", {}) or {}
+
+        if tool == "search_segments":
+            n_search_calls += 1
+
+        elif tool == "refine_in_segment":
+            n_refine_calls += 1
+            # wallclock time spent inside refine (from your trace)
+            refine_seconds_total += float(step.get("dt_s", 0.0) or 0.0)
+
+        elif tool == "inspect_window":
+            n_inspect_calls += 1
+            inspect_seconds_total += float(step.get("dt_s", 0.0) or 0.0)
+
+            t0 = float(call["t0"])
+            t1 = float(call["t1"])
+            w = _round_win(t0, t1, ndigits=2)
+
+            inspect_windows.append(w)
+            unique_inspect_windows.add(w)
+
+            dense_seconds_encoded += max(0.0, (t1 - t0))
+
+            # if you logged n_samples, use it; else approximate via fps*(t1-t0)
+            if "n_samples" in stats:
+                approx_inspected_frames += int(stats["n_samples"])
+            else:
+                fps = float(call.get("fps", 0.0) or 0.0)
+                approx_inspected_frames += int(max(0.0, fps * (t1 - t0)))
+
+    pct_video_touched = 0.0
+    if video_duration_s > 0:
+        pct_video_touched = 100.0 * dense_seconds_encoded / video_duration_s
+
+    return {
+        "video_duration_s": video_duration_s,
+
+        "tool_counts": tool_counts,
+        "n_search_calls": n_search_calls,
+        "n_refine_calls": n_refine_calls,
+        "n_inspect_calls": n_inspect_calls,
+
+        "n_unique_inspect_windows": len(unique_inspect_windows),
+        "inspect_windows": inspect_windows[-10:],  # last few for debugging
+
+        "dense_seconds_encoded": dense_seconds_encoded,
+        "pct_video_touched": pct_video_touched,
+
+        "inspect_wallclock_s": inspect_seconds_total,
+        "refine_wallclock_s": refine_seconds_total,
+
+        "approx_inspected_frames": approx_inspected_frames,
+    }
 
 def minimal_video_rlm(video_path: str, query: str):
     clip = Clip()
@@ -645,6 +765,11 @@ def minimal_video_rlm(video_path: str, query: str):
 
     print("\n=== TOOL TRACE (env.trace) ===")
     print(json.dumps(env.trace, indent=2))
+
+    duration_s = getattr(env, "duration_s", 0.0)
+    m = compute_trace_metrics(env.trace, float(duration_s))
+    print("\n=== METRICS ===")
+    print(json.dumps(m, indent=2))
 
 
 
