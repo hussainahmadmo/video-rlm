@@ -74,10 +74,10 @@ def _extract_numbers_from_notes(memory: List[Dict[str, Any]]) -> Dict[str, Any]:
     for step in memory:
         # 1) IMPORTANT: parse explicit window field saved by compact_slice
         w = step.get("window", None)
-            if isinstance(w, (list, tuple)) and len(w) == 2:
-                add_window(w[0], w[1])
-            elif isinstance(w, dict) and "t0" in w and "t1" in w:
-                add_window(w["t0"], w["t1"])
+        if isinstance(w, (list, tuple)) and len(w) == 2:
+            add_window(w[0], w[1])
+        elif isinstance(w, dict) and "t0" in w and "t1" in w:
+            add_window(w["t0"], w["t1"])
 
         # 2) parse from evidence notes (your old logic)
         for ev in step.get("evidence", []) or []:
@@ -239,7 +239,9 @@ def dfs_backtracking_controller(
     llm: VLLMJsonToolLLM,
     query: str,
     node: Node,
+    global_state: Dict[str, Any],   # <--- add
 ) -> Optional[str]:
+
     if node.depth >= MAX_DEPTH:
         return None
 
@@ -264,12 +266,16 @@ def dfs_backtracking_controller(
                 wins.append((round(t0,2), round(t1,2)))
             allow["allowed_windows"] = wins
             allow["last_best_window"] = wins[-1] if wins else None
+        
+        allowed_tools = ["search_segments", "refine_in_segment"]
+        if allow.get("allowed_windows"): #only allow inspect when we have windows.
+            allowed_tools.append("inspect_window")
 
         j = llm.judge(
             goal=query,
             memory=node.memory,
             allowlist=allow,
-            allowed_tools=["search_segments", "refine_in_segment", "inspect_window"],
+            allowed_tools=allowed_tools,
             tool_schema=TOOL_SCHEMA,
             temperature=0.0,
             taxonomy_plan=node.plan
@@ -294,7 +300,7 @@ def dfs_backtracking_controller(
                 cs = env.act(call)
                 cs_dict = env.context_to_dict(cs)
                 child = Node(depth=node.depth + 1, memory=node.memory + [compact_slice(cs_dict)])
-                return dfs_backtracking_controller(env, llm, query, child)
+                return dfs_backtracking_controller(env, llm, query, child, global_state)
             if t == "rewrite_query":
                 rq = bt.get("query", query)
                 node.last_rewritten_query = rq
@@ -302,14 +308,14 @@ def dfs_backtracking_controller(
                 cs = env.act(call)
                 cs_dict = env.context_to_dict(cs)
                 child = Node(depth=node.depth + 1, memory=node.memory + [compact_slice(cs_dict)])
-                return dfs_backtracking_controller(env, llm, rq, child)
+                return dfs_backtracking_controller(env, llm, query, child, global_state)
 
         nc = j.get("next_call")
         if nc:
             cs = env.act(nc)
             cs_dict = env.context_to_dict(cs)
             child = Node(depth=node.depth + 1, memory=node.memory + [compact_slice(cs_dict)])
-            return dfs_backtracking_controller(env, llm, query, child)
+            return dfs_backtracking_controller(env, llm, query, child, global_state)
 
 
     seg_candidates = _top_segments_from_memory(node.memory)
@@ -319,7 +325,8 @@ def dfs_backtracking_controller(
         cs_dict = env.context_to_dict(cs)
         new_mem = node.memory + [compact_slice(cs_dict)]
         child = Node(depth=node.depth + 1, memory=new_mem)
-        return dfs_backtracking_controller(env, llm, query, child)
+        return dfs_backtracking_controller(env, llm, query, child, global_state)
+
 
     for seg in seg_candidates:
         if ("seg", seg) in node.tried:
@@ -385,7 +392,8 @@ def dfs_backtracking_controller(
             continue  # <-- try next seg (this is local backtracking)
 
         # Otherwise, continue DFS down this branch (it may inspect more windows, etc.)
-        ans = dfs_backtracking_controller(env, llm, query, child)
+        ans = dfs_backtracking_controller(env, llm, query, child, global_state)
+        
         if ans is not None:
             return ans
 
@@ -395,7 +403,7 @@ def dfs_backtracking_controller(
         cs = env.act(call)
         cs_dict = env.context_to_dict(cs)
         child = Node(depth=node.depth + 1, memory=node.memory + [compact_slice(cs_dict)])
-        return dfs_backtracking_controller(env, llm, query, child)
+        return dfs_backtracking_controller(env, llm, query, child, global_state)
 
     return None
 
@@ -404,19 +412,37 @@ from typing import Literal, Optional
 
 Tax = Literal["S1","S2","S3","S4","S5"]
 
+from dataclasses import dataclass, field
+from typing import List, Optional
+
 @dataclass
 class TaxonomyPlan:
-    tax: Tax
-    intent: str
-    # knobs your controller will enforce
+    tax: "Tax"          # S1..S5 enum/type you already have
+    intent: str         # e.g. "qa", "summarize", "translate", etc.
+
+    # ---- coarse routing ----
     coarse_top_k: int = 3
-    refine_dense_fps: float = 30.0
-    refine_window_s: float = 5.0
-    inspect_fps: float = 30.0
-    # extra policy
-    require_before_after: bool = False   # S5
-    require_lookback: bool = False       # S3
-    require_multiple_windows: bool = False  # S4/S5
+
+    # ---- escalation ladders (critical) ----
+    inspect_fps_ladder: List[float] = field(default_factory=lambda: [8.0, 16.0, 30.0, 60.0])
+    refine_window_ladder_s: List[float] = field(default_factory=lambda: [5.0, 3.0, 1.5])
+    refine_dense_fps_ladder: List[float] = field(default_factory=lambda: [8.0, 16.0, 30.0, 60.0])
+
+    # ---- coverage requirements ----
+    require_before_after: bool = False          # S5
+    require_lookback: bool = False             # S3
+    require_multiple_windows: bool = False     # S4/S5
+    min_distinct_windows: int = 2              # for S4/S5 aggregation
+
+    # ---- stagnation & repetition control ----
+    max_repeat_same_window: int = 1            # don’t re-inspect same (t0,t1,fps) endlessly
+    min_score_improve: float = 0.01            # require evidence score improvement to keep escalating
+
+    # ---- budget / fallback ----
+    allow_full_pass_fallback: bool = True
+    max_inspect_calls: int = 12
+    max_refine_calls: int = 6
+    max_total_calls: int = 20                  # cap total tool calls per query
 
 
 def classify_query_to_taxonomy(q: str) -> TaxonomyPlan:
@@ -443,12 +469,21 @@ def classify_query_to_taxonomy(q: str) -> TaxonomyPlan:
 
 
 def run_recursive_controller(env: VideoEnv, llm: VLLMJsonToolLLM, query: str) -> str:
-    plan = classify_query_to_taxonomy(query)  # classify query into S1–S5 and set policy knobs (fps/window/top_k)
-    root = Node(depth=0, memory=[], plan=plan)  # store the plan on the root so the judge/controller can use it
-    ans = dfs_backtracking_controller(env, llm, query, root)
+    plan = classify_query_to_taxonomy(query)
+    root = Node(depth=0, memory=[], plan=plan)
+
+    global_state = {
+        "tried_calls": set(),
+        "failed_calls": [],
+        "notes": [],
+        "best_memory": [],
+    }
+
+    ans = dfs_backtracking_controller(env, llm, query, root, global_state)
+
     if ans is None:
-        # last resort: summarize what we have (or return unsure)
-        return _summarize_with_llm(llm, query, root.memory) or "No confident answer found."
+        mem = global_state.get("best_memory") or root.memory
+        return _summarize_with_llm(llm, query, mem) or "No confident answer found."
     return ans
 
 def _safe_load_json(text: str) -> Dict[str, Any]:
@@ -657,16 +692,27 @@ class VLLMJsonToolLLM:
                 f"Judge must set exactly one of next_call/backtrack when not convinced.\nRaw:\n{raw}"
             )
 
-        if next_call is not None:
-            _validate_tool_call(next_call, allowed_tools, tool_schema)
-            _enforce_allowlist(next_call, allowlist)
+        # ... same up to (next_call is None) == (backtrack is None) check ...
 
+        if next_call is not None:
+            try:
+                _validate_tool_call(next_call, allowed_tools, tool_schema)
+                _enforce_allowlist(next_call, allowlist)
+            except ValueError as e:
+                j["next_call"] = None
+                j["backtrack"] = {"type": "expand_search"}
+                j["critique"] = (j.get("critique", "") + f" | allowlist_violation: {e}").strip()
+                j["convinced"] = False
+
+        # refresh locals after any mutation
+        next_call = j.get("next_call", None)
+        backtrack = j.get("backtrack", None)
 
         if backtrack is not None:
             if not isinstance(backtrack, dict) or "type" not in backtrack:
                 raise ValueError(f"Bad backtrack object: {backtrack}")
             if backtrack["type"] not in ("try_next_segment", "expand_search", "rewrite_query"):
-                raise ValueError(f"Unknown backtrack type: {backtrack}")
+                raise ValueError(f"Unknown backtrack type: {backtrack['type']}")
 
         return j
 
@@ -710,8 +756,7 @@ class VLLMJsonToolLLM:
         if allowed and tool not in allowed:
             raise ValueError(
                 f"LLM picked tool '{tool}' but allowed_tools={sorted(allowed)}.\n"
-                f"Raw response:\n{text}"
-            )
+                f"Raw response:\n{text}")
 
         if tool not in TOOL_SCHEMA:
             raise ValueError(f"Unknown tool '{tool}'. Must be one of {list(TOOL_SCHEMA.keys())}")
@@ -730,8 +775,19 @@ from typing import Any, Dict, List, Tuple, Optional
 
 def compact_slice(cs_dict: Dict[str, Any]) -> Dict[str, Any]:
     out = {"tool": cs_dict.get("tool")}
-    if "window" in cs_dict: out["window"] = cs_dict["window"]
-    if "stats" in cs_dict: out["stats"] = cs_dict["stats"]
+
+    # ✅ keep the tool call so judge can see which seg/window was executed
+    if "call" in cs_dict:
+        out["call"] = cs_dict["call"]
+
+    # ✅ keep the short natural-language result (includes captions today)
+    if "summary" in cs_dict:
+        out["summary"] = cs_dict["summary"]
+
+    if "window" in cs_dict:
+        out["window"] = cs_dict["window"]
+    if "stats" in cs_dict:
+        out["stats"] = cs_dict["stats"]
 
     ev = cs_dict.get("evidence", []) or []
 
@@ -739,10 +795,8 @@ def compact_slice(cs_dict: Dict[str, Any]) -> Dict[str, Any]:
         note = (e.get("note", "") or "")
         return ("seg=" in note) or ("window=[" in note) or (note.startswith("[") and "," in note and note.endswith("]"))
 
-    # keep top-5 + ALSO keep anything that contains seg/window ids
     keep = ev[:5] + [e for e in ev[5:] if has_seg_or_window(e)]
 
-    # optional dedup (by note)
     seen = set()
     dedup = []
     for e in keep:
