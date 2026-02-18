@@ -7,9 +7,8 @@ from clip_encoder import Clip
 from env import VideoEnv
 from typing import Any, Dict, List
 from openai import OpenAI
-
-
-#(Hussain) Change captioner such that we can important multiple captioners
+from tracing import trace_judge
+#(Hussain) Change captioner such that we can import multiple captioners
 from captioner import BlipCaptioner
 
 SYSTEM_PROMPT = (
@@ -61,35 +60,66 @@ def _best_score_in_memory(memory: List[Dict[str, Any]]) -> float:
     return best
 
 def _extract_numbers_from_notes(memory: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Optional helper: build an allowlist of seg_idx and windows the model can use."""
     segs = set()
-    windows = []  # list of (t0,t1)
+    windows: List[Tuple[float, float]] = []
+
+    def add_window(a, b):
+        try:
+            a = float(a); b = float(b)
+            if b > a:
+                windows.append((a, b))
+        except:
+            pass
+
     for step in memory:
+        # 1) IMPORTANT: parse explicit window field saved by compact_slice
+        w = step.get("window", None)
+            if isinstance(w, (list, tuple)) and len(w) == 2:
+                add_window(w[0], w[1])
+            elif isinstance(w, dict) and "t0" in w and "t1" in w:
+                add_window(w["t0"], w["t1"])
+
+        # 2) parse from evidence notes (your old logic)
         for ev in step.get("evidence", []) or []:
-            note = ev.get("note", "") or ""
-            # seg=3, window=[180.00,240.00]
+            note = (ev.get("note", "") or "").strip()
+
             if "seg=" in note:
                 try:
                     seg = int(note.split("seg=")[1].split(",")[0])
                     segs.add(seg)
                 except:
                     pass
+
             if "window=[" in note:
                 try:
-                    w = note.split("window=[", 1)[1].split("]")[0]
-                    t0s, t1s = w.split(",")
-                    windows.append((float(t0s), float(t1s)))
+                    inside = note.split("window=[", 1)[1].split("]")[0]
+                    t0s, t1s = inside.split(",", 1)
+                    add_window(t0s, t1s)
                 except:
                     pass
-            # [205.76,207.68]
-            if note.startswith("[") and "," in note and note.endswith("]"):
+
+            if note.startswith("[") and note.endswith("]") and "," in note:
                 try:
-                    w = note[1:-1]
-                    t0s, t1s = w.split(",")
-                    windows.append((float(t0s), float(t1s)))
+                    inside = note[1:-1]
+                    t0s, t1s = inside.split(",", 1)
+                    add_window(t0s, t1s)
                 except:
                     pass
-    return {"allowed_seg_idx": sorted(segs), "allowed_windows": windows[-10:]}
+
+    # dedup (rounded) while preserving order
+    seen = set()
+    uniq = []
+    for (a, b) in windows:
+        rw = (round(a, 2), round(b, 2))
+        if rw not in seen:
+            seen.add(rw)
+            uniq.append(rw)
+
+    return {
+        "allowed_seg_idx": sorted(segs),
+        "allowed_windows": uniq,
+        "last_best_window": (uniq[-1] if uniq else None),
+    }
 
 def _top_segments_from_memory(memory: List[Dict[str, Any]]) -> List[int]:
     segs = []
@@ -221,6 +251,19 @@ def dfs_backtracking_controller(
     # Only bother judging once we have *some* evidence (or after an inspect)
     if node.memory:
         allow = _extract_numbers_from_notes(node.memory)
+        allow["duration_s"] = float(getattr(env, "duration_s", 0.0) or 0.0)
+
+        # if we have segs but no windows yet, convert segs -> [t0,t1]
+        if not allow.get("allowed_windows"):
+            seg_len = float(getattr(env, "seg_len_s", 60.0) or 60.0)
+            print("env has seg_len_s?", hasattr(env, "seg_len_s"), "value", getattr(env, "seg_len_s", None))
+            wins = []
+            for seg in allow.get("allowed_seg_idx", []):
+                t0 = seg * seg_len
+                t1 = min(t0 + seg_len, allow["duration_s"] or (t0 + seg_len))
+                wins.append((round(t0,2), round(t1,2)))
+            allow["allowed_windows"] = wins
+            allow["last_best_window"] = wins[-1] if wins else None
 
         j = llm.judge(
             goal=query,
@@ -234,6 +277,8 @@ def dfs_backtracking_controller(
 
         node.hypothesis = j.get("hypothesis", "")
         node.critique = j.get("critique", "")
+
+        trace_judge(env.trace, node.depth, when="pre", phase="judge_pre", query=query, allowlist=allow, decision=j)        
 
         if j.get("convinced", False):
             return _summarize_with_llm(llm, query, node.memory)
@@ -307,6 +352,18 @@ def dfs_backtracking_controller(
         # ### JUDGE INSERT #2: judge *after* you inspected (most useful)
         # --------------------------------------------------------------
         allow2 = _extract_numbers_from_notes(child.memory)
+        allow2["duration_s"] = float(getattr(env, "duration_s", 0.0) or 0.0)
+
+        if not allow2.get("allowed_windows"):
+            seg_len = float(getattr(env, "seg_len_s", 60.0) or 60.0)
+            wins = []
+            for seg in allow2.get("allowed_seg_idx", []):
+                t0 = seg * seg_len
+                t1 = min(t0 + seg_len, allow2["duration_s"] or (t0 + seg_len))
+                wins.append((round(t0, 2), round(t1, 2)))
+            allow2["allowed_windows"] = wins
+            allow2["last_best_window"] = wins[-1] if wins else None
+
         j2 = llm.judge(
             goal=query,
             memory=child.memory,
@@ -318,6 +375,7 @@ def dfs_backtracking_controller(
         )
         child.hypothesis = j2.get("hypothesis", "")
         child.critique = j2.get("critique", "")
+        trace_judge(env.trace, child.depth, when="post", phase="judge_post", query=query, allowlist=allow2, decision=j2)
 
         if j2.get("convinced", False):
             return _summarize_with_llm(llm, query, child.memory)
@@ -431,26 +489,46 @@ def _safe_load_json(text: str) -> Dict[str, Any]:
 
     raise ValueError(f"Could not find a JSON object in model output.\nRaw:\n{text}")
 
-def _enforce_allowlist(call: Dict[str, Any], allow: Dict[str, Any]) -> None:
-    wins = allow.get("allowed_windows", []) or []
+def _last_window_from_memory(memory):
+    wins = _top_windows_from_memory(memory)
+    return list(wins[-1]) if wins else None
+
+def _enforce_allowlist(call: Dict[str, Any], allow: Dict[str, Any], max_expand_s: float = 30.0) -> None:
     tool = call.get("tool")
+    if tool != "inspect_window":
+        return
 
-    if tool == "inspect_window" and wins:
-        t0, t1 = float(call["t0"]), float(call["t1"])
-        eps = 1e-3
+    t0, t1 = float(call["t0"]), float(call["t1"])
+    if t1 <= t0:
+        raise ValueError("inspect_window requires t1>t0")
 
-        ok = False
-        for (a, b) in wins:
-            a, b = float(a), float(b)
-            if (t0 + eps) >= a and (t1 - eps) <= b:
-                ok = True
-                break
+    # Clamp sanity if you want
+    dur = allow.get("duration_s", None)
+    if dur is not None:
+        if t0 < -1e-3 or t1 > float(dur) + 1e-3:
+            raise ValueError(f"inspect_window out of bounds: [{t0},{t1}] dur={dur}")
 
-        if not ok:
-            raise ValueError(
-                f"inspect_window [{t0},{t1}] not contained in any allowed window. "
-                f"Allowed: {wins[-10:]}"
-            )
+    # (A) allow if contained in any existing evidence window
+    wins = allow.get("allowed_windows", []) or []
+    for (a, b) in wins:
+        a, b = float(a), float(b)
+        if t0 >= a - 1e-3 and t1 <= b + 1e-3:
+            return
+
+    # (B) allow if close to anchor window (recursive expansion/backtrack)
+    anchor = allow.get("last_best_window", None)
+    if anchor is not None:
+        a0, a1 = float(anchor[0]), float(anchor[1])
+        # permit expanding/shift within +/- max_expand_s around anchor span
+        lo = max(0.0, a0 - max_expand_s)
+        hi = (float(dur) if dur is not None else a1 + max_expand_s)  # if no dur, still allow
+        if t0 >= lo - 1e-3 and t1 <= hi + 1e-3 and (t1 - t0) <= (a1 - a0) + 2*max_expand_s + 1e-3:
+            return
+
+    raise ValueError(
+        f"inspect_window [{t0},{t1}] not allowed. "
+        f"Need containment in evidence windows or within ±{max_expand_s}s of last_best_window."
+    )
 
 class VLLMJsonToolLLM:
     def __init__(self, model: str, base_url: str = "http://localhost:8000/v1", api_key: str = "EMPTY"):
@@ -476,46 +554,49 @@ class VLLMJsonToolLLM:
           - either proposes a next tool call OR requests backtracking
         Must output JSON.
         """
-
         judge_system = (
-            "You are a recursive judge/controller for video reasoning.\n"
-            "You maintain a hypothesis and request evidence to confirm/refute it.\n"
-            "Your reasoning MUST be grounded in the Signal Taxonomy S1–S5.\n"
-            "\n"
-            "Signal Taxonomy (use these labels explicitly):\n"
-            "S1 Perceptual availability: signal is sampled but visually subtle/ambiguous -> need higher spatial detail / better view.\n"
-            "S2 Microevent/transient: event is brief and may be missed by low FPS -> need temporal zoom / higher FPS around change.\n"
-            "S3 Delayed relevance: early event matters only after later outcome -> reason from outcome then backtrack earlier.\n"
-            "S4 Distributed evidence: no single moment suffices; answer requires aggregating multiple weak signals across time.\n"
-            "S5 Ordering/contrast: answer depends on before/after comparison or relative order between states.\n"
-            "\n"
-            "You may:\n"
-            "  (A) propose next_call (one tool call) using ONLY allowed seg/window ids from allowlist\n"
-            "  (B) request backtrack if evidence is insufficient or contradictory\n"
-            "Stop only when convinced.\n"
-            "\n"
-            "Output ONLY valid JSON with keys:\n"
-            "hypothesis, critique, convinced, signal_type, missing_signal, next_call, backtrack\n"
-            "Where:\n"
-            "- signal_type is one of: 'S1','S2','S3','S4','S5'\n"
-            "- missing_signal is a short string describing exactly what evidence is missing.\n"
-            "\n"
-            "IMPORTANT TOOL RULES (do not violate):\n"
-            "- refine_in_segment parameters:\n"
-            "    * seg_idx: int\n"
-            "    * dense_fps: float\n"
-            "    * window_s: float DURATION IN SECONDS (e.g., 1.0, 2.0, 5.0). NOT a [t0,t1] list.\n"
-            "- inspect_window parameters:\n"
-            "    * t0,t1: floats ABSOLUTE TIMES in seconds from video start. Use this when you want a [start,end] window.\n"
-            "- Never output window_s as a list. If you have a time range [t0,t1], you must call inspect_window instead.\n"
-            "\n"
-            "Selection policy by taxonomy:\n"
-            "- If S1: prefer inspect_window on a *short* interval but with higher visual certainty (you may tighten window).\n"
-            "- If S2: prefer inspect_window with higher fps (temporal zoom) near a transition window.\n"
-            "- If S3: backtrack to earlier windows/segments than the current best evidence.\n"
-            "- If S4: request multiple windows across time (or expand_search / try_next_segment) until evidence stabilizes.\n"
-            "- If S5: explicitly retrieve two windows: BEFORE and AFTER, and compare ordering.\n"
-        )
+                "You are a recursive judge/controller for video reasoning.\n"
+                "You maintain a hypothesis and request evidence to confirm/refute it.\n"
+                "Your reasoning MUST be grounded in the Signal Taxonomy S1–S5.\n"
+                "\n"
+                "Signal Taxonomy (use these labels explicitly):\n"
+                "S1 Perceptual availability: signal is sampled but visually subtle/ambiguous -> need higher spatial detail / better view.\n"
+                "S2 Microevent/transient: event is brief and may be missed by low FPS -> need temporal zoom / higher FPS around change.\n"
+                "S3 Delayed relevance: early event matters only after later outcome -> reason from outcome then backtrack earlier.\n"
+                "S4 Distributed evidence: no single moment suffices; answer requires aggregating multiple weak signals across time.\n"
+                "S5 Ordering/contrast: answer depends on before/after comparison or relative order between states.\n"
+                "\n"
+                "You may:\n"
+                "  (A) propose next_call (one tool call) using ONLY allowed seg/window ids from allowlist\n"
+                "  (B) request backtrack if evidence is insufficient or contradictory\n"
+                "Stop only when convinced.\n"
+                "\n"
+                "Output ONLY valid JSON with keys:\n"
+                "hypothesis, critique, convinced, signal_type, missing_signal, next_call, backtrack\n"
+                "Where:\n"
+                "- signal_type is one of: 'S1','S2','S3','S4','S5'\n"
+                "- missing_signal is a short string describing exactly what evidence is missing.\n"
+                "\n"
+                "IMPORTANT TOOL RULES (do not violate):\n"
+                "- refine_in_segment parameters:\n"
+                "    * seg_idx: int\n"
+                "    * dense_fps: float\n"
+                "    * window_s: float DURATION IN SECONDS (e.g., 1.0, 2.0, 5.0). NOT a [t0,t1] list.\n"
+                "- inspect_window parameters (ALL REQUIRED):\n"
+                "    * query: str\n"
+                "    * t0,t1: floats ABSOLUTE TIMES in seconds from video start\n"
+                "    * fps: float\n"
+                "    * top_m: int\n"
+                "- Never output window_s as a list. If you have a time range [t0,t1], you must call inspect_window instead.\n"
+                "\n"
+                "JSON rule: if you propose next_call, it MUST exactly match the tool schema (no missing keys).\n"
+                "Selection policy by taxonomy:\n"
+                "- If S1: prefer inspect_window on a short interval but with higher visual certainty.\n"
+                "- If S2: prefer inspect_window with higher fps (temporal zoom) near a transition window.\n"
+                "- If S3: backtrack to earlier windows/segments than the current best evidence.\n"
+                "- If S4: request multiple windows across time until evidence stabilizes.\n"
+                "- If S5: explicitly retrieve two windows (BEFORE and AFTER) and compare ordering.\n"
+            )
 
         user_payload = {
             "goal": goal,
@@ -551,6 +632,7 @@ class VLLMJsonToolLLM:
 
         raw = (resp.choices[0].message.content or "").strip()
         j = _safe_load_json(raw)
+        
 
         # Basic shape checks
         if "convinced" not in j:
@@ -647,16 +729,30 @@ from typing import Any, Dict, List, Tuple, Optional
     
 
 def compact_slice(cs_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """Keep evidence compact so the LLM doesn't drown."""
     out = {"tool": cs_dict.get("tool")}
     if "window" in cs_dict: out["window"] = cs_dict["window"]
     if "stats" in cs_dict: out["stats"] = cs_dict["stats"]
 
     ev = cs_dict.get("evidence", []) or []
-    # keep only top few items
-    out["evidence"] = ev[:5]
-    return out
 
+    def has_seg_or_window(e):
+        note = (e.get("note", "") or "")
+        return ("seg=" in note) or ("window=[" in note) or (note.startswith("[") and "," in note and note.endswith("]"))
+
+    # keep top-5 + ALSO keep anything that contains seg/window ids
+    keep = ev[:5] + [e for e in ev[5:] if has_seg_or_window(e)]
+
+    # optional dedup (by note)
+    seen = set()
+    dedup = []
+    for e in keep:
+        k = e.get("note", repr(e))
+        if k not in seen:
+            seen.add(k)
+            dedup.append(e)
+
+    out["evidence"] = dedup
+    return out
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
