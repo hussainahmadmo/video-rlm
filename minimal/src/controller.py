@@ -7,9 +7,48 @@ from clip_encoder import Clip
 from env import VideoEnv
 from typing import Any, Dict, List
 from openai import OpenAI
-from tracing import trace_judge
+from tracing import trace_judge, trace_gate
+from policy import TaxonomyPlan, classify_query_to_taxonomy, gate_call  # (or _gate_call if you keep underscore)
 #(Hussain) Change captioner such that we can import multiple captioners
 from captioner import BlipCaptioner
+from controller_utils import AllowlistState, finalize_allowlist, available_tools_for
+from controller_utils import finalize_allowlist, available_tools_for, _extract_numbers_from_notes, _enforce_allowlist
+from reasoning.order_ops import (ordering_mode, evidence_for_summary, needs_heavy_detail)
+from tracing import trace_controller_action
+from reasoning.evidence_adapters import add_tool_result_to_evidence
+from reasoning.evidence_state import EvidenceState
+import copy
+
+
+
+SUMMARY_SYSTEM_PROMPT = (
+    """
+        You are an evidence-grounded video QA system.
+
+        You MUST return a valid tool call using the tool:
+        summarize_answer
+
+        The output MUST be a JSON object with the following fields:
+
+        {
+        "tool": "summarize_answer",
+        "answer": string,
+        "evidence": list of 1–3 short quotes/snippets (include timestamps if available),
+        "abstain": boolean,
+        "reason": string
+        }
+
+        Rules:
+        - You must use ONLY the provided memory evidence.
+        - If evidence clearly supports an answer, provide it.
+        - If evidence does not support a specific answer, set:
+            "abstain": true
+        - If the best you can do is restate the question, you MUST abstain.
+        - If evidence contradicts itself and cannot be resolved, you MUST abstain.
+        - Never omit the "tool" field.
+        - Never output text outside the JSON object.
+    """
+)
 
 SYSTEM_PROMPT = (
   "You are a video controller. Output ONLY a single JSON object.\n"
@@ -19,6 +58,7 @@ SYSTEM_PROMPT = (
   " - refine_in_segment: {tool:'refine_in_segment', query:str, seg_idx:int, dense_fps:float, window_s:float}\n"
   " - inspect_window: {tool:'inspect_window', query:str, t0:float, t1:float, fps:float, top_m:int}\n"
   " - summarize_answer: {tool:'summarize_answer', answer:str}\n"
+  " - inspect_window_heavy: {tool:'inspect_window_heavy', query:str, t0:float, t1:float, fps:float, top_m:int}\n"
   "Return EXACTLY one of these objects and nothing else."
 )
 
@@ -27,6 +67,7 @@ TOOL_SCHEMA = {
   "refine_in_segment": ["tool", "query", "seg_idx", "dense_fps", "window_s"],
   "inspect_window": ["tool", "query", "t0", "t1", "fps", "top_m"],
   "summarize_answer": ["tool", "answer"],
+  "inspect_window_heavy": ["tool", "query", "t0", "t1", "fps", "top_m"],   # NEWs
 }
 
 MAX_DEPTH = 6
@@ -39,6 +80,7 @@ class Node:
     memory: List[Dict[str, Any]]
     tried: set = field(default_factory=set)
     plan: Optional["TaxonomyPlan"] = None  # forward reference avoids ordering issues
+    evidence: Optional["EvidenceState"] = None
 
     branch_score: float = float("-inf")
     chosen_seg: Optional[int] = None
@@ -48,6 +90,36 @@ class Node:
     critique: str = ""
     last_rewritten_query: Optional[str] = None
 
+def _has_caption(step: Dict[str, Any]) -> bool:
+    for tf in (step.get("top_frames") or []):
+        if tf.get("caption") and str(tf["caption"]).strip():
+            return True
+    for ev in (step.get("evidence") or []):
+        if isinstance(ev, str) and ev.strip():
+            return True
+        if isinstance(ev, dict) and (ev.get("note") or "").strip():
+            return True
+    return False
+
+def _evidence_slices(memory, k=6):
+    out = []
+    for m in memory:
+        tool = m.get("tool") or m.get("name")
+        if tool not in ("inspect_window", "inspect_window_heavy"):
+            continue
+
+        payload = m.get("result") or m.get("obs") or m
+
+        # harvest evidence
+        for tf in payload.get("top_frames", []) or []:
+            ev = tf.get("vlm_answer") or tf.get("caption")
+            if ev:
+                out.append({"timestamp": tf.get("t"), "evidence": ev})
+
+        if not payload.get("top_frames") and payload.get("summary"):
+            out.append({"evidence": payload["summary"]})
+
+    return out[-k:]
 
 def _best_score_in_memory(memory: List[Dict[str, Any]]) -> float:
     best = float("-inf")
@@ -58,68 +130,6 @@ def _best_score_in_memory(memory: List[Dict[str, Any]]) -> float:
             except:
                 pass
     return best
-
-def _extract_numbers_from_notes(memory: List[Dict[str, Any]]) -> Dict[str, Any]:
-    segs = set()
-    windows: List[Tuple[float, float]] = []
-
-    def add_window(a, b):
-        try:
-            a = float(a); b = float(b)
-            if b > a:
-                windows.append((a, b))
-        except:
-            pass
-
-    for step in memory:
-        # 1) IMPORTANT: parse explicit window field saved by compact_slice
-        w = step.get("window", None)
-        if isinstance(w, (list, tuple)) and len(w) == 2:
-            add_window(w[0], w[1])
-        elif isinstance(w, dict) and "t0" in w and "t1" in w:
-            add_window(w["t0"], w["t1"])
-
-        # 2) parse from evidence notes (your old logic)
-        for ev in step.get("evidence", []) or []:
-            note = (ev.get("note", "") or "").strip()
-
-            if "seg=" in note:
-                try:
-                    seg = int(note.split("seg=")[1].split(",")[0])
-                    segs.add(seg)
-                except:
-                    pass
-
-            if "window=[" in note:
-                try:
-                    inside = note.split("window=[", 1)[1].split("]")[0]
-                    t0s, t1s = inside.split(",", 1)
-                    add_window(t0s, t1s)
-                except:
-                    pass
-
-            if note.startswith("[") and note.endswith("]") and "," in note:
-                try:
-                    inside = note[1:-1]
-                    t0s, t1s = inside.split(",", 1)
-                    add_window(t0s, t1s)
-                except:
-                    pass
-
-    # dedup (rounded) while preserving order
-    seen = set()
-    uniq = []
-    for (a, b) in windows:
-        rw = (round(a, 2), round(b, 2))
-        if rw not in seen:
-            seen.add(rw)
-            uniq.append(rw)
-
-    return {
-        "allowed_seg_idx": sorted(segs),
-        "allowed_windows": uniq,
-        "last_best_window": (uniq[-1] if uniq else None),
-    }
 
 def _top_segments_from_memory(memory: List[Dict[str, Any]]) -> List[int]:
     segs = []
@@ -140,37 +150,10 @@ def _top_segments_from_memory(memory: List[Dict[str, Any]]) -> List[int]:
             out.append(s)
     return out
 
-def _top_windows_from_memory(memory: List[Dict[str, Any]]) -> List[Tuple[float, float]]:
-    wins = []
-    for step in memory:
-        for ev in step.get("evidence", []) or []:
-            note = ev.get("note", "")
-            if "window=[" in note:
-                try:
-                    w = note.split("window=[", 1)[1].split("]")[0]
-                    t0s, t1s = w.split(",")
-                    wins.append((float(t0s), float(t1s)))
-                except:
-                    pass
-            if note.startswith("[") and note.endswith("]") and "," in note:
-                try:
-                    w = note[1:-1]
-                    t0s, t1s = w.split(",")
-                    wins.append((float(t0s), float(t1s)))
-                except:
-                    pass
-    # unique, keep order
-    out = []
-    for w in wins:
-        if w not in out:
-            out.append(w)
-    return out
-
 def _validate_tool_call(
     call: Dict[str, Any],
     allowed_tools: List[str],
-    tool_schema: Dict[str, List[str]],
-) -> None:
+    tool_schema: Dict[str, List[str]],) -> None:
     """
     Validate a single tool call object, e.g.
       {"tool":"inspect_window","query":"...","t0":0.0,"t1":1.0,"fps":4.0,"top_m":5}
@@ -212,8 +195,7 @@ def _validate_tool_call(
         if not isinstance(call["dense_fps"], (int, float)):
             raise ValueError(f"refine_in_segment.dense_fps must be number. Got: {call}")
         
-
-    if tool == "inspect_window":
+    if tool in ("inspect_window","inspect_window_heavy"):
         for k in ("t0", "t1", "fps", "top_m"):
             if not isinstance(call[k], (int, float)):
                 raise ValueError(f"inspect_window.{k} must be number. Call={call}")
@@ -224,67 +206,180 @@ def _validate_tool_call(
         if not isinstance(call["answer"], str):
             raise ValueError(f"summarize_answer.answer must be str. Call={call}")
 
+from reasoning.order_ops import evidence_for_summary
 def _summarize_with_llm(llm: VLLMJsonToolLLM, query: str, memory: List[Dict[str, Any]]) -> str:
+    evidence_mem = evidence_for_summary(memory, k = 6, query=query)
+    #Optional deterministic heavy refinement for ordering queries
+    mode = ordering_mode(query)
     prompt = {
-        "system": SYSTEM_PROMPT,
+        "system": SUMMARY_SYSTEM_PROMPT,
         "goal": query,
         "available_tools": ["summarize_answer"],  # force summarize
-        "memory": memory[-4:],
+        "tool_schema": {"summarize_answer": ["tool", "answer","evidence","abstain", "reason"]},   # ✅ restrict
+        "memory": evidence_mem,
     }
+
+    print("EVIDENCE_MEM_LEN", len(evidence_mem))
+    print("EVIDENCE_MEM_SAMPLE", evidence_mem[:1])
     call = llm.decide(prompt)
+
+    if call.get("abstain"):
+        return f"I’m not sure from the available evidence. ({call.get('reason','insufficient evidence')})"
+
     return call.get("answer", "")
 
-def dfs_backtracking_controller(
-    env: VideoEnv,
-    llm: VLLMJsonToolLLM,
-    query: str,
-    node: Node,
-    global_state: Dict[str, Any],   # <--- add
-) -> Optional[str]:
+def _step(env, node: Node, call: Dict[str, Any], gs: Dict[str, Any]) -> Optional[Node]:
+    allow = finalize_allowlist(
+        node.memory,
+        seg_len_s=float(getattr(env, "seg_len_s", 60.0)),
+        duration_s=float(getattr(env, "duration_s", 0.0) or 0.0),
+    )
+    heavy_enabled = getattr(env, "heavy_vlm", None) is not None
 
+    call2, why = gate_call(call, node.plan, allow.to_dict(), gs, heavy_enabled)
+    trace_gate(env.trace, node.depth, proposed=call, final=call2, why=why, allowlist=allow.to_dict())
+
+    if call2 is None:
+        return None
+
+    cs = exec_call(env, call2, gs)
+    cs_raw = cs if isinstance(cs, dict) else env.context_to_dict(cs)
+    payload = cs_raw.get("result", cs_raw)
+
+    evt = compact_slice({
+        "tool": call2["tool"],
+        "call": call2,
+        **payload,
+    })
+
+    child = Node(
+        depth=node.depth + 1,
+        memory=node.memory + [evt],
+        plan=node.plan,
+        tried=set(node.tried),
+        evidence=copy.deepcopy(node.evidence) if node.evidence else EvidenceState(),
+    )
+    add_tool_result_to_evidence(child.evidence, call2, payload)
+
+    # if Node.evidence exists (recommended), ensure it’s there
+    if child.evidence is None:
+        from reasoning.evidence_state import EvidenceState
+        child.evidence = EvidenceState()
+
+    add_tool_result_to_evidence(child.evidence, call2, payload)
+
+    gs["best_memory"] = child.memory
+    # optional debug snapshot:
+    # gs["best_evidence"] = child.evidence
+
+    return child
+
+def _judge_node(env, llm, query, node):
+    allow = finalize_allowlist(node.memory, seg_len_s=env.seg_len_s, duration_s=env.duration_s)
+
+    allowed_tools = ["search_segments", "refine_in_segment"]
+    if allow.allowed_windows:
+        allowed_tools.append("inspect_window")
+        if getattr(env, "heavy_vlm", None) is not None:
+            allowed_tools.append("inspect_window_heavy")
+
+    # compact judge history
+    judge_history = []
+    for t in env.trace:
+        if t.get("tool") == "judge":
+            d = t.get("decision", {}) or {}
+            judge_history.append({
+                "depth": t.get("depth"),
+                "when": t.get("when"),
+                "phase": t.get("phase"),
+                "signal_type": d.get("signal_type"),
+                "convinced": d.get("convinced"),
+                "hypothesis": d.get("hypothesis"),
+                "critique": d.get("critique"),
+                "missing_signal": d.get("missing_signal"),
+                "next_call": d.get("next_call"),
+                "backtrack": d.get("backtrack"),
+            })
+
+    gate_history = []
+    for t in env.trace:
+        if t.get("tool") == "gate":
+            gate_history.append({
+                "depth": t.get("depth"),
+                "why": t.get("why"),
+                "proposed": t.get("proposed"),
+                "final": t.get("final"),
+                "allowlist_summary": t.get("allowlist_summary"),
+            })
+
+    controller_state = {
+        "tried": sorted(list(node.tried)) if hasattr(node, "tried") else None,
+        "branch_score": getattr(node, "branch_score", None),
+        "last_rewritten_query": getattr(node, "last_rewritten_query", None),
+        "plan": None if node.plan is None else node.plan.__dict__,
+    }
+
+    judge_input = {
+        "goal": query,
+        "depth": node.depth,
+        "allowed_tools": allowed_tools,
+        "tool_schema": TOOL_SCHEMA,
+        "memory": node.memory,
+        "allowlist": allow.to_dict(),
+        "judge_history": judge_history,
+        "gate_history": gate_history[-20:],
+        "controller_state": controller_state,
+    }
+
+    j = llm.judge(
+        goal=query,
+        memory=node.memory,
+        allowlist=allow.to_dict(),
+        allowed_tools=allowed_tools,
+        tool_schema=TOOL_SCHEMA,
+        taxonomy_plan=node.plan,
+        judge_history=judge_history,
+        gate_history=gate_history[-20:],
+        controller_state=controller_state,
+        temperature=0.0,
+    )
+
+    return j, allow, allowed_tools, judge_input
+
+def _do(env, llm, query, node, gs, chosen_call, why, decision=None):
+    # 1) controller chose something
+    trace_controller_action(env.trace, node.depth, chosen_call, why, decision=decision)
+
+    # 2) gate + execute (gate/tool logs already happen inside _step)
+    child = _step(env, node, chosen_call, gs)
+
+    # 3) recurse
+    return None if child is None else dfs_backtracking_controller(env, llm, query, child, gs)
+
+def dfs_backtracking_controller(env, llm, query, node, gs):
     if node.depth >= MAX_DEPTH:
         return None
 
     node.branch_score = max(node.branch_score, _best_score_in_memory(node.memory))
 
-    # ------------------------------------------------------------------
-    # ### JUDGE INSERT #1: early "should we stop / backtrack / act?" gate
-    # ------------------------------------------------------------------
-    # Only bother judging once we have *some* evidence (or after an inspect)
+    # ---- Pre-judge when we have any memory ----
     if node.memory:
-        allow = _extract_numbers_from_notes(node.memory)
-        allow["duration_s"] = float(getattr(env, "duration_s", 0.0) or 0.0)
+        j, allow, _allowed_tools, judge_input = _judge_node(env, llm, query, node)
+        j["_judge_input"] = {
+            "goal": query,
+            "allowed_tools": _allowed_tools,
+            "tool_schema": TOOL_SCHEMA,
+            "memory": node.memory,
+            "allowlist": allow.to_dict(),
+            "taxonomy_plan": None if node.plan is None else node.plan.__dict__,
+        }
 
-        # if we have segs but no windows yet, convert segs -> [t0,t1]
-        if not allow.get("allowed_windows"):
-            seg_len = float(getattr(env, "seg_len_s", 60.0) or 60.0)
-            print("env has seg_len_s?", hasattr(env, "seg_len_s"), "value", getattr(env, "seg_len_s", None))
-            wins = []
-            for seg in allow.get("allowed_seg_idx", []):
-                t0 = seg * seg_len
-                t1 = min(t0 + seg_len, allow["duration_s"] or (t0 + seg_len))
-                wins.append((round(t0,2), round(t1,2)))
-            allow["allowed_windows"] = wins
-            allow["last_best_window"] = wins[-1] if wins else None
-        
-        allowed_tools = ["search_segments", "refine_in_segment"]
-        if allow.get("allowed_windows"): #only allow inspect when we have windows.
-            allowed_tools.append("inspect_window")
-
-        j = llm.judge(
-            goal=query,
-            memory=node.memory,
-            allowlist=allow,
-            allowed_tools=allowed_tools,
-            tool_schema=TOOL_SCHEMA,
-            temperature=0.0,
-            taxonomy_plan=node.plan
+        trace_judge(
+            env.trace, node.depth,
+            when="pre", phase="judge_pre",
+            query=query, allowlist=allow.to_dict(),
+            decision=j, judge_input=judge_input,
         )
-
-        node.hypothesis = j.get("hypothesis", "")
-        node.critique = j.get("critique", "")
-
-        trace_judge(env.trace, node.depth, when="pre", phase="judge_pre", query=query, allowlist=allow, decision=j)        
 
         if j.get("convinced", False):
             return _summarize_with_llm(llm, query, node.memory)
@@ -292,118 +387,98 @@ def dfs_backtracking_controller(
         bt = j.get("backtrack")
         if bt:
             t = bt.get("type")
+
             if t == "try_next_segment":
-                return None  # <-- THIS is DFS backtracking: parent tries next seg
+                return None
+
             if t == "expand_search":
-                # do a broader search from *this* node and continue DFS
-                call = {"tool": "search_segments", "query": query, "top_k": 6}
-                cs = env.act(call)
-                cs_dict = env.context_to_dict(cs)
-                child = Node(depth=node.depth + 1, memory=node.memory + [compact_slice(cs_dict)])
-                return dfs_backtracking_controller(env, llm, query, child, global_state)
+                chosen = {"tool": "search_segments", "query": query, "top_k": 6}
+                return _do(env, llm, query, node, gs, chosen, "judge.backtrack=expand_search", decision=j)
+
             if t == "rewrite_query":
                 rq = bt.get("query", query)
                 node.last_rewritten_query = rq
-                call = {"tool": "search_segments", "query": rq, "top_k": 6}
-                cs = env.act(call)
-                cs_dict = env.context_to_dict(cs)
-                child = Node(depth=node.depth + 1, memory=node.memory + [compact_slice(cs_dict)])
-                return dfs_backtracking_controller(env, llm, query, child, global_state)
+                chosen = {"tool": "search_segments", "query": rq, "top_k": 6}
+                return _do(env, llm, query, node, gs, chosen, "judge.backtrack=rewrite_query", decision=j)
 
         nc = j.get("next_call")
         if nc:
-            cs = env.act(nc)
-            cs_dict = env.context_to_dict(cs)
-            child = Node(depth=node.depth + 1, memory=node.memory + [compact_slice(cs_dict)])
-            return dfs_backtracking_controller(env, llm, query, child, global_state)
+            ans = _do(env, llm, query, node, gs, nc, "judge.next_call", decision=j)
+            if ans is not None:
+                return ans
+            #if blocked/fails, continue to deterministic DFS fallback below
 
 
+            return _do(env, llm, query, node, gs, nc, "judge.next_call", decision=j)
+
+    # ---- If no segments yet, do initial search ----
     seg_candidates = _top_segments_from_memory(node.memory)
     if not seg_candidates:
-        call = {"tool": "search_segments", "query": query, "top_k": 3}
-        cs = env.act(call)
-        cs_dict = env.context_to_dict(cs)
-        new_mem = node.memory + [compact_slice(cs_dict)]
-        child = Node(depth=node.depth + 1, memory=new_mem)
-        return dfs_backtracking_controller(env, llm, query, child, global_state)
+        chosen = {"tool": "search_segments", "query": query, "top_k": 3}
+        return _do(env, llm, query, node, gs, chosen, "bootstrap.no_segments")
 
-
+    # ---- Manual DFS over candidate segments ----
     for seg in seg_candidates:
         if ("seg", seg) in node.tried:
             continue
         node.tried.add(("seg", seg))
 
-        refine_call = {"tool": "refine_in_segment", "query": query, "seg_idx": seg, "dense_fps": 8.0, "window_s": 2.0}
-        cs = env.act(refine_call)
-        cs_dict = env.context_to_dict(cs)
-        mem1 = node.memory + [compact_slice(cs_dict)]
+        chosen_refine = {
+            "tool": "refine_in_segment",
+            "query": query,
+            "seg_idx": seg,
+            "dense_fps": 8.0,
+            "window_s": 2.0,
+        }
+        # log+step but DON'T immediately recurse: we need child1 for windows
+        trace_controller_action(env.trace, node.depth, chosen_refine, f"dfs.refine.seg={seg}")
+        child1 = _step(env, node, chosen_refine, gs)
+        if child1 is None:
+            continue
 
-        wins = _top_windows_from_memory(mem1)
+        wins = _top_windows_from_memory(child1.memory)
         if not wins:
             continue
-        (t0, t1) = wins[-1]
+        t0, t1 = wins[-1]
 
-        insp_call = {"tool": "inspect_window", "query": query, "t0": t0, "t1": t1, "fps": 4.0, "top_m": 5}
-        cs2 = env.act(insp_call)
-        cs2_dict = env.context_to_dict(cs2)
-        mem2 = mem1 + [compact_slice(cs2_dict)]
+        chosen_inspect = {
+            "tool": "inspect_window",
+            "query": query,
+            "t0": t0,
+            "t1": t1,
+            "fps": 4.0,
+            "top_m": 5,
+        }
+        trace_controller_action(env.trace, child1.depth, chosen_inspect, "dfs.inspect")
+        child2 = _step(env, child1, chosen_inspect, gs)
+        if child2 is None:
+            continue
 
-        child = Node(
-            depth=node.depth + 1,
-            memory=mem2,
-            chosen_seg=seg,
-            chosen_window=(t0, t1),
+        # post-judge after inspect
+        j2, allow2, _allowed_tools2, judge_input2 = _judge_node(env, llm, query, child2)
+        trace_judge(
+            env.trace, child2.depth,
+            when="post", phase="judge_post",
+            query=query, allowlist=allow2.to_dict(),
+            decision=j2, judge_input=judge_input2,
         )
-
-        # --------------------------------------------------------------
-        # ### JUDGE INSERT #2: judge *after* you inspected (most useful)
-        # --------------------------------------------------------------
-        allow2 = _extract_numbers_from_notes(child.memory)
-        allow2["duration_s"] = float(getattr(env, "duration_s", 0.0) or 0.0)
-
-        if not allow2.get("allowed_windows"):
-            seg_len = float(getattr(env, "seg_len_s", 60.0) or 60.0)
-            wins = []
-            for seg in allow2.get("allowed_seg_idx", []):
-                t0 = seg * seg_len
-                t1 = min(t0 + seg_len, allow2["duration_s"] or (t0 + seg_len))
-                wins.append((round(t0, 2), round(t1, 2)))
-            allow2["allowed_windows"] = wins
-            allow2["last_best_window"] = wins[-1] if wins else None
-
-        j2 = llm.judge(
-            goal=query,
-            memory=child.memory,
-            allowlist=allow2,
-            allowed_tools=["search_segments", "refine_in_segment", "inspect_window"],
-            tool_schema=TOOL_SCHEMA,
-            temperature=0.0,
-            taxonomy_plan=child.plan
-        )
-        child.hypothesis = j2.get("hypothesis", "")
-        child.critique = j2.get("critique", "")
-        trace_judge(env.trace, child.depth, when="post", phase="judge_post", query=query, allowlist=allow2, decision=j2)
 
         if j2.get("convinced", False):
-            return _summarize_with_llm(llm, query, child.memory)
+            return _summarize_with_llm(llm, query, child2.memory)
 
         bt2 = j2.get("backtrack")
         if bt2 and bt2.get("type") == "try_next_segment":
-            continue  # <-- try next seg (this is local backtracking)
+            continue
 
-        # Otherwise, continue DFS down this branch (it may inspect more windows, etc.)
-        ans = dfs_backtracking_controller(env, llm, query, child, global_state)
-        
+        ans = dfs_backtracking_controller(env, llm, query, child2, gs)
         if ans is not None:
             return ans
 
+    # ---- fallback expand search once ----
     if ("expand_search", None) not in node.tried:
         node.tried.add(("expand_search", None))
-        call = {"tool": "search_segments", "query": query, "top_k": 6}
-        cs = env.act(call)
-        cs_dict = env.context_to_dict(cs)
-        child = Node(depth=node.depth + 1, memory=node.memory + [compact_slice(cs_dict)])
-        return dfs_backtracking_controller(env, llm, query, child, global_state)
+        chosen = {"tool": "search_segments", "query": query, "top_k": 6}
+        return _do(env, llm, query, node, gs, chosen, "fallback.expand_search_once")
 
     return None
 
@@ -415,68 +490,50 @@ Tax = Literal["S1","S2","S3","S4","S5"]
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-@dataclass
-class TaxonomyPlan:
-    tax: "Tax"          # S1..S5 enum/type you already have
-    intent: str         # e.g. "qa", "summarize", "translate", etc.
+def exec_call(env, call, gs):
+    if call is None:
+        return None
 
-    # ---- coarse routing ----
-    coarse_top_k: int = 3
+    tool = call.get("tool")
+    if not tool:
+        raise ValueError(f"exec_call: missing tool in call={call}")
 
-    # ---- escalation ladders (critical) ----
-    inspect_fps_ladder: List[float] = field(default_factory=lambda: [8.0, 16.0, 30.0, 60.0])
-    refine_window_ladder_s: List[float] = field(default_factory=lambda: [5.0, 3.0, 1.5])
-    refine_dense_fps_ladder: List[float] = field(default_factory=lambda: [8.0, 16.0, 30.0, 60.0])
+    # run tool first; only charge if it worked
+    cs = env.act(call)
 
-    # ---- coverage requirements ----
-    require_before_after: bool = False          # S5
-    require_lookback: bool = False             # S3
-    require_multiple_windows: bool = False     # S4/S5
-    min_distinct_windows: int = 2              # for S4/S5 aggregation
+    # ---- increment budgets AFTER success ----
+    gs.setdefault("n_calls", 0)
+    gs.setdefault("n_inspect", 0)
+    gs.setdefault("n_refine", 0)
+    gs.setdefault("n_heavy", 0)
 
-    # ---- stagnation & repetition control ----
-    max_repeat_same_window: int = 1            # don’t re-inspect same (t0,t1,fps) endlessly
-    min_score_improve: float = 0.01            # require evidence score improvement to keep escalating
+    gs["n_calls"] += 1
+    if tool == "inspect_window":
+        gs["n_inspect"] += 1
+    elif tool == "refine_in_segment":
+        gs["n_refine"] += 1
+    elif tool == "inspect_window_heavy":
+        gs["n_heavy"] += 1
 
-    # ---- budget / fallback ----
-    allow_full_pass_fallback: bool = True
-    max_inspect_calls: int = 12
-    max_refine_calls: int = 6
-    max_total_calls: int = 20                  # cap total tool calls per query
-
-
-def classify_query_to_taxonomy(q: str) -> TaxonomyPlan:
-    ql = q.lower()
-
-    # S5: ordering/contrast
-    if any(x in ql for x in ["before", "after", "change", "difference", "compared", "when did", "first", "then"]):
-        return TaxonomyPlan(tax="S5", intent="temporal ordering/contrast", require_before_after=True, require_multiple_windows=True)
-
-    # S3: delayed relevance / why/how
-    if any(x in ql for x in ["why", "how did", "how was", "what caused", "explain", "enable"]):
-        return TaxonomyPlan(tax="S3", intent="delayed causal evidence", require_lookback=True, coarse_top_k=6)
-
-    # S2: microevents/transient
-    if any(x in ql for x in ["press", "tap", "hit", "strike", "flip", "turn", "flick", "exact moment"]):
-        return TaxonomyPlan(tax="S2", intent="microevent/transient", refine_dense_fps=30.0, refine_window_s=2.0, inspect_fps=30.0)
-
-    # S4: distributed evidence / counts / repeated actions
-    if any(x in ql for x in ["how many", "every time", "repeated", "pattern", "throughout", "all the times"]):
-        return TaxonomyPlan(tax="S4", intent="distributed evidence across time", coarse_top_k=6, require_multiple_windows=True)
-
-    # default S1: fine-grained attribute/binding
-    return TaxonomyPlan(tax="S1", intent="fine-grained attribute/binding", refine_dense_fps=30.0, refine_window_s=5.0, inspect_fps=30.0)
-
+    return cs
 
 def run_recursive_controller(env: VideoEnv, llm: VLLMJsonToolLLM, query: str) -> str:
     plan = classify_query_to_taxonomy(query)
-    root = Node(depth=0, memory=[], plan=plan)
+    root = Node(depth=0, memory=[], plan=plan, evidence=EvidenceState())
 
+
+    env.trace = []
     global_state = {
-        "tried_calls": set(),
-        "failed_calls": [],
-        "notes": [],
+        "tried_calls": set(),          # hashable signatures of tool calls
+        "inspect_counts": {},          # (t0,t1,fps)->count
+        "n_calls": 0,
+        "n_inspect": 0,
+        "n_refine": 0,
+        "best_score": float("-inf"),
         "best_memory": [],
+        "n_heavy": 0,
+        "evidence_state": EvidenceState()
+
     }
 
     ans = dfs_backtracking_controller(env, llm, query, root, global_state)
@@ -517,6 +574,8 @@ def _safe_load_json(text: str) -> Dict[str, Any]:
     end = s.rfind("}")
     if start != -1 and end != -1 and end > start:
         candidate = s[start : end + 1]
+        candidate = _repair_numeric_exprs(candidate)
+
         try:
             return json.loads(candidate)
         except json.JSONDecodeError as e:
@@ -524,46 +583,31 @@ def _safe_load_json(text: str) -> Dict[str, Any]:
 
     raise ValueError(f"Could not find a JSON object in model output.\nRaw:\n{text}")
 
+import re
+
+def _repair_numeric_exprs(s: str) -> str:
+    """
+    Repairs simple numeric expressions like:
+        "t1": 53.68 + 5.0
+    into:
+        "t1": 58.68
+    """
+    pat = re.compile(r'(:\s*)(-?\d+(?:\.\d+)?)(\s*([+\-])\s*)(\d+(?:\.\d+)?)')
+
+    def repl(m):
+        prefix = m.group(1)
+        a = float(m.group(2))
+        op = m.group(4)
+        b = float(m.group(5))
+        val = a + b if op == "+" else a - b
+        return f"{prefix}{val:.6f}".rstrip("0").rstrip(".")
+
+    return pat.sub(repl, s)
+
 def _last_window_from_memory(memory):
     wins = _top_windows_from_memory(memory)
     return list(wins[-1]) if wins else None
 
-def _enforce_allowlist(call: Dict[str, Any], allow: Dict[str, Any], max_expand_s: float = 30.0) -> None:
-    tool = call.get("tool")
-    if tool != "inspect_window":
-        return
-
-    t0, t1 = float(call["t0"]), float(call["t1"])
-    if t1 <= t0:
-        raise ValueError("inspect_window requires t1>t0")
-
-    # Clamp sanity if you want
-    dur = allow.get("duration_s", None)
-    if dur is not None:
-        if t0 < -1e-3 or t1 > float(dur) + 1e-3:
-            raise ValueError(f"inspect_window out of bounds: [{t0},{t1}] dur={dur}")
-
-    # (A) allow if contained in any existing evidence window
-    wins = allow.get("allowed_windows", []) or []
-    for (a, b) in wins:
-        a, b = float(a), float(b)
-        if t0 >= a - 1e-3 and t1 <= b + 1e-3:
-            return
-
-    # (B) allow if close to anchor window (recursive expansion/backtrack)
-    anchor = allow.get("last_best_window", None)
-    if anchor is not None:
-        a0, a1 = float(anchor[0]), float(anchor[1])
-        # permit expanding/shift within +/- max_expand_s around anchor span
-        lo = max(0.0, a0 - max_expand_s)
-        hi = (float(dur) if dur is not None else a1 + max_expand_s)  # if no dur, still allow
-        if t0 >= lo - 1e-3 and t1 <= hi + 1e-3 and (t1 - t0) <= (a1 - a0) + 2*max_expand_s + 1e-3:
-            return
-
-    raise ValueError(
-        f"inspect_window [{t0},{t1}] not allowed. "
-        f"Need containment in evidence windows or within ±{max_expand_s}s of last_best_window."
-    )
 
 class VLLMJsonToolLLM:
     def __init__(self, model: str, base_url: str = "http://localhost:8000/v1", api_key: str = "EMPTY"):
@@ -579,9 +623,12 @@ class VLLMJsonToolLLM:
         allowed_tools: List[str],
         tool_schema: Dict[str, List[str]],
         temperature: float = 0.0,
-        taxonomy_plan: Optional["TaxonomyPlan"] = None,  # allow passing S1–S5 policy into the judge prompt
-
-    ) -> Dict[str, Any]:
+        taxonomy_plan: Optional["TaxonomyPlan"] = None,
+        judge_history: Optional[List[Dict[str, Any]]] = None,
+        gate_history: Optional[List[Dict[str, Any]]] = None,
+        controller_state: Optional[Dict[str, Any]] = None,
+        ) -> Dict[str, Any]:
+        # allow passing S1–S5 policy into the judge prompt
         """
         Text-RLM-style judge:
           - forms/updates hypothesis
@@ -637,9 +684,12 @@ class VLLMJsonToolLLM:
             "goal": goal,
             "allowed_tools": allowed_tools,
             "tool_schema": tool_schema,
-            "memory": memory[-6:],     # keep it small
+            "memory": memory,    
             "allowlist": allowlist,    # allowed_seg_idx, allowed_windows
             "taxonomy_plan": None if taxonomy_plan is None else taxonomy_plan.__dict__,  # expose plan knobs to judge
+            "judge_history": judge_history,
+            "gate_history" : gate_history,
+            "controller_state" : controller_state,
             "output_format": {
                 "hypothesis": "string (your current best guess)",
                 "critique": "string (what's missing / what conflicts)",
@@ -655,6 +705,7 @@ class VLLMJsonToolLLM:
                 "Be conservative: if you didn't inspect frames, you're usually not convinced."
             ]
         }
+
 
         resp = self.client.chat.completions.create(
             model=self.model,
@@ -685,6 +736,15 @@ class VLLMJsonToolLLM:
             j["next_call"] = None
             j["backtrack"] = None
             return j
+
+        #problem - if model return both then pick a deterministic policy
+        if next_call is not None and backtrack is not None:
+            j["backtrack"] = None
+            backtrack = None
+
+        #enforce: must have exactly one
+        next_call = j.get("next_call", None)
+        backtrack = j.get("backtrack", None)
 
         if (next_call is None) == (backtrack is None):
             # both None or both set => not acceptable
@@ -718,14 +778,18 @@ class VLLMJsonToolLLM:
 
     def decide(self, prompt: Dict[str, Any]) -> Dict[str, Any]:
         system_prompt = prompt.get("system", SYSTEM_PROMPT)
-
+        tool_schema = prompt.get("tool_schema", TOOL_SCHEMA)
         memory = (prompt.get("memory") or [])[-4:]
-        allow = _extract_numbers_from_notes(memory)
+        available = prompt.get("available_tools", []) or []
+        if available == ["summarize_answer"]:
+            allow = {}   # not needed for summarization
+        else:
+            allow = _extract_numbers_from_notes(memory)
 
         user_payload = {
             "goal": prompt["goal"],
             "available_tools": prompt["available_tools"],
-            "tool_schema": TOOL_SCHEMA,
+            "tool_schema": tool_schema,
             "memory": memory,
             "allowlist": allow,
         }
@@ -776,36 +840,46 @@ from typing import Any, Dict, List, Tuple, Optional
 def compact_slice(cs_dict: Dict[str, Any]) -> Dict[str, Any]:
     out = {"tool": cs_dict.get("tool")}
 
-    # ✅ keep the tool call so judge can see which seg/window was executed
     if "call" in cs_dict:
         out["call"] = cs_dict["call"]
-
-    # ✅ keep the short natural-language result (includes captions today)
     if "summary" in cs_dict:
         out["summary"] = cs_dict["summary"]
-
     if "window" in cs_dict:
         out["window"] = cs_dict["window"]
     if "stats" in cs_dict:
         out["stats"] = cs_dict["stats"]
 
+    # keep top_frames (small)
+    tfs = cs_dict.get("top_frames") or []
+    if tfs:
+        tf_keep = []
+        for tf in tfs[:5]:
+            t = tf.get("t")
+            if t is None:
+                continue
+            tf_keep.append({
+                "t": float(t),
+                "score": tf.get("score"),
+                "caption": tf.get("caption"),
+                "vlm_answer": tf.get("vlm_answer"),
+            })
+        if tf_keep:
+            out["top_frames"] = tf_keep
+
+    # keep evidence notes too (ensure dict)
     ev = cs_dict.get("evidence", []) or []
+    ev_out = []
+    for e in ev[:10]:
+        if isinstance(e, dict):
+            ev_out.append(e)
+        else:
+            try:
+                from dataclasses import asdict
+                ev_out.append(asdict(e))
+            except:
+                ev_out.append({"note": str(e)})
+    out["evidence"] = ev_out
 
-    def has_seg_or_window(e):
-        note = (e.get("note", "") or "")
-        return ("seg=" in note) or ("window=[" in note) or (note.startswith("[") and "," in note and note.endswith("]"))
-
-    keep = ev[:5] + [e for e in ev[5:] if has_seg_or_window(e)]
-
-    seen = set()
-    dedup = []
-    for e in keep:
-        k = e.get("note", repr(e))
-        if k not in seen:
-            seen.add(k)
-            dedup.append(e)
-
-    out["evidence"] = dedup
     return out
 
 from dataclasses import dataclass
@@ -817,8 +891,7 @@ def _round_win(t0: float, t1: float, ndigits: int = 2) -> Tuple[float, float]:
 
 def compute_trace_metrics(
     trace: List[Dict[str, Any]],
-    video_duration_s: float,
-) -> Dict[str, Any]:
+    video_duration_s: float,) -> Dict[str, Any]:
     tool_counts: Dict[str, int] = {}
     inspect_windows: List[Tuple[float, float]] = []
     unique_inspect_windows = set()
@@ -854,7 +927,7 @@ def compute_trace_metrics(
             # wallclock time spent inside refine (from your trace)
             refine_seconds_total += float(step.get("dt_s", 0.0) or 0.0)
 
-        elif tool == "inspect_window":
+        elif tool in ("inspect_window", "inspect_window_heavy"):
             n_inspect_calls += 1
             inspect_seconds_total += float(step.get("dt_s", 0.0) or 0.0)
 
