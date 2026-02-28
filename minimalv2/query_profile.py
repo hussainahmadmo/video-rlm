@@ -32,6 +32,13 @@ def classify_query(query: str) -> QueryProfile:
     # NEW: microevent / temporal-followup questions
     # dont change the if else ordering of the branches, dont want generic words in the 
     # below conditions to end up stealing temporal markers.
+    if any(m in q for m in temporal_markers):
+        return QueryProfile(
+            mode="microevent",
+            anchor_policy="best_score",     # best evidence of the anchor event
+            coverage_target=2,
+            require_temporal_pair=True,     # enforce two distinct windows
+        )
 
     if "why" in q or "cause" in q or "because" in q:
         return QueryProfile(mode="causal", anchor_policy="best_score", coverage_target=2)
