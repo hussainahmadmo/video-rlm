@@ -10,20 +10,44 @@ def pick_next_action(profile, state, actions):
     if not candidates:
         return None
 
+    # ----------------------
+    # ORDERING mode
+    # ----------------------
     if profile.mode == "ordering":
         if profile.anchor_policy == "earliest":
             return min(candidates, key=lambda a: a.t0)
         if profile.anchor_policy == "latest":
             return max(candidates, key=lambda a: a.t0)
 
-    if profile.mode == "distributed":
-        return candidates[0]  # already sorted by probe score
+    # ----------------------
+    # MICROEVENT mode
+    # ----------------------
+    if profile.mode == "microevent":
+        if not state.windows:
+            # first step → anchor by best CLIP score
+            return candidates[0]
 
-    if profile.mode == "causal":
+        # get earliest inspected window (anchor)
+        anchor_t0, anchor_t1 = min(state.windows, key=lambda w: w[0])
+
+        # prefer windows strictly AFTER anchor
+        after = [a for a in candidates if a.t0 >= anchor_t1]
+
+        if after:
+            # walk forward in time (temporal progression)
+            return min(after, key=lambda a: a.t0)
+
+        # if no later windows exist, fall back
         return candidates[0]
 
-    return candidates[0]
+    # ----------------------
+    # DISTRIBUTED / CAUSAL
+    # ----------------------
+    if profile.mode in ("distributed", "causal"):
+        return candidates[0]
 
+    # ATTRIBUTE default
+    return candidates[0]
 
 def propose_followup_window(anchor: tuple[float,float], *, direction: str, gap_s: float = 0.0, width_s: float = 4.0):
     """
