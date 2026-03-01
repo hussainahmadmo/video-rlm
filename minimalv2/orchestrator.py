@@ -7,7 +7,7 @@ from typing import Optional
 from query_profile import classify_query
 from state import BeliefState
 from actions import build_action_space
-from scheduler import pick_next_action, propose_followup_window
+from scheduler import pick_next_action, propose_followup_windows
 from stopping import stopping_rule
 from budget import Budget
 from tools import probe_index, inspect_window
@@ -37,7 +37,7 @@ def run(
 ):
     profile = classify_query(query)
     state = BeliefState()
-
+    direction = detect_direction(query)
     budget = Budget(
         max_dense_seconds=max_dense_seconds,
         max_frames=max_frames,
@@ -95,14 +95,61 @@ def run(
         )
 
         state.update_from_window(res)
+        
+        # -- microevent-- follows-up: inspect a temporally adjacent window ---
+        #only run this for microevent queries.
 
         if profile.mode == "microevent" and state.steps == 1:
-            ft0, ft1 = propose_followup_window(
+            direction = detect_direction(query)
+            width = (action.t1 - action.t0)
+
+            followups = propose_followup_windows(
                 (action.t0, action.t1),
                 direction=direction,
-                gap_s=0.0,
-                width_s=(action.t1 - action.t0),  # same length as anchor window
-            )
+                width_s=width,
+                gaps_s=[0.0, width, 3*width, 8*width],)   # <- tune this)
+
+            best_before = state.best_relevance_score
+
+            for (ft0, ft1) in followups:
+                # avoid duplicates / invalid windows
+                if ft1 <= ft0 or (ft0, ft1) in state.windows:
+                    continue
+
+                follow_res = inspect_window(
+                    video=video,
+                    t0=ft0,
+                    t1=ft1,
+                    stride=action.stride,
+                    resolution=action.resolution,
+                    query=query,
+                )
+
+
+                trace.append(
+                    {
+                        "action": {
+                            "t0": ft0,
+                            "t1": ft1,
+                            "stride": action.stride,
+                            "resolution": action.resolution,
+                            "followup_of": [action.t0, action.t1],
+                            "direction": direction,
+                            "gap_s": (ft0 - action.t1) if direction == "after" else (action.t0 - ft1),
+                        },
+                        "result": {
+                            "relevance_score": follow_res.relevance_score,
+                            "frames_encoded": follow_res.frames_encoded,
+                            "dense_seconds": follow_res.dense_seconds,
+                            "wallclock_s": follow_res.wallclock_s,
+                        },
+                    }
+                )
+                state.update_from_window(follow_res)
+
+                if (state.best_relevance_score - best_before) >= profile.eps_marginal_gain:
+                    break
+
 
     # 4) Final answer step (optional but you asked to add it)
     pred = None
