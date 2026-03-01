@@ -53,18 +53,32 @@ def run(
         topk=probe_topk,
     )
 
-    # 2) Build action space
-    actions = build_action_space(
-        candidates,
-        window_len=window_len_s,
-        topk=action_topk,
-    )
-
+    # 2) Build action space (mode-aware)
+    if profile.mode == "microevent":
+        # finer inspection for event transitions ("after", "then", etc.)
+        actions = build_action_space(
+            candidates,
+            window_len=2.0,          # shorter window to capture the transition
+            topk=action_topk,
+            # if you implemented Option A (multi-stride):
+            strides=[0.25, 0.5],     # fine + coarse
+            resolutions=["high"],
+            # if you implemented Option B (alignment):
+            # align="start",
+        )
+    else:
+        actions = build_action_space(
+            candidates,
+            window_len=window_len_s, # your default (4s)
+            topk=action_topk,
+            strides=[0.5],
+            resolutions=["high"],
+        )
     trace = []
 
     # 3) Deterministic schedule loop
     while not stopping_rule(state, profile, budget):
-        action = pick_next_action(profile, state, actions)
+        action = pick_next_action(profile, state, actions, direction=direction)
         if action is None:
             break
 
@@ -107,7 +121,8 @@ def run(
                 (action.t0, action.t1),
                 direction=direction,
                 width_s=width,
-                gaps_s=[0.0, width, 3*width, 8*width],)   # <- tune this)
+                gaps_s=[k * width for k in range(12)],  # 12 contiguous windows
+                )
 
             best_before = state.best_relevance_score
 
