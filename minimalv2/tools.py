@@ -144,8 +144,7 @@ class WindowResult:
     dense_seconds: float
     wallclock_s: float
     evidence: Optional[dict] = None   # NEW
-    source: str = "clip"              # NEW
-
+    source: str = "clip"   # "clip"|"ocr"|"asr"|"caption"|"objects"
 
 
 # ---------------------------
@@ -314,24 +313,117 @@ def probe_index(video: str, query: str, fps: float = 1.0, segment_len_s: float =
     return _PROBER.probe_video(video_path=video, query=query, fps=fps, segment_len_s=segment_len_s, topk=topk)
 
 
-def inspect_window(video: str, t0: float, t1: float, stride: float, resolution: str, query: Optional[str] = None):
+from typing import List, Optional
+import time
+import math
+from PIL import Image
+
+def _frames_in_window_decord(video_path: str, t0: float, t1: float, sample_fps: float) -> List[Image.Image]:
+    """
+    Random-access sampling with decord: only decode frames in [t0, t1].
+    """
+    from decord import VideoReader  # type: ignore
+    import numpy as np
+
+    vr = VideoReader(video_path)
+    src_fps = float(vr.get_avg_fps()) if hasattr(vr, "get_avg_fps") else 30.0
+    n = len(vr)
+
+    if sample_fps <= 0:
+        raise ValueError("sample_fps must be > 0")
+
+    # choose frame indices at desired sample_fps
+    start_idx = max(0, int(math.floor(t0 * src_fps)))
+    end_idx = min(n - 1, int(math.ceil(t1 * src_fps)))
+
+    # step in source-frame units to approximate sample_fps
+    step = max(1, int(round(src_fps / sample_fps)))
+
+    idxs = list(range(start_idx, end_idx + 1, step))
+    if not idxs:
+        return []
+
+    # batch decode
+    batch = vr.get_batch(idxs).asnumpy()  # (B, H, W, 3), RGB
+    return [Image.fromarray(frame) for frame in batch]
+
+
+def _frames_in_window_opencv(video_path: str, t0: float, t1: float, sample_fps: float, max_frames: Optional[int] = None) -> List[Image.Image]:
+    """
+    Seek + decode with OpenCV: only decode frames in [t0, t1].
+    """
+    import cv2  # type: ignore
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    if sample_fps <= 0:
+        raise ValueError("sample_fps must be > 0")
+
+    # seek near t0
+    cap.set(cv2.CAP_PROP_POS_MSEC, float(t0) * 1000.0)
+
+    step = max(1, int(round(src_fps / sample_fps)))
+    frames: List[Image.Image] = []
+
+    # We start reading from the seek point; use time from CAP_PROP_POS_MSEC
+    while True:
+        ok, frame_bgr = cap.read()
+        if not ok:
+            break
+
+        # current timestamp (seconds)
+        ts = (cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
+        if ts > t1:
+            break
+
+        # sample every `step` frames by skipping reads
+        # (OpenCV doesn't give us the frame index reliably after seeking, so we skip by grabbing extra frames)
+        frame_rgb = frame_bgr[:, :, ::-1]
+        frames.append(Image.fromarray(frame_rgb))
+
+        if max_frames is not None and len(frames) >= max_frames:
+            break
+
+        # skip step-1 frames quickly
+        for _ in range(step - 1):
+            ok2 = cap.grab()
+            if not ok2:
+                break
+
+    cap.release()
+    return frames
+
+
+def inspect_window(
+    video: str,
+    t0: float,
+    t1: float,
+    stride: float,
+    resolution: str,
+    query: Optional[str] = None,
+    source: str = "clip",
+):
     global _PROBER
     if _PROBER is None:
         _PROBER = CLIPProber()
 
     start = time.time()
-    duration = max(0.0, t1 - t0)
-    frames_encoded = max(1, int(duration / max(1e-6, stride)))
 
+    duration = max(0.0, t1 - t0)
     sample_fps = 1.0 / max(1e-6, stride)
 
-    frames: List[Image.Image] = []
-    for ts, img in iter_frames(video, fps=sample_fps):
-        if ts < t0:
-            continue
-        if ts > t1:
-            break
-        frames.append(img)
+    # decode only frames in the window (fast)
+    try:
+        frames = _frames_in_window_decord(video, t0, t1, sample_fps=sample_fps)
+    except Exception as e:
+        # fallback to OpenCV seek
+        # print(f"[inspect_window] decord window decode failed: {repr(e)} -> fallback opencv", flush=True)
+        frames = _frames_in_window_opencv(video, t0, t1, sample_fps=sample_fps)
+
+    frames_encoded = len(frames)
 
     relevance = 0.0
     if frames and query:
@@ -341,6 +433,7 @@ def inspect_window(video: str, t0: float, t1: float, stride: float, resolution: 
         relevance = float(max(sims)) if sims else 0.0
 
     wall = time.time() - start
+
     return WindowResult(
         t0=t0,
         t1=t1,
@@ -348,7 +441,6 @@ def inspect_window(video: str, t0: float, t1: float, stride: float, resolution: 
         frames_encoded=frames_encoded,
         dense_seconds=duration,
         wallclock_s=float(wall),
-        evidence = None,  # <-- NEW (text/tags/etc.)
-        source = "clip"              # <-- NEW ("clip"|"ocr"|"asr"|"caption"|"objects")
-
+        evidence=None,
+        source=source,
     )
