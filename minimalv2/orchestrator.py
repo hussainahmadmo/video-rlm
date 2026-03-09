@@ -30,17 +30,21 @@ def run(
     max_frames: int = 2000,
     max_wallclock_s: float = 60.0,
 
-    # ---- profiler (text LLM) ----
+    # profiler
     profiler_model: str = "YOUR_TEXT_PROFILER_MODEL",
-    profiler_base_url: str = "http://localhost:8000/v1",
+    profiler_base_url: str = "http://localhost:8001/v1",
 
-    # ---- answer endpoint (VLM served on same base_url usually) ----
+    # OCR stage
+    ocr_model: Optional[str] = None,
+    ocr_base_url: Optional[str] = None,
+
+    # final answer model
     answer_base_url: str = "http://localhost:8000/v1",
     answer_max_tokens: int = 64,
 
-    # Optional manual overrides (useful for ablations)
-    force_answer_model: Optional[str] = None,     # if set, overrides routing
-    disable_answer: bool = False,                 # useful when debugging search only
+    # overrides
+    force_answer_model: Optional[str] = None,
+    disable_answer: bool = False,
 ):
     # 0) LLM profiler decides policy + routing tiers + knobs
     policy = profile_query_llm(
