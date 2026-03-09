@@ -258,7 +258,8 @@ def run(
                         stride=0.5,
                         resolution="high",
                         max_frames=8,
-                    )
+                        model=ocr_model,
+                        base_url = ocr_base_url
                     txts = (o.evidence or {}).get("ocr_text", [])
                     if txts:
                         evidence_parts.append(
