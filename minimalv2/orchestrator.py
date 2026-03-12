@@ -10,7 +10,7 @@ from actions import build_action_space
 from scheduler import pick_next_action, propose_followup_windows
 from stopping import stopping_rule
 from budget import Budget
-from tools import probe_index, inspect_window, ocr_window
+from tools import probe_index, inspect_window, ocr_window, asr_window
 from cheap_answerer import TextAnswerer, TextAnswererConfig
 from model_registry import default_registry, pick_answer_model, pick_text_model
 from answerer import VLLMAnswerer, VLLMAnswererConfig
@@ -45,15 +45,50 @@ def run(
     # overrides
     force_answer_model: Optional[str] = None,
     disable_answer: bool = False,
-):
+
+    #ASR stage
+    asr_model: Optional[str] = None,
+    asr_base_url: Optional[str] = None,):
+
+    decision_log: Dict[str, Any] = {
+        "query": query,
+        "profiler": {},
+        "probe": {},
+        "scheduler_steps": [],
+        "window_selection": {},
+        "answer_stage": {},
+        "stop_reason": None,
+    }
+
+
     # 0) LLM profiler decides policy + routing tiers + knobs
-    policy = profile_query_llm(
+    policy, profiler_analysis = profile_query_llm(
         query,
         base_url=profiler_base_url,
         model=profiler_model,
         temperature=0.0,
         timeout_s=30.0,
     )
+
+    needs_high_detail = (
+            profiler_analysis.get("visual_detail_level") == "high"
+            or profiler_analysis.get("object_scale") == "small"
+            or bool(profiler_analysis.get("needs_precise_local_view", False))
+    )
+    answer_max_frames_per_window = 4 if needs_high_detail else 2
+    answer_max_images_total = 4 if needs_high_detail else 2
+    answer_jpeg_quality = 92 if needs_high_detail else 85
+
+    print("PROFILER ANALYSIS:", profiler_analysis)
+    print("DECISION POLICY:", asdict(policy))
+    
+
+    decision_log["profiler"] = {
+        "profiler_model": profiler_model,
+        "profiler_base_url": profiler_base_url,
+        "analysis" : profiler_analysis,
+        "compiled_policy" : asdict(policy)
+        }
 
     state = BeliefState()
     direction = detect_direction(query)
@@ -80,7 +115,25 @@ def run(
         segment_len_s=probe_seg_len_s,
         topk=probe_topk,
     )
+
     probe_wall = time.time() - probe_start
+
+    decision_log["probe"] = {
+        "probe_fps": probe_fps,
+        "probe_seg_len_s": probe_seg_len_s,
+        "probe_topk": probe_topk,
+        "num_candidates": len(clip_candidates),
+        "probe_wallclock_s": probe_wall,
+        "top_candidates_preview": [
+            {
+                "t0": getattr(c, "t0", None),
+                "t1": getattr(c, "t1", None),
+                "score": getattr(c, "score", None),
+            }
+            for c in clip_candidates[:10]
+        ],
+        }
+    
 
     # If you implemented update_from_probe, keep it
     if hasattr(state, "update_from_probe"):
@@ -95,20 +148,45 @@ def run(
 
     # 2) Build action space
     # Keep your microevent tighter windows logic, but driven by policy.mode/require_temporal_pair
+    q = query.lower()
+
+    is_next_action = any(x in q for x in [
+        "what did he do next",
+        "what did she do next",
+        "what happened next",
+        "what happens next",
+        "do next",
+    ])
+
+    is_fine_microevent = any(x in q for x in [
+        "immediately",
+        "exact moment",
+        "the instant",
+    ])
+
+    adaptive_window_len_s = window_len_s
+
     if policy.require_temporal_pair or policy.mode == "microevent":
+        if is_fine_microevent:
+            adaptive_window_len_s = 2.0
+        elif is_next_action:
+            adaptive_window_len_s = 4.0
+        else:
+            adaptive_window_len_s = 3.0
+
         actions = build_action_space(
             clip_candidates,
-            window_len=2.0,                 # tight
+            window_len=adaptive_window_len_s,
             topk=action_topk,
-            strides=list(policy.strides),   # usually (0.25, 0.5)
+            strides=list(policy.strides),
             resolutions=["high"],
         )
     else:
         actions = build_action_space(
             clip_candidates,
-            window_len=window_len_s,        # policy default
+            window_len=window_len_s,
             topk=action_topk,
-            strides=list(policy.strides),   # usually (0.5,)
+            strides=list(policy.strides),
             resolutions=["high"],
         )
 
@@ -151,7 +229,7 @@ def run(
         state.update_from_window(res)
 
         # 3b) microevent followups (your existing behavior)
-        if policy.mode == "microevent" and state.steps == 1:
+        if (policy.mode in {"microevent", "ordering"}) and policy.require_temporal_pair and state.steps == 1:
             direction = detect_direction(query)
             width = (action.t1 - action.t0)
 
@@ -245,26 +323,67 @@ def run(
                     "probe_segments_scanned": getattr(state, "probe_segments_scanned", None),
                 },
             }
+        
+        # Collect OCR evidence whenever OCR is part of the policy,
+        # even if we are not doing cheap text answering.
+        ocr_outputs = []
+
+        if "ocr" in policy.preferred_tools:
+            if not ocr_model or not ocr_base_url:
+                raise ValueError(
+                    "OCR requested by policy, but ocr_model or ocr_base_url is not set."
+                )
+
+            for (t0, t1) in vlm_windows:
+                o = ocr_window(
+                    video,
+                    t0,
+                    t1,
+                    stride=0.5,
+                    resolution="high",
+                    max_frames=8,
+                    model=ocr_model,
+                    base_url=ocr_base_url,
+                    
+                )
+                ocr_outputs.append(((t0, t1), o))
+
+        asr_outputs = []
+
+        if "asr" in policy.preferred_tools:
+            if not asr_model or not asr_base_url:
+                raise ValueError(
+                    "ASR requested by policy, but asr_model or asr_base_url is not set."
+                )
+
+            for (t0, t1) in vlm_windows:
+                a = asr_window(
+                    video,
+                    t0,
+                    t1,
+                    stride=0.5,
+                    resolution="high",
+                    query=query,
+                    model=asr_model,
+                    base_url=asr_base_url,
+                )
+                asr_outputs.append(((t0, t1), a))
+
+        
 
         if getattr(policy, "enable_cheap_stage", False):
             evidence_parts = []
-
-            for (t0, t1) in vlm_windows:
-                if "ocr" in policy.preferred_tools:
-                    o = ocr_window(
-                        video,
-                        t0,
-                        t1,
-                        stride=0.5,
-                        resolution="high",
-                        max_frames=8,
-                        model=ocr_model,
-                        base_url = ocr_base_url
-                    txts = (o.evidence or {}).get("ocr_text", [])
-                    if txts:
-                        evidence_parts.append(
-                            f"[OCR {t0:.1f}-{t1:.1f}] " + " ".join(txts)
-                        )
+            for (t0, t1), o in ocr_outputs:
+                txts = (o.evidence or {}).get("ocr_text", [])
+                if txts:
+                    evidence_parts.append(f"[OCR {t0:.1f}-{t1:.1f}] " + " ".join(txts))
+                    
+            for (t0, t1), a in asr_outputs:
+                txt = (a.evidence or {}).get("asr_text", "")
+                if txt:
+                    evidence_parts.append(
+                        f"[ASR {t0:.1f}-{t1:.1f}] {txt}"
+                    )
 
                 # later:
                 # if "caption" in policy.preferred_tools:
@@ -273,6 +392,7 @@ def run(
                 #     ...
 
             evidence = "\n".join(evidence_parts).strip()
+            print("CHEAP EVIDENCE:", evidence)
 
             if evidence:
                 text_model = pick_text_model(REG, policy.cheap_answer_tier)
@@ -289,6 +409,10 @@ def run(
                         question=query,
                         evidence=evidence,
                     )
+                    print("CHEAP TEXT MODEL:", text_model)
+                    print("CHEAP PRED:", cheap_pred)
+                    print("CHEAP CONF:", cheap_conf)
+                    print("CHEAP RAW:", cheap_raw)
 
                     if cheap_conf >= policy.text_answer_min_conf:
                         return {
@@ -305,6 +429,8 @@ def run(
                                 "answer_conf": cheap_conf,
                                 "stage": "cheap_text",
                                 "answer_raw": cheap_raw,
+                                "ocr_model" : ocr_model,
+                                "ocr_base_url" : ocr_base_url
 
                             },
                             "reasoning_metrics": {
@@ -323,6 +449,10 @@ def run(
 
         
         if chosen_answer_model is not None:
+            print("FALLING THROUGH TO VLM")
+            print("ANSWER MODEL:", chosen_answer_model)
+            print("ANSWER BASE URL:", answer_base_url)
+            print("ANSWER INPUT WINDOWS:", vlm_windows)
             ans = VLLMAnswerer(
                 VLLMAnswererConfig(
                     model=chosen_answer_model,
@@ -338,12 +468,15 @@ def run(
                 windows=vlm_windows,
                 question=query,
                 sample_fps=1.0,
-                max_frames_per_window=2,
+                max_frames_per_window=answer_max_frames_per_window,
                 mode=policy.mode,
                 max_windows=2,
-                max_images_total=2,
-                jpeg_quality=85,
+                max_images_total=answer_max_images_total,
+                jpeg_quality=answer_jpeg_quality,
             )
+
+            print("VLM ANSWER CONF:", answer_conf)
+            print("VLM ANSWER RAW:", answer_raw)
             
 
             # ---- fallback attempt if low confidence ----
@@ -434,9 +567,17 @@ def select_vlm_windows(policy, trace, *, direction: str, k_followups: int = 1):
         s = float(res.get("relevance_score", 0.0))
         scored.append(((t0, t1), s))
 
+    print("WINDOW SCORES:", [
+        {"t0": t0, "t1": t1, "score": s}
+        for ((t0, t1), s) in scored
+    ])
+
     if policy.mode != "microevent":
         scored.sort(key=lambda x: -x[1])
-        return [w for (w, _) in scored[: min(3, len(scored))]]
+        selected = [w for (w, _) in scored[: min(3, len(scored))]]
+        print("SELECTION RULE:", "top_score")
+        print("SELECTED VLM WINDOWS:", selected)
+        return selected
 
     if direction == "after":
         follow = [x for x in scored if x[0][0] >= a1]
@@ -449,7 +590,8 @@ def select_vlm_windows(policy, trace, *, direction: str, k_followups: int = 1):
     out.extend([w for (w, _) in follow[:k_followups]])
     out = list(dict.fromkeys(out))
     out.sort(key=lambda w: w[0])
+
+    print("SELECTION RULE:", "microevent_followup")
+    print("ANCHOR WINDOW:", (a0, a1))
+    print("SELECTED VLM WINDOWS:", out)
     return out
-
-
-
