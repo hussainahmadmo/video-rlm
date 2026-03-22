@@ -116,6 +116,14 @@ def run(
         topk=probe_topk,
     )
 
+    print("TOP CLIP CANDIDATES:")
+    for i, c in enumerate(clip_candidates[:20]):
+        print(i, {
+            "t0": getattr(c, "t0", None),
+            "t1": getattr(c, "t1", None),
+            "score": getattr(c, "score", None),
+        })
+
     probe_wall = time.time() - probe_start
 
     decision_log["probe"] = {
@@ -324,6 +332,11 @@ def run(
                 },
             }
         
+        # Expand the first selected VLM window by 2s on each side
+        first_t0, first_t1 = vlm_windows[0]
+        vlm_windows[0] = (max(0.0, first_t0 - 2.0), first_t1 + 2.0)
+
+        print("EXPANDED FIRST VLM WINDOW:", vlm_windows[0])
         # Collect OCR evidence whenever OCR is part of the policy,
         # even if we are not doing cheap text answering.
         ocr_outputs = []
@@ -348,15 +361,29 @@ def run(
                 )
                 ocr_outputs.append(((t0, t1), o))
 
+        # ASR can use a wider evidence set than the VLM
         asr_outputs = []
+        asr_windows = list(vlm_windows)
+        # For spoken-answer questions, transcribe more candidate windows
+        if "asr" in policy.preferred_tools and getattr(policy, "enable_cheap_stage", False):
+            extra_asr_windows = []
+            for c in clip_candidates[:8]:
+                t0 = float(c.t0)
+                t1 = float(c.t1)
+                w = (max(0.0, t0 - 2.0), t1 + 2.0)
+                if w not in extra_asr_windows:
+                    extra_asr_windows.append(w)
+
+            asr_windows = extra_asr_windows
+            print("ASR WINDOWS", asr_windows)
 
         if "asr" in policy.preferred_tools:
             if not asr_model or not asr_base_url:
                 raise ValueError(
                     "ASR requested by policy, but asr_model or asr_base_url is not set."
                 )
-
-            for (t0, t1) in vlm_windows:
+            
+            for (t0, t1) in asr_windows:
                 a = asr_window(
                     video,
                     t0,
@@ -368,8 +395,6 @@ def run(
                     base_url=asr_base_url,
                 )
                 asr_outputs.append(((t0, t1), a))
-
-        
 
         if getattr(policy, "enable_cheap_stage", False):
             evidence_parts = []
@@ -477,6 +502,45 @@ def run(
 
             print("VLM ANSWER CONF:", answer_conf)
             print("VLM ANSWER RAW:", answer_raw)
+
+            verify_raw = None
+
+            if "asr" in policy.preferred_tools and asr_outputs:
+                transcript_parts = []
+                for (t0, t1), a in asr_outputs:
+                    txt = (a.evidence or {}).get("asr_text", "")
+                    if txt:
+                        transcript_parts.append(f"[ASR {t0:.1f}-{t1:.1f}] {txt}")
+
+                transcript = "\n".join(transcript_parts).strip()
+                print("VERIFY TRANSCRIPT:", transcript)
+
+                if transcript:
+                    verifier_model = pick_text_model(REG, "cheap")
+                    if verifier_model is not None:
+                        verifier = TextAnswerer(
+                            TextAnswererConfig(
+                                model=verifier_model,
+                                base_url=profiler_base_url,
+                            )
+                        )
+
+                        verify_question = (
+                            f"Question: {query}\n"
+                            f"Candidate answer: {pred}\n\n"
+                            "Decide whether the candidate answer is directly supported by the transcript evidence. "
+                            "If unsupported, provide the corrected answer from the transcript.\n"
+                            'Return STRICT JSON ONLY with keys: '
+                            '{"supported": <true|false>, "corrected_answer": <string>, '
+                            '"confidence": <number 0..1>, "reason": <string>}'
+                        )
+
+                        _, _, verify_raw = verifier.answer_with_confidence(
+                            question=verify_question,
+                            evidence=transcript,
+                        )
+
+                        print("VERIFY RAW:", verify_raw)
             
 
             # ---- fallback attempt if low confidence ----
