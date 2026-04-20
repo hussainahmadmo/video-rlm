@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from typing import Dict
 
@@ -87,35 +88,61 @@ class WorkflowEngine:
             if dep in wf.stage_results
         }
 
+        submit_t = time.time()
+
         try:
             if spec.stage_type == StageType.VISUAL_INSPECT:
+                wait_start_t = time.time()
                 async with self.visual_sem:
+                    start_t = time.time()
                     result: StageResult = await runner.run(
                         workflow=wf,
                         spec=spec,
                         parent_results=parent_results,
                         reuse_cache=self.reuse_cache,
                     )
+                    end_t = time.time()
+
+                queue_wait_s = start_t - wait_start_t
             else:
+                start_t = time.time()
                 result: StageResult = await runner.run(
                     workflow=wf,
                     spec=spec,
                     parent_results=parent_results,
                     reuse_cache=self.reuse_cache,
                 )
+                end_t = time.time()
+                queue_wait_s = 0.0
+
+            result.metrics = dict(result.metrics or {})
+            result.metrics.update({
+                "submit_t": submit_t,
+                "start_t": start_t,
+                "end_t": end_t,
+                "stage_wall_s": end_t - start_t,
+                "queue_wait_s": queue_wait_s,
+            })
 
             wf.stage_results[stage_id] = result
             wf.stage_status[stage_id] = result.status
             return result
 
         except Exception as e:
+            fail_t = time.time()
             result = StageResult(
                 stage_id=stage_id,
                 workflow_id=workflow_id,
                 stage_type=spec.stage_type,
                 status=StageStatus.FAILED,
                 artifacts={},
-                metrics={},
+                metrics={
+                    "submit_t": submit_t,
+                    "start_t": fail_t,
+                    "end_t": fail_t,
+                    "stage_wall_s": 0.0,
+                    "queue_wait_s": 0.0,
+                },
                 error=str(e),
             )
             wf.stage_results[stage_id] = result
