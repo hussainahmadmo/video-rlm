@@ -8,86 +8,67 @@ import requests
 
 from policy_schema import ExecutionPolicy
 
+#analysis = semantic understanding of the question.
+#profile = 
+PROFILER_SYSTEM_PROMPT = """
+You are a query profiler for a video question answering system.
 
-
-PROFILER_SYSTEM_PROMPT = """You are a profiling and routing controller for a video question answering system.
-Your job: produce an ExecutionPolicy JSON that decides:
-- reasoning mode (attribute/ordering/microevent/distributed/causal)
-- tool plan (clip/ocr/caption/asr/objects)
-- model tiers:
-  - probe_tier
-  - caption_tier
-  - ocr_tier
-  - asr_tier
-  - cheap_answer_tier
-  - answer_tier
-  - fallback_answer_tier
-  each in {none,cheap,medium,strong}
-- whether to enable a cheap text-only answer stage before the VLM:
-  - enable_cheap_stage: bool
-  - text_answer_min_conf: float in [0,1]
-- windowing/budget knobs:
-  - probe_fps
-  - probe_seg_len_s
-  - probe_topk
-  - window_len_s
-  - strides
-  - action_topk
-- stopping knobs:
-  - max_steps
-  - eps_marginal_gain
-- escalation thresholds:
-  - min_retrieval_conf
-  - min_answer_conf
-
-IMPORTANT:
-- Output must be STRICT JSON only (no markdown, no explanations, no extra text).
-- Use conservative costs: prefer cheap tools/models if likely sufficient.
-- If question asks about reading words on screen/signs/subtitles, include OCR in preferred_tools.
-- If question asks about counting "how many" or "throughout the video", use distributed + captions/asr if helpful.
-- If question asks for ordering of events or "sequence", use ordering (or microevent if it asks about after/before a specific event).
-- If question asks "what happens after/before/then/next", use microevent and require_temporal_pair=true, smaller windows, finer stride.
-- Enable the cheap text-only answer stage when OCR/caption/ASR evidence is likely enough to answer before running a VLM.
-- If cheap text-only evidence is unlikely to be sufficient, set enable_cheap_stage=false.
-- If unsure, choose attribute with clip and moderate steps.
-- If the question mentions written words, labels, marked areas, logos, titles, signs, or text, include "ocr" in preferred_tools and set ocr_tier to at least "cheap".
-- If the question is likely answered by spoken content, narration, explanation, or dialogue, include "asr" in preferred_tools and set asr_tier to at least "cheap".
-- Questions asking what someone says, explains, mentions, or which option is correct based on speech should usually use ASR before relying on CLIP alone.
-- If the answer is unlikely to be recoverable from frames alone, prefer ASR-enabled routing.
-
-Example JSON output format:
+Given a user query, output STRICT JSON ONLY with the following schema:
 
 {
-  "mode": "attribute",
-  "anchor_policy": "best_score",
-  "coverage_target": 1,
-  "require_temporal_pair": false,
-  "preferred_tools": ["clip"],
-  "probe_tier": "cheap",
-  "caption_tier": "none",
-  "ocr_tier": "none",
-  "asr_tier": "none",
-  "enable_cheap_stage": false,
-  "cheap_answer_tier": "none",
-  "text_answer_min_conf": 0.75,
-  "answer_tier": "cheap",
-  "fallback_answer_tier": "none",
-  "probe_fps": 1.0,
-  "probe_seg_len_s": 5.0,
-  "probe_topk": 50,
-  "window_len_s": 4.0,
-  "strides": [0.5],
-  "action_topk": 50,
-  "max_steps": 20,
-  "eps_marginal_gain": 0.01,
-  "escalate_if_low_confidence": true,
-  "min_retrieval_conf": 0.15,
-  "min_answer_conf": 0.35,
-  "confidence": 0.8,
-  "rationale": "Simple visual attribute question."
+  "analysis": {
+    "scene_localization_cues": ["<string>", ...],
+    "primary_question_clause": "<string>",
+    "primary_question_target": "visual_attribute" | "visual_object" | "text_span" | "spoken_span" | "event" | "count" | "temporal_relation",
+    "required_evidence": ["clip" | "ocr" | "asr", ...],
+    "is_scene_description_only": true | false,
+    "needs_visible_text": true | false,
+    "needs_spoken_content": true | false,
+    "needs_temporal_reasoning": true | false,
+    "notes": "<short string>",
+    "visual_detail_level": "low" | "medium" | "high",
+    "object_scale": "large" | "medium" | "small" | "unknown",
+    "needs_precise_local_view": true | false,
+    "notes": "<short string>"
+  },
+  "profile": {
+    "evidence_sources": ["clip" | "ocr" | "asr", ...],
+    "answer_type": "visual_attribute" | "visual_object" | "text_span" | "spoken_span" | "event" | "count" | "temporal_relation",
+    "reference_type": "none" | "direct_answer" | "text_reference" | "speech_reference",
+    "temporal_requirement": "none" | "ordering" | "before_after" | "distributed" | "causal",
+    "inspection_pattern": "static_localized" | "temporal_followup" | "distributed_scan" | "speech_first" | "ocr_first",
+    "enable_cheap_stage": true | false,
+    "confidence": <float 0..1>,
+    "rationale": "<short string>"
+  }
 }
 
-Output STRICT JSON only.
+Guidelines:
+- First identify the actual thing being asked in the final question clause.
+- Earlier descriptive text is often only for scene localization.
+- Put scene-only descriptive cues into analysis.scene_localization_cues.
+- Put the real ask into analysis.primary_question_clause.
+- Use "ocr" only when written text on screen is important.
+- Use "asr" only when spoken language is important.
+- Use "clip" when the answer is mainly visual.
+- Use multiple evidence_sources only if more than one is clearly needed.
+- If the question asks for the text itself, use answer_type="text_span" and reference_type="direct_answer".
+- If the question mentions text only to identify a region/object, use reference_type="text_reference" and keep the true answer_type visual.
+- If the question asks for a visual property like shape, color, material, size, clothing, handheld item, or visible object, use clip and a visual answer_type.
+- If the question asks what happens first / before / after, use answer_type="temporal_relation".
+- Use temporal_requirement="none" for static questions.
+- Use inspection_pattern="static_localized" for static localized visual questions.
+- Use inspection_pattern="speech_first" for ASR-first questions.
+- Use inspection_pattern="ocr_first" for OCR-first questions.
+- enable_cheap_stage should be true only when OCR/ASR text alone may answer the question.
+- Do not let long scene descriptions dominate tool choice.
+- Output STRICT JSON only.
+- Also assess how visually demanding the question is.
+- Set analysis.visual_detail_level="high" for small handheld objects, accessories, fine-grained object distinctions, shape/material/border questions, or subtle visible differences.
+- Set analysis.object_scale="small" when the target object is likely small relative to the frame.
+- Set analysis.needs_precise_local_view=true when answering likely benefits from tighter or higher-detail visual inspection.
+- Use low or medium when the target is large, obvious, or scene-level.
+
 """
 
 def _extract_json(text: str) -> Dict[str, Any]:
@@ -182,13 +163,10 @@ def profile_query_llm(
     query: str,
     *,
     base_url: str = "http://localhost:8000/v1",
-    model: str = "gpt-4o-mini",   # you should set to a *text* model served by vLLM, or any OpenAI-compatible endpoint
+    model: str = "gpt-4o-mini",
     temperature: float = 0.0,
     timeout_s: float = 30.0,
-) -> ExecutionPolicy:
-    """
-    Calls OpenAI-compatible /chat/completions on `base_url`.
-    """
+):
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
         "model": model,
@@ -197,7 +175,7 @@ def profile_query_llm(
             {"role": "system", "content": PROFILER_SYSTEM_PROMPT},
             {"role": "user", "content": query},
         ],
-        "max_tokens": 512,
+        "max_tokens": 768,
     }
 
     r = requests.post(url, json=payload, timeout=timeout_s)
@@ -208,9 +186,114 @@ def profile_query_llm(
     print("\n===== RAW PROFILER OUTPUT =====")
     print(text)
     print("===== END RAW PROFILER OUTPUT =====\n")
+
     d = _extract_json(text)
-    d = _patch_policy_with_guardrails(query, d)
-    return _coerce_policy(d)
+
+    print("\n===== RAW PARSED PROFILER JSON =====")
+    print(json.dumps(d, indent=2))
+
+    analysis = d.get("analysis", {})
+    profile = d.get("profile", d)
+
+    print("\n===== RAW PROFILER ANALYSIS =====")
+    print(json.dumps(analysis, indent=2))
+
+    print("\n===== RAW PARSED PROFILE =====")
+    print(json.dumps(profile, indent=2))
+
+    profile = _patch_query_profile_with_guardrails(query, profile)
+
+    print("\n===== PATCHED PROFILE =====")
+    print(json.dumps(profile, indent=2))
+
+    qp = _coerce_query_profile(profile)
+    policy = _query_profile_to_execution_policy(qp)
+
+    print("\n===== COMPILED EXECUTION POLICY =====")
+    print(asdict(policy))
+
+    return policy, analysis
+
+from query_profile_schema import QueryProfile
+
+
+def _query_profile_to_execution_policy(qp: QueryProfile) -> ExecutionPolicy:
+    preferred_tools = tuple(qp.evidence_sources)
+
+    ocr_tier = "cheap" if "ocr" in qp.evidence_sources else "none"
+    asr_tier = "cheap" if "asr" in qp.evidence_sources else "none"
+
+    if qp.temporal_requirement in ("ordering", "before_after"):
+        mode = "ordering"
+        require_temporal_pair = True
+        window_len_s = 2.0
+        max_steps = 10
+        strides = (0.5,)
+    elif qp.temporal_requirement == "distributed":
+        mode = "distributed"
+        require_temporal_pair = False
+        window_len_s = 4.0
+        max_steps = 20
+        strides = (0.5,)
+    elif qp.temporal_requirement == "causal":
+        mode = "causal"
+        require_temporal_pair = False
+        window_len_s = 4.0
+        max_steps = 20
+        strides = (0.5,)
+    else:
+        mode = "attribute"
+        require_temporal_pair = False
+        window_len_s = 4.0
+        max_steps = 20
+        strides = (0.5,)
+
+    return ExecutionPolicy(
+        mode=mode,
+        anchor_policy="best_score",
+        coverage_target=1,
+        require_temporal_pair=require_temporal_pair,
+        preferred_tools=preferred_tools,
+        probe_tier="cheap",
+        caption_tier="none",
+        ocr_tier=ocr_tier,
+        asr_tier=asr_tier,
+        enable_cheap_stage=qp.enable_cheap_stage,
+        cheap_answer_tier="cheap" if qp.enable_cheap_stage else "none",
+        text_answer_min_conf=0.75,
+        answer_tier="cheap",
+        fallback_answer_tier="none",
+        probe_fps=1.0,
+        probe_seg_len_s=5.0,
+        probe_topk=50,
+        window_len_s=window_len_s,
+        strides=strides,
+        action_topk=50,
+        max_steps=max_steps,
+        eps_marginal_gain=0.01,
+        escalate_if_low_confidence=True,
+        min_retrieval_conf=0.15,
+        min_answer_conf=0.35,
+        confidence=qp.confidence,
+        rationale=qp.rationale,
+    )
+
+def _coerce_query_profile(d: Dict[str, Any]) -> QueryProfile:
+    evidence_sources = tuple(d.get("evidence_sources", ["clip"]))
+
+    if not evidence_sources:
+        evidence_sources = ("clip",)
+
+    return QueryProfile(
+        evidence_sources=evidence_sources,
+        answer_type=str(d.get("answer_type", "visual_object")),
+        reference_type=str(d.get("reference_type", "none")),
+        temporal_requirement=str(d.get("temporal_requirement", "none")),
+        inspection_pattern=str(d.get("inspection_pattern", "static_localized")),
+        enable_cheap_stage=bool(d.get("enable_cheap_stage", False)),
+        confidence=float(d.get("confidence", 0.6)),
+        rationale=str(d.get("rationale", "")),
+    )
 
 def _looks_speechish_question(query: str) -> bool:
     q = query.lower()
@@ -234,66 +317,228 @@ def _looks_speechish_question(query: str) -> bool:
 
     return any(m in q for m in speech_markers)
 
-def _patch_policy_with_guardrails(query: str, d: Dict[str, Any]) -> Dict[str, Any]:
+
+def _looks_textish_question(query: str) -> bool:
     q = query.lower()
 
-    # ---------- OCR/textish guardrail ----------
     text_markers = [
-        "text", "word", "words", "written",
-        "caption", "subtitles",
-        "sign", "label", "logo", "title",
-        "headline", "name", "number", "date",
-        "displayed", "shown", "marked",
+        "text",
+        "word",
+        "words",
+        "written",
+        "subtitle",
+        "subtitles",
+        "caption",
+        "captions",
+        "sign",
+        "label",
+        "logo",
+        "title",
+        "headline",
+        "name",
+        "number",
+        "date",
+        "displayed",
+        "shown",
+        "marked",
         "complete text",
+        "what is written",
+        "what does the text say",
+    ]
+    return any(m in q for m in text_markers)
+
+def _patch_query_profile_with_guardrails(query: str, d: Dict[str, Any]) -> Dict[str, Any]:
+    q = query.lower()
+
+    # Support both nested {"analysis": ..., "profile": ...} and flat dicts
+    analysis = d.get("analysis", {}) if isinstance(d.get("analysis"), dict) else {}
+    profile = d.get("profile", d) if isinstance(d.get("profile", d), dict) else dict(d)
+    profile = dict(profile)  # copy
+
+    primary_target = analysis.get("primary_question_target")
+    needs_spoken = bool(analysis.get("needs_spoken_content", False))
+    needs_visible_text = bool(analysis.get("needs_visible_text", False))
+    needs_temporal = bool(analysis.get("needs_temporal_reasoning", False))
+    required_evidence = list(analysis.get("required_evidence", []))
+
+
+    # Fallback when patch receives only flat profile
+    if primary_target is None:
+        primary_target = profile.get("answer_type")
+
+
+    text_markers = [
+        "text", "word", "words", "written", "subtitle", "subtitles",
+        "caption", "captions", "sign", "label", "logo", "title",
+        "headline", "name", "number", "date", "displayed", "shown",
+        "marked", "complete text", "what is written", "what does the text say",
     ]
 
-    if any(m in q for m in text_markers):
-        preferred = list(d.get("preferred_tools", ["clip"]))
+    speech_markers = [
+        "say", "says", "said", "speak", "speaks", "speaking",
+        "talk", "talking", "talks", "explain", "explains", "explaining",
+        "explained", "mention", "mentions", "mentioned", "according to",
+        "what does he say", "what does she say", "what is he saying",
+        "what is she saying", "what is being explained",
+        "what is the speaker saying", "what does the narrator say",
+    ]
 
-        # OCR should be first tool
-        if "ocr" not in preferred:
-            preferred = ["ocr"] + preferred
+    attribute_markers = [
+        "shape", "color", "material", "size", "border", "area", "region"
+    ]
+
+    ordering_markers = [
+        "first", "before", "after", "next", "then", "later", "earlier"
+    ]
+
+    has_text = any(m in q for m in text_markers)
+    has_speech = any(m in q for m in speech_markers)
+    has_attr = any(m in q for m in attribute_markers)
+    has_order = any(m in q for m in ordering_markers)
+
+    # ------------------------------------------------------------------
+    # 1) Respect structured analysis when available
+    # ------------------------------------------------------------------
+
+
+
+    # Spoken answer
+    if primary_target == "spoken_span":
+        profile["evidence_sources"] = ["asr"]
+        profile["answer_type"] = "spoken_span"
+        profile["reference_type"] = "direct_answer"
+        profile["temporal_requirement"] = "ordering" if needs_temporal else "none"
+        profile["inspection_pattern"] = "speech_first"
+        profile["enable_cheap_stage"] = True
+        return profile
+
+    # Visual target, no speech/text needed -> pure clip
+    if primary_target in {"visual_object", "visual_attribute"} and not needs_spoken and not needs_visible_text:
+        profile["evidence_sources"] = ["clip"]
+        profile["answer_type"] = primary_target
+        profile["reference_type"] = "none"
+        profile["temporal_requirement"] = "ordering" if needs_temporal else "none"
+        profile["inspection_pattern"] = "temporal_followup" if needs_temporal else "static_localized"
+        profile["enable_cheap_stage"] = False
+        return profile
+
+    # Visual target, but speech needed to localize the moment -> ASR + clip
+    if primary_target in {"visual_object", "visual_attribute"} and needs_spoken:
+        profile["evidence_sources"] = ["asr", "clip"]
+        profile["answer_type"] = primary_target
+        profile["reference_type"] = "speech_reference"
+        profile["temporal_requirement"] = "ordering" if needs_temporal else "none"
+        profile["inspection_pattern"] = "speech_first"
+        profile["enable_cheap_stage"] = False
+        return profile
+
+    # Visible text answer
+    if primary_target == "text_span" or needs_visible_text:
+        if primary_target in {"visual_object", "visual_attribute"}:
+            profile["evidence_sources"] = ["ocr", "clip"]
+            profile["answer_type"] = primary_target
+            profile["reference_type"] = "text_reference"
+            profile["temporal_requirement"] = "none"
+            profile["inspection_pattern"] = "ocr_first"
+            profile["enable_cheap_stage"] = False
         else:
-            preferred.remove("ocr")
-            preferred = ["ocr"] + preferred
+            profile["evidence_sources"] = ["ocr"]
+            profile["answer_type"] = "text_span"
+            profile["reference_type"] = "direct_answer"
+            profile["temporal_requirement"] = "none"
+            profile["inspection_pattern"] = "ocr_first"
+            profile["enable_cheap_stage"] = True
+        return profile
 
-        d["preferred_tools"] = preferred
-
-        if d.get("ocr_tier", "none") == "none":
-            d["ocr_tier"] = "cheap"
-
-        d["enable_cheap_stage"] = True
-        if d.get("cheap_answer_tier", "none") == "none":
-            d["cheap_answer_tier"] = "cheap"
-
-    # ---------- Speech/ASR guardrail ----------
-    if _looks_speechish_question(query):
-        preferred = list(d.get("preferred_tools", ["clip"]))
-
-        # ASR should be first tool
-        if "asr" not in preferred:
-            preferred = ["asr"] + preferred
+    # Temporal relation
+    if primary_target == "temporal_relation":
+        # If speech is involved, support both
+        if needs_spoken:
+            profile["evidence_sources"] = ["asr", "clip"]
+            profile["reference_type"] = "speech_reference"
+            profile["inspection_pattern"] = "speech_first"
         else:
-            preferred.remove("asr")
-            preferred = ["asr"] + preferred
+            profile["evidence_sources"] = ["clip"]
+            profile["reference_type"] = "none"
+            profile["inspection_pattern"] = "temporal_followup"
+        profile["answer_type"] = "temporal_relation"
+        profile["temporal_requirement"] = "ordering"
+        profile["enable_cheap_stage"] = False
+        return profile
+    
+    if analysis:
+        return profile
 
-        d["preferred_tools"] = preferred
+    # ------------------------------------------------------------------
+    # 2) Fallback heuristics only if analysis is missing/unhelpful
+    # ------------------------------------------------------------------
 
-        if d.get("asr_tier", "none") == "none":
-            d["asr_tier"] = "cheap"
+    # text is mentioned, but answer requested is a visual property
+    if has_text and has_attr:
+        profile["evidence_sources"] = ["ocr", "clip"]
+        profile["answer_type"] = "visual_attribute"
+        profile["reference_type"] = "text_reference"
+        profile["temporal_requirement"] = "none"
+        profile["inspection_pattern"] = "static_localized"
+        profile["enable_cheap_stage"] = False
+        return profile
 
-        d["enable_cheap_stage"] = True
-        if d.get("cheap_answer_tier", "none") == "none":
-            d["cheap_answer_tier"] = "cheap"
+    # direct text answer
+    if has_text and not has_attr:
+        profile["evidence_sources"] = ["ocr"]
+        profile["answer_type"] = "text_span"
+        profile["reference_type"] = "direct_answer"
+        profile["inspection_pattern"] = "ocr_first"
+        profile["enable_cheap_stage"] = True
+        if not has_order:
+            profile["temporal_requirement"] = "none"
+        return profile
 
-        # speech questions usually not microevent
-        temporal_markers = ["after", "before", "next", "then", "later", "earlier"]
-        if d.get("mode") == "microevent" and not any(t in q for t in temporal_markers):
-            d["mode"] = "attribute"
-            d["require_temporal_pair"] = False
+    # speech as reference only should not force spoken answer for visual targets
+    if has_speech and any(x in q for x in [
+        "on the screen", "visible", "present", "not present",
+        "which object", "what object", "wearing", "holding", "in his hand", "in her hand"
+    ]):
+        profile["evidence_sources"] = ["asr", "clip"]
+        profile["answer_type"] = "visual_object"
+        profile["reference_type"] = "speech_reference"
+        profile["temporal_requirement"] = "none"
+        profile["inspection_pattern"] = "speech_first"
+        profile["enable_cheap_stage"] = False
+        return profile
 
-    # ---------- consistency ----------
-    if d.get("enable_cheap_stage", False) and d.get("cheap_answer_tier", "none") == "none":
-        d["cheap_answer_tier"] = "cheap"
+    # pure speech answer
+    if has_speech:
+        profile["evidence_sources"] = ["asr"]
+        if has_order:
+            profile["answer_type"] = "temporal_relation"
+            profile["temporal_requirement"] = "ordering"
+        else:
+            profile["answer_type"] = "spoken_span"
+            profile["temporal_requirement"] = "none"
+        profile["reference_type"] = "direct_answer"
+        profile["inspection_pattern"] = "speech_first"
+        profile["enable_cheap_stage"] = True
+        return profile
 
-    return d
+    # visual ordering
+    if has_order:
+        profile["evidence_sources"] = ["clip"]
+        profile["answer_type"] = "temporal_relation"
+        profile["reference_type"] = "none"
+        profile["temporal_requirement"] = "ordering"
+        profile["inspection_pattern"] = "temporal_followup"
+        profile["enable_cheap_stage"] = False
+        return profile
+
+    # ordinary visual attribute/object
+    if has_attr:
+        profile["evidence_sources"] = ["clip"]
+        profile["answer_type"] = "visual_attribute"
+        profile["reference_type"] = "none"
+        profile["temporal_requirement"] = "none"
+        profile["inspection_pattern"] = "static_localized"
+        profile["enable_cheap_stage"] = False
+        return profile
+
+    return profile
