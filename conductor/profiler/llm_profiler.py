@@ -35,7 +35,7 @@ Given a user query, output STRICT JSON ONLY with the following schema:
     "evidence_sources": ["vlm" | "ocr" | "asr", ...],
     "answer_type": "visual_answer" | "spoken_span" | "text_span",
     "reference_type": "none" | "direct_answer" | "text_reference" | "speech_reference" | "visual_reference",
-    "inspection_pattern": "vlm_only" | "asr_only" | "ocr_only" | "vlm_anchor_then_asr" | "asr_anchor_then_vlm" | "vlm_anchor_then_ocr" | "ocr_anchor_then_vlm",
+    "inspection_pattern": "vlm_only" | "asr_only" | "ocr_only" | "vlm_anchor_then_asr" | "asr_anchor_then_vlm" | "vlm_anchor_then_ocr" | "ocr_anchor_then_vlm" | "asr_anchor_then_ocr",
     "confidence": <float 0..1>,
     "rationale": "<short string>"
   }
