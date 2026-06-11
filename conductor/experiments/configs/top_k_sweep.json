@@ -1,0 +1,52 @@
+[
+  {
+    "name": "k1",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 1,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "query_conditioned": false,
+    "num_windows": 0
+  },
+  {
+    "name": "k2",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 2,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "query_conditioned": false,
+    "num_windows": 0
+  },
+  {
+    "name": "k4",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 4,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "query_conditioned": false,
+    "num_windows": 0
+  },
+  {
+    "name": "k8",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 8,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "query_conditioned": false,
+    "num_windows": 0
+  },
+  {
+    "name": "k16",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 16,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "query_conditioned": false,
+    "num_windows": 0
+  }
+]

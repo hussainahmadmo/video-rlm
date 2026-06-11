@@ -1,0 +1,23 @@
+[
+  {
+    "name": "budget2",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 8,
+    "window_len_s": 8,
+    "vlm_budget": 2,
+    "query_conditioned": false,
+    "num_windows": 0
+  },
+
+  {
+    "name": "budget4",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 8,
+    "window_len_s": 8,
+    "vlm_budget": 4,
+    "query_conditioned": false,
+    "num_windows": 0
+  }
+]

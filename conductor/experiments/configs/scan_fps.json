@@ -1,0 +1,45 @@
+[
+  {
+    "name": "scan0.0156_k4_budget32",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 4,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "query_conditioned": false,
+    "num_windows": 0
+  },
+
+  {
+    "name": "scan0.0156_k8_budget32",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 8,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "query_conditioned": false,
+    "num_windows": 0
+  },
+
+  {
+    "name": "scan0.03125_k4_budget32",
+    "method": "clip_oneshot",
+    "scan_fps": 0.03125,
+    "clip_topk": 4,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "query_conditioned": false,
+    "num_windows": 0
+  },
+
+  {
+    "name": "scan0.03125_k8_budget32",
+    "method": "clip_oneshot",
+    "scan_fps": 0.03125,
+    "clip_topk": 8,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "query_conditioned": false,
+    "num_windows": 0
+  }
+]
