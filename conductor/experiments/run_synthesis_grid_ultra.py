@@ -199,17 +199,17 @@ def build_answer_prompt(question, choices, extra_context=None):
     label_text = ", ".join(labels)
 
     return f"""
-You are answering a multiple-choice question about a video.
-{context}
-Question:
-{question}
+        You are answering a multiple-choice question about a video.
+        {context}
+        Question:
+        {question}
 
-Choices:
-{format_choices(choices)}
+        Choices:
+        {format_choices(choices)}
 
-Return only one answer label from: {label_text}.
-Do not return any other letter.
-""".strip()
+        Return only one answer label from: {label_text}.
+        Do not return any other letter.
+        """.strip()
 
 
 def build_global_summary_prompt(item, query_conditioned):
@@ -437,22 +437,12 @@ def clip_topk_windows(
     k,
     window_len_s=8.0,
     scan_fps=1.0,
-    frames_per_candidate=1,
-    rerank_candidates=0,
-    stride_s=4.0,
 ):
     t0 = time.time()
-    #previosuy doing frame embedding change to window
-    # scan = build_frame_scan_embeddings(
-    #     video_path,
-    #     scan_fps=scan_fps,
-    # )
-
-    scan = build_window_embeddings(
+    scan = build_frame_scan_embeddings(
         video_path,
-        window_len_s,
-        stride_s,
-        frames_per_window=4,
+        scan_fps=scan_fps,
+        window_len_s=window_len_s,
     )
 
     model, _, device = get_clip_model()
@@ -488,130 +478,59 @@ def clip_topk_windows(
     scores = scores.cpu().numpy()
     raw_top = np.argsort(scores)[::-1][:k]
     print("\n[BASELINE TOPK]")
+
     for idx in raw_top:
+        w = scan["windows"][idx]
         print(
-            f"t={scan['timestamps'][idx]:.1f}s "
+            f"window={w[0]:.1f}-{w[1]:.1f}s "
             f"score={scores[idx]:.4f}"
         )
 
     top_idx = np.argsort(scores)[::-1]
 
+    selected = []
+    selected_windows = []
 
-    if rerank_candidates > 0:
-        top_idx = top_idx[:rerank_candidates]
-    else:
-        top_idx = top_idx[:k]
+    for idx in top_idx:
+        w = scan["windows"][idx]
 
-    reranked = []
+        overlap = False
 
+        for sw in selected_windows:
+            inter = max(0, min(w[1], sw[1]) - max(w[0], sw[0]))
+            union = max(w[1], sw[1]) - min(w[0], sw[0])
 
-    duration_s, _, _ = duration_fps_nframes(video_path)
+            if inter / union > 0.5:
+                overlap = True
+                break
+
+        if not overlap:
+            selected.append(idx)
+            selected_windows.append(w)
+
+        if len(selected) == k:
+            break
+
+    top_idx = selected
+
+    window_scores = []
 
     for idx in top_idx:
 
-        window = scan["windows"][idx]
-
-        window = [
-            max(0.0, t - window_len_s/2),
-            min(duration_s, t + window_len_s/2),
-        ]
-
-        imgs, _ = sample_clip_frames_for_scoring(
-            video_path,
-            window,
-            frames_per_candidate=frames_per_candidate,
-        )
-
-        batch = torch.stack([
-            _CLIP_PREPROCESS(img)
-            for img in imgs
-        ]).to(device)
-
-        torch.cuda.synchronize()
-        t_rerank = time.time()
-
-        image_features = model.encode_image(batch)
-
-        torch.cuda.synchronize()
-
-        LATENCY_STATS["clip_rerank_encode_s"] = (
-            LATENCY_STATS.get("clip_rerank_encode_s", 0)
-            + (time.time() - t_rerank)
-        )
-
-        image_features = image_features / image_features.norm(
-            dim=-1,
-            keepdim=True,
-        )
-
-        rerank_score = (
-            image_features
-            @ text_feat.T
-        ).mean()
-
-        reranked.append({
-            "timestamp": t,
-            "score": float(rerank_score),
-        })
-
-    print("\n[RERANK RAW]")
-    for x in reranked[:10]:
-        print(
-            f"t={x['timestamp']:.1f}s "
-            f"score={x['score']:.4f}"
-        )
-
-    reranked.sort(
-        key=lambda x: x["score"],
-        reverse=True,
-    )
-
-    print("\n[RERANK SORTED]")
-    for x in reranked[:10]:
-        print(
-            f"t={x['timestamp']:.1f}s "
-            f"score={x['score']:.4f}"
-        )
-
-    selected = []
-    selected_scores = []
-
-    for cand in reranked:
-        t = cand["timestamp"]
-        if all(abs(t - x) > window_len_s for x in selected):
-            selected.append(t)
-            selected_scores.append(cand["score"])
-        if len(selected) == k:
-            break
-    
-    window_scores = []
-
-    for t, score in zip(selected, selected_scores):
-
         window_scores.append({
-            "window": [
-                max(0.0, t - window_len_s / 2),
-                min(duration_s, t + window_len_s / 2),
-            ],
-            "score": score,
+            "window": scan["windows"][idx],
+            "score": float(scores[idx]),
         })
-
-
-
-    window_scores.sort(
-        key=lambda x: x["score"],
-        reverse=True,
-    )
 
     LATENCY_STATS["clip_total_s"] = time.time() - t0
 
-
-    candidate_windows_examined = len(scan["timestamps"])
+    candidate_windows_examined = len(scan["windows"])
 
     return {
         "top_windows": sorted(
             window_scores,
-            key=lambda x: x["window"][0],
+            key=lambda x: x["score"],
+            reverse=True,
         ),
         "candidate_windows_examined":
             candidate_windows_examined,
@@ -761,15 +680,6 @@ def run_clip_oneshot(item, config):
         k=config["clip_topk"],
         window_len_s=config["window_len_s"],
         scan_fps=config["scan_fps"],
-        frames_per_candidate=config.get(
-            "frames_per_candidate",
-            1,
-        ),
-        rerank_candidates=config.get(
-            "rerank_candidates",
-            0,
-        ),
-        stride_s=config["stride_s"],
     )
 
     top_windows = retrieval["top_windows"]
@@ -876,6 +786,7 @@ def run_clip_oneshot(item, config):
 def build_frame_scan_embeddings(
     video_path,
     scan_fps=2.0,
+    window_len_s=8.0,
     ):
 
     model, _, device = get_clip_model()
@@ -993,10 +904,23 @@ def build_frame_scan_embeddings(
     LATENCY_STATS["clip_decode_s"] = decode_time
     LATENCY_STATS["clip_encode_s"] = encode_time
 
-    timestamps = [
-        idx / fps
-        for idx in scan_idxs
-    ]
+    duration_s = nframes / fps
+
+    windows = []
+
+    for ts in all_times:
+
+        start = max(
+            0.0,
+            ts - window_len_s / 2
+        )
+
+        end = min(
+            duration_s,
+            ts + window_len_s / 2
+        )
+
+        windows.append([start, end])
 
     print(
         f"[PROFILE] "
@@ -1004,10 +928,10 @@ def build_frame_scan_embeddings(
         f"resize={resize_time:.2f}s "
         f"encode={encode_time:.2f}s"
     )
-
     return {
         "timestamps": all_times,
         "features": feats,
+        "windows": windows,
     }
 
 
@@ -1254,8 +1178,8 @@ def run_experiment(dataset, output, max_examples=None, resume=True):
                 "scan_fps": config.get("scan_fps"),
                 "config_name": config["name"],
                 "method": config["method"],
-                "num_windows": config["num_windows"],
-                "query_conditioned": config["query_conditioned"],
+                "num_windows": config.get("num_windows"),
+                "query_conditioned": config.get("query_conditioned"),
                 "vlm_budget": config.get("vlm_budget"),
                 "prediction_label": prediction_label,
                 "prediction_text": pred["prediction_text"],
@@ -1322,63 +1246,6 @@ def main():
         resume=not args.no_resume,
     )
 
-
-@torch.no_grad()
-def build_window_embeddings(
-    video_path,
-    window_len_s=8,
-    stride_s=4,
-    frames_per_window=4,
-):
-    model, _, device = get_clip_model()
-
-    duration_s, _, _ = duration_fps_nframes(video_path)
-
-    windows = make_sliding_windows(
-        duration_s,
-        window_len_s,
-        stride_s,
-    )
-
-    feats = []
-    metadata = []
-
-    for window in windows:
-
-        imgs, _ = sample_clip_frames_for_scoring(
-            video_path,
-            window,
-            frames_per_candidate=frames_per_window,
-        )
-
-        batch = torch.stack([
-            _CLIP_PREPROCESS(img)
-            for img in imgs
-        ]).to(device)
-
-        image_features = model.encode_image(batch)
-
-        image_features = (
-            image_features
-            / image_features.norm(dim=-1, keepdim=True)
-        )
-
-        window_feat = image_features.mean(0)
-
-        window_feat = (
-            window_feat
-            / window_feat.norm()
-        )
-
-        feats.append(window_feat)
-        metadata.append(window)
-
-    feats = torch.stack(feats)
-
-    return {
-        "features": feats,
-        "windows": metadata,
-    }
 
 
 if __name__ == "__main__":
