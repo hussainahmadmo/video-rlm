@@ -9,6 +9,7 @@ class Action:
     t1: float
     stride: float
     resolution: str
+    score: float = 0.0
 
 
 def build_action_space(
@@ -20,7 +21,8 @@ def build_action_space(
     resolutions: Optional[Iterable[str]] = None,
 ) -> list[Action]:
     """
-    Build inspect actions around each candidate.
+    Build inspect actions around ea
+     candidate.
     You can pass multiple strides to get multi-scale coverage.
     """
     candidates = sorted(candidates, key=lambda c: (-c.score, c.t0))[:topk]
@@ -35,7 +37,7 @@ def build_action_space(
 
         for s in strides:
             for r in resolutions:
-                actions.append(Action("inspect_window", base_t0, base_t1, s, r))
+                actions.append(Action("inspect_window", base_t0, base_t1, s, r, score=float(c.score)))
 
     # de-dupe exact duplicates while preserving order
     seen = set()

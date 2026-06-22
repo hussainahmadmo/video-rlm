@@ -1,6 +1,7 @@
 # scheduler.py
 
-def pick_next_action(profile, state, actions):
+# scheduler.py
+def pick_next_action(profile, state, actions, *, direction: str = "after"):
     inspected = state.windows
 
     def is_new(a):
@@ -10,43 +11,34 @@ def pick_next_action(profile, state, actions):
     if not candidates:
         return None
 
-    # ----------------------
-    # ORDERING mode
-    # ----------------------
     if profile.mode == "ordering":
         if profile.anchor_policy == "earliest":
             return min(candidates, key=lambda a: a.t0)
         if profile.anchor_policy == "latest":
             return max(candidates, key=lambda a: a.t0)
 
-    # ----------------------
-    # MICROEVENT mode
-    # ----------------------
     if profile.mode == "microevent":
-        if not state.windows:
-            # first step → anchor by best CLIP score
-            return candidates[0]
+        # If we don't have last_window yet, pick best probe-ranked action.
+        if state.last_window is None:
+            return max(candidates, key=lambda a: (a.score, -a.t0))
 
-        # get earliest inspected window (anchor)
-        anchor_t0, anchor_t1 = min(state.windows, key=lambda w: w[0])
+        last_t0, last_t1 = state.last_window
 
-        # prefer windows strictly AFTER anchor
-        after = [a for a in candidates if a.t0 >= anchor_t1]
+        if direction == "after":
+            pool = [a for a in candidates if a.t0 >= last_t1]
+            # prefer the nearest next window after what we just inspected
+            return min(pool, key=lambda a: a.t0) if pool else candidates[0]
 
-        if after:
-            # walk forward in time (temporal progression)
-            return min(after, key=lambda a: a.t0)
+        if direction == "before":
+            pool = [a for a in candidates if a.t1 <= last_t0]
+            # prefer the nearest previous window before what we just inspected
+            return max(pool, key=lambda a: a.t0) if pool else candidates[0]
 
-        # if no later windows exist, fall back
         return candidates[0]
 
-    # ----------------------
-    # DISTRIBUTED / CAUSAL
-    # ----------------------
     if profile.mode in ("distributed", "causal"):
         return candidates[0]
 
-    # ATTRIBUTE default
     return candidates[0]
 
 def propose_followup_window(anchor: tuple[float,float], *, direction: str, gap_s: float = 0.0, width_s: float = 4.0):
@@ -65,6 +57,18 @@ def propose_followup_window(anchor: tuple[float,float], *, direction: str, gap_s
 
 
 from typing import List, Tuple
+
+
+def pick_anchor_ordering(candidates, *, policy: str):
+    # 1) keep only the top fraction (or top N) by relevance
+    candidates = sorted(candidates, key=lambda a: -a.score)
+    top = candidates[: min(20, len(candidates))]  # e.g., top-20 relevant windows
+    # 2) pick earliest/latest among those relevant ones
+    if policy == "earliest":
+        return min(top, key=lambda a: a.t0)
+    if policy == "latest":
+        return max(top, key=lambda a: a.t1)  # or a.t0 if fixed-length
+    raise ValueError(policy)
 
 def propose_followup_windows(
     anchor: Tuple[float, float],

@@ -16,10 +16,19 @@ _CLIP_MODEL = None
 _CLIP_PREPROCESS = None
 _CLIP_DEVICE = None
 
+WINDOWS = [2, 5, 10, 15, 20]
+FRAMES_PER_WINDOW = [2]
 
-WINDOWS = [1, 3, 5, 10, 20]
-FRAMES_PER_WINDOW = [1, 2, 4, 8, 16]
 
+def format_choices(choices):
+    if not choices:
+        return ""
+
+    labels = ["A", "B", "C", "D", "E"]
+    return "\n".join(
+        f"{labels[i]}. {choice}"
+        for i, choice in enumerate(choices)
+    )
 
 def load_jsonl(path):
     rows = []
@@ -225,14 +234,21 @@ def sample_frames(video_path, windows, frames_per_window, jpeg_quality=85, max_s
     return images_b64, uniq_indices, decode_latency
 
 
-def call_vlm(client, model, question, images_b64, max_tokens=384):
+def call_vlm(client, model, question, images_b64, choices=None, max_tokens=384):
+    choice_text = format_choices(choices)
+
     content = [
         {
             "type": "text",
             "text": (
-                "Answer the video question using the sampled frames. "
-                "Be specific about the evidence and actions in the video.\n\n"
-                f"Question: {question}"
+                "Answer the video multiple-choice question using the sampled frames. "
+                "Choose exactly one option from A, B, C, D, or E. "
+                "Start your response with exactly this format:\n"
+                "Answer: <letter>\n"
+                "Explanation: <one short sentence>\n\n"
+                f"Question: {question}\n\n"
+                f"Choices:\n{choice_text}\n\n"
+                "Answer:"
             ),
         }
     ]
@@ -329,7 +345,10 @@ def main():
                             "qid": ex.get("qid"),
                             "type": "egoschema",
                             "video": video_path,
-                            "question": ex.get("question", ""),
+                            "question": ex["question"],
+                            "choices": ex.get("choices"),
+                            "answer_idx": ex.get("answer_idx"),
+                            "answer_label": ex.get("answer_label"),
                             "answer": ex.get("answer", ""),
                             "action_topk": k,
                             "frames_per_window": f,
@@ -359,6 +378,9 @@ def main():
                             "clip_batch_size": args.clip_batch_size,
                             "proposal_latency_s": proposal_latency_s,
                             "total_latency_with_proposal_s": proposal_latency_s,
+                            "choices": ex.get("choices"),
+                            "answer_idx": ex.get("answer_idx"),
+                            "answer_label": ex.get("answer_label"),
                         }
                         out.write(json.dumps(row) + "\n")
                         out.flush()
@@ -387,6 +409,7 @@ def main():
                             args.model,
                             ex["question"],
                             images_b64,
+                            choices=ex.get("choices"),
                             max_tokens=answer_max_tokens_effective,
                         )
 
@@ -398,6 +421,9 @@ def main():
                             "type": "egoschema",
                             "video": video_path,
                             "question": ex["question"],
+                            "choices": ex.get("choices"),
+                            "answer_idx": ex.get("answer_idx"),
+                            "answer_label": ex.get("answer_label"),
                             "answer": ex.get("answer", ""),
                             "action_topk": k,
                             "frames_per_window": f,
@@ -437,7 +463,10 @@ def main():
                             "qid": ex.get("qid"),
                             "type": "egoschema",
                             "video": video_path,
-                            "question": ex.get("question", ""),
+                            "question": ex["question"],
+                            "choices": ex.get("choices"),
+                            "answer_idx": ex.get("answer_idx"),
+                            "answer_label": ex.get("answer_label"),
                             "answer": ex.get("answer", ""),
                             "action_topk": k,
                             "frames_per_window": f,

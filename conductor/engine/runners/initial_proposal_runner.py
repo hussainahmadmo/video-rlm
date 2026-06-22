@@ -7,6 +7,9 @@ from conductor.retrieval.window_proposal import CandidateWindow, build_action_sp
 from conductor.retrieval.clip_window_ranker import CLIPWindowRanker
 
 class InitialProposalRunner(BaseRunner):
+    def __init__(self):
+        pass
+
     async def run(self, *, workflow, spec, parent_results, reuse_cache):
         duration_s = float(spec.payload["duration_s"])
 

@@ -19,8 +19,20 @@ _CLIP_DEVICE = None
 
 
 
-ACTION_TOPKS = [1, 3, 5, 10, 20]
-FRAMES_PER_WINDOW = [1, 2, 4, 8, 16]
+ACTION_TOPKS = [10]
+FRAMES_PER_WINDOW = [2]
+
+def format_choices(choices):
+    if not choices:
+        return ""
+
+    labels = ["A", "B", "C", "D", "E"]
+    return "\n".join(
+        f"{labels[i]}. {choice}"
+        for i, choice in enumerate(choices)
+    )
+
+
 def get_clip_model(device="cuda"):
     global _CLIP_MODEL, _CLIP_PREPROCESS, _CLIP_DEVICE
 
@@ -250,21 +262,46 @@ def summarize_window(client, model, question, window_id, window, image_urls, max
     return call_vlm(client, model, content, max_tokens)
 
 
-def final_answer(client, model, question, window_summaries, max_tokens):
+# def final_answer(client, model, question, window_summaries, max_tokens):
+#     evidence = "\n".join(
+#         [f"Window {i+1}: {s}" for i, s in enumerate(window_summaries)]
+#     )
+
+#     content = [
+#         {
+#             "type": "text",
+#             "text": (
+#                 "Answer the question using the window evidence below. "
+#                 "Mention the concrete evidence from the windows. "
+#                 "Be specific about actions, objects, and the overall goal.\n\n"
+#                 f"Question: {question}\n\n"
+#                 f"Window evidence:\n{evidence}\n\n"
+#                 "Final answer:"
+#             ),
+#         }
+#     ]
+
+#     return call_vlm(client, model, content, max_tokens)
+
+def final_answer(client, model, question, window_summaries, choices=None, max_tokens=384):
     evidence = "\n".join(
         [f"Window {i+1}: {s}" for i, s in enumerate(window_summaries)]
     )
+    choice_text = format_choices(choices)
 
     content = [
         {
             "type": "text",
             "text": (
-                "Answer the question using the window evidence below. "
-                "Mention the concrete evidence from the windows. "
-                "Be specific about actions, objects, and the overall goal.\n\n"
+                "Answer the video multiple-choice question using the window evidence below. "
+                "Choose exactly one option from A, B, C, D, or E. "
+                "Start your response with exactly this format:\n"
+                "Answer: <letter>\n"
+                "Explanation: <one short sentence>\n\n"
                 f"Question: {question}\n\n"
+                f"Choices:\n{choice_text}\n\n"
                 f"Window evidence:\n{evidence}\n\n"
-                "Final answer:"
+                "Answer:"
             ),
         }
     ]
@@ -413,7 +450,8 @@ def main():
                             args.model,
                             question,
                             window_summaries,
-                            answer_max_tokens_effective,
+                            choices=ex.get("choices"),
+                            max_tokens=answer_max_tokens_effective,
                         )
                         vlm_latency_s += final_lat
 
@@ -468,6 +506,9 @@ def main():
                             "type": "egoschema",
                             "video": video_path,
                             "question": question,
+                            "choices": ex.get("choices"),
+                            "answer_idx": ex.get("answer_idx"),
+                            "answer_label": ex.get("answer_label"),
                             "answer": ex.get("answer", ""),
                             "action_topk": k,
                             "frames_per_window": fpw,

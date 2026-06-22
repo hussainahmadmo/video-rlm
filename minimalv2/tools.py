@@ -1,11 +1,19 @@
 # tools.py
-
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Iterator, Optional, List, Tuple
 import math
 import time
+
+import base64
+import io
+import json
+import os
+import time
+import tempfile
+import requests
+
+from typing import List, Optional
 
 import numpy as np
 from PIL import Image
@@ -15,6 +23,11 @@ import clip
 _CAPTION_DB = None  # lazy global
 
 
+def _pil_to_data_url(img: Image.Image, jpeg_quality: int = 85) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=jpeg_quality)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{b64}"
 
 # ---------------------------
 # Caption Index (VideoAgent-style memory)
@@ -28,9 +41,11 @@ def ocr_window(
     resolution: str,
     *,
     max_frames: int = 8,
+    model=None,
+    base_url=None,
 ) -> WindowResult:
     """
-    Extract OCR text from sampled frames. Cheap-ish.
+    Extract OCR text from sampled frames using an OpenAI-compatible VLM endpoint.
     """
     start = time.time()
 
@@ -45,18 +60,77 @@ def ocr_window(
         if len(frames) >= max_frames:
             break
 
-    # TODO: replace with actual OCR
-    ocr_texts = []  # list[str]
-    # Example placeholder: empty
+    if not frames:
+        wall = time.time() - start
+        return WindowResult(
+            t0=t0,
+            t1=t1,
+            relevance_score=0.0,
+            frames_encoded=0,
+            dense_seconds=max(0.0, t1 - t0),
+            wallclock_s=float(wall),
+            evidence={"ocr_text": []},
+            source="ocr",
+        )
+
+    if not model or not base_url:
+        raise ValueError("ocr_window requires both model and base_url")
+
+    content = [
+        {
+            "type": "text",
+            "text": (
+                "Extract all visible text from these frames. "
+                "Return STRICT JSON ONLY in the format:\n"
+                '{"ocr_text": ["...","..."]}'
+            ),
+        }
+    ]
+
+    for img in frames:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": _pil_to_data_url(img),
+                },
+            }
+        )
+
+    payload = {
+        "model": model,
+        "temperature": 0.0,
+        "messages": [
+            {"role": "user", "content": content},
+        ],
+        "max_tokens": 256,
+    }
+
+    url = base_url.rstrip("/") + "/chat/completions"
+    r = requests.post(url, json=payload, timeout=120)
+    r.raise_for_status()
+    j = r.json()
+
+    raw = j["choices"][0]["message"]["content"]
+
+    try:
+        parsed = json.loads(raw)
+        ocr_texts = parsed.get("ocr_text", [])
+        if not isinstance(ocr_texts, list):
+            ocr_texts = []
+    except Exception:
+        # fallback: keep raw text if model didn't obey JSON
+        ocr_texts = [raw.strip()] if raw.strip() else []
 
     wall = time.time() - start
     return WindowResult(
-        t0=t0, t1=t1,
+        t0=t0,
+        t1=t1,
         relevance_score=0.0,
         frames_encoded=len(frames),
         dense_seconds=max(0.0, t1 - t0),
         wallclock_s=float(wall),
-        evidence={"ocr_text": ocr_texts},
+        evidence={"ocr_text": ocr_texts, "raw_ocr_response": raw},
         source="ocr",
     )
 
@@ -397,6 +471,20 @@ def _frames_in_window_opencv(video_path: str, t0: float, t1: float, sample_fps: 
     return frames
 
 
+import subprocess
+
+def has_audio_stream(video_path: str) -> bool:
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        video_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return bool(r.stdout.strip())
+
 def inspect_window(
     video: str,
     t0: float,
@@ -444,3 +532,142 @@ def inspect_window(
         evidence=None,
         source=source,
     )
+
+# keep your existing imports / WindowResult definition
+
+
+def _extract_audio_clip_ffmpeg(video_path: str, t0: float, t1: float) -> str:
+    """
+    Extract [t0, t1] audio into a temporary wav file.
+    Returns the temp file path.
+    """
+    import subprocess
+
+    duration = max(0.0, t1 - t0)
+    if duration <= 0:
+        raise ValueError(f"Invalid audio clip duration: {duration}")
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    out_path = tmp.name
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss", str(t0),
+        "-i", video_path,
+        "-t", str(duration),
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-ac", "1",
+        out_path,
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return out_path
+
+
+def asr_window(
+    video: str,
+    t0: float,
+    t1: float,
+    stride: float,
+    resolution: str,
+    *,
+    query: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout_s: float = 120.0,
+) -> WindowResult:
+    """
+    Extract ASR text from a video window using an OpenAI-compatible
+    /v1/audio/transcriptions endpoint.
+
+    Returns a WindowResult with evidence={"asr_text": "..."}.
+        evidence["asr_text"]
+        evidence["raw_asr_response"]
+        evidence["timing"] = {
+            "extract_s" : .....,
+            "request_s" : .....,
+            "total_s": .....,        
+        }
+    """
+    total_start = time.time()
+
+    if not model or not base_url:
+        raise ValueError("asr_window requires both model and base_url")
+
+    audio_path = None
+    try:
+        #1) Extract audio clip
+        extract_start = time.time()
+        audio_path = _extract_audio_clip_ffmpeg(video, t0, t1)
+        extract_end = time.time()
+
+        print("ASR TEMP AUDIO:", audio_path)
+        print("ASR WINDOW:", t0, t1)
+        print("ASR AUDIO SIZE:", os.path.getsize(audio_path))
+
+        url = base_url.rstrip("/") + "/audio/transcriptions"
+
+        #2) Send chunk to ASR server
+        with open(audio_path, "rb") as f:
+            files = {
+                "file": (os.path.basename(audio_path), f, "audio/wav"),
+            }
+            data = {
+                "model": model,
+            }
+
+            request_start = time.time()
+            r = requests.post(url, files=files, data=data, timeout=timeout_s)
+            request_end = time.time()
+
+            if not r.ok:
+                print("ASR STATUS:", r.status_code)
+                print("ASR RESPONSE TEXT:", r.text)
+                print("ASR URL:", url)
+                print("ASR MODEL:", model)
+                print("ASR AUDIO PATH:", audio_path)
+                print("ASR EXTRACT TIME S:", extract_end - extract_start)
+                print("ASR REQUEST TIME S:", request_end - request_start)
+                raise RuntimeError(f"ASR request failed: {r.status_code} {r.text}")
+
+            j = r.json()
+
+        #3) Parse transcript
+        asr_text = (j.get("text") or "").strip()
+        if not isinstance(asr_text, str):
+            asr_text = json.dumps(j)
+
+        total_end = time.time()
+
+        extract_s = float(extract_end - extract_start)
+        request_s = float(request_end - request_start)
+        total_s = float(total_end - total_start)
+
+        print("ASR EXTRACT TIME S:", extract_s)
+        print("ASR REQUEST+TRANSCRIBE TIME S:", request_s)
+        print("ASR TOTAL TIME S:", total_s)
+
+        return WindowResult(
+            t0=t0,
+            t1=t1,
+            relevance_score=0.0,
+            frames_encoded=0,
+            dense_seconds=max(0.0, t1 - t0),
+            wallclock_s=total_s,
+            evidence={
+                "asr_text": asr_text,
+                "raw_asr_response": j,
+                "timing": {
+                    "extract_s": extract_s,
+                    "request_s": request_s,
+                    "total_s": total_s,
+                },
+            },
+            source="asr",
+        )
+
+    finally:
+        print("KEEPING ASR TEMP AUDIO FOR DEBUG:", audio_path)

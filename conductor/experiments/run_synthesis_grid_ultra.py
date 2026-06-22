@@ -12,7 +12,7 @@ from PIL import Image
 from openai import OpenAI
 import torch.nn.functional as F
 import torch
-import clip
+from transformers import AutoModel, AutoProcessor
 
 from openai import OpenAI
 
@@ -38,8 +38,8 @@ client = OpenAI(
     api_key="EMPTY",
 )
 
-_CLIP_MODEL = None
-_CLIP_PREPROCESS = None
+_RETRIEVAL_MODEL = None
+_RETRIEVAL_PROCESSOR = None
 _CLIP_DEVICE = None
 _VR_CACHE = {}
 
@@ -57,7 +57,9 @@ class DecordVideo:
 
         self.vr = VideoReader(
             path,
-            ctx=cpu(0)
+            ctx=cpu(0),
+            width=224,
+            height=224,
             )
         
         print("CPU decode enabled")
@@ -76,6 +78,27 @@ class DecordVideo:
 
     def get_batch(self, indices):
         return self.vr.get_batch(indices)
+    
+def init_models():
+    global _RETRIEVAL_MODEL
+    global _RETRIEVAL_PROCESSOR
+
+    print("Loading SigLIP...")
+
+    _RETRIEVAL_PROCESSOR = AutoProcessor.from_pretrained(
+        "google/siglip-base-patch16-224"
+    )
+
+    _RETRIEVAL_MODEL = (
+        AutoModel.from_pretrained(
+            "google/siglip-base-patch16-224"
+        )
+        .to(CLIP_DEVICE)
+    )
+
+    _RETRIEVAL_MODEL.eval()
+
+    print("SigLIP loaded")
 
 def get_vr(video_path):
     if video_path not in _VR_CACHE:
@@ -94,6 +117,34 @@ def load_jsonl(path):
                 rows.append(json.loads(line))
     return rows
 
+
+def get_retrieval_model(device=None):
+    global _RETRIEVAL_MODEL
+    global _RETRIEVAL_PROCESSOR
+
+    if device is None:
+        device = CLIP_DEVICE
+
+    if _RETRIEVAL_MODEL is None:
+
+        _RETRIEVAL_PROCESSOR = AutoProcessor.from_pretrained(
+            "google/siglip-base-patch16-224"
+        )
+
+        _RETRIEVAL_MODEL = (
+            AutoModel.from_pretrained(
+                "google/siglip-base-patch16-224"
+            )
+            .to(device)
+        )
+
+        _RETRIEVAL_MODEL.eval()
+
+    return (
+        _RETRIEVAL_MODEL,
+        _RETRIEVAL_PROCESSOR,
+        device,
+    )
 
 def append_jsonl(row, path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -362,20 +413,6 @@ def call_llm_answer(prompt):
     return resp.choices[0].message.content
 
 
-def get_clip_model(device=None):
-    global _CLIP_MODEL, _CLIP_PREPROCESS, _CLIP_DEVICE
-
-    if device is None:
-        device = CLIP_DEVICE
-
-    if _CLIP_MODEL is None:
-        _CLIP_DEVICE = device if torch.cuda.is_available() else "cpu"
-        print(f"Loading CLIP ViT-B/32 on {_CLIP_DEVICE}", flush=True)
-        _CLIP_MODEL, _CLIP_PREPROCESS = clip.load("ViT-B/32", device=_CLIP_DEVICE)
-        _CLIP_MODEL.eval()
-
-    return _CLIP_MODEL, _CLIP_PREPROCESS, _CLIP_DEVICE
-
 def duration_fps_nframes(video_path):
     vr = get_vr(video_path)
     fps = float(vr.get_avg_fps())
@@ -439,24 +476,44 @@ def clip_topk_windows(
     scan_fps=1.0,
 ):
     t0 = time.time()
+
     scan = build_frame_scan_embeddings(
         video_path,
         scan_fps=scan_fps,
         window_len_s=window_len_s,
     )
 
-    model, _, device = get_clip_model()
+    model, processor, device = get_retrieval_model()
 
-    text_tokens = clip.tokenize(
-        [query],
-        truncate=True,
+    text_inputs = processor(
+        text=[query],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=64,
     ).to(device)
+
+    text_inputs = {
+        k: v.to(device)
+        for k, v in text_inputs.items()
+    }
+
+    print("QUERY:")
+    print(query)
+
+    print("INPUT_IDS SHAPE:")
+    print(text_inputs["input_ids"].shape)
+
+    print("TOKENS:")
+    print(text_inputs["input_ids"].shape[1])
 
     torch.cuda.synchronize()
 
     t_text = time.time()
 
-    text_feat = model.encode_text(text_tokens)
+    text_feat = model.get_text_features(
+        **text_inputs
+    )
 
     torch.cuda.synchronize()
 
@@ -470,10 +527,7 @@ def clip_topk_windows(
         keepdim=True,
     )
 
-    scores = (
-        scan["features"]
-        @ text_feat.T
-    ).squeeze(-1)
+    scores = (scan["features"] @ text_feat.T).squeeze(-1)
 
     scores = scores.cpu().numpy()
     raw_top = np.argsort(scores)[::-1][:k]
@@ -656,22 +710,14 @@ def sample_frames_from_windows(
     }
 
 
-def build_clip_query(item, use_choices=True):
-
-    if use_choices:
-        choices_text = format_choices(item["choices"])
-        return f"{item['question']}\n{choices_text}"
-
+def build_clip_query(item):
     return item["question"]
+
 
 def run_clip_oneshot(item, config):
     LATENCY_STATS.clear()
     query = build_clip_query(
         item,
-        use_choices=config.get(
-            "use_choices_in_query",
-            True,
-        ),
     )
 
     retrieval = clip_topk_windows(
@@ -698,6 +744,8 @@ def run_clip_oneshot(item, config):
     TOTAL_FRAMES = config["vlm_budget"]
     base = TOTAL_FRAMES // len(selected_windows)
     extra = TOTAL_FRAMES % len(selected_windows)
+
+    #step 8 - sample frames for selected windows
     frame_allocations = [
         base + (1 if i < extra else 0)
         for i in range(len(selected_windows))
@@ -789,24 +837,12 @@ def build_frame_scan_embeddings(
     window_len_s=8.0,
     ):
 
-    model, _, device = get_clip_model()
-
-
-    mean = torch.tensor(
-        [0.48145466,0.4578275,0.40821073],
-        device=device
-    ).view(1,3,1,1)
-
-    std = torch.tensor(
-        [0.26862954,0.26130258,0.27577711],
-        device=device
-    ).view(1,3,1,1)
+    model, processor, device = get_retrieval_model()
 
     vr = get_vr(video_path)
 
     fps = float(vr.get_avg_fps())
     nframes = len(vr)
-
 
     #step is computed from the video fps, so it automatically adapts such
     #so the fps is the property of the video. 
@@ -839,8 +875,6 @@ def build_frame_scan_embeddings(
         t0 = time.time()
         torch.cuda.synchronize()
 
-
-
         print(
             "[CHUNK]",
             chunk[0],
@@ -857,43 +891,36 @@ def build_frame_scan_embeddings(
         decode_time += time.time() - t
 
         t_resize = time.time()
-        batch = batch.to(device, non_blocking=True)
+        pil_images = [
+            Image.fromarray(x.cpu().numpy()).convert("RGB")
+            for x in batch
+        ]
 
-        #change shape from [N, H, W, C] to [N, C, H, W] - pytorch models pref [batch, channel, height, width]
-        batch = batch.permute(0,3,1,2)
-        batch = batch.float() / 255.0
-
-
-        #shrink every image from 1080 * 1920 to 240*240 so CLIP can process.
-        batch = F.interpolate(
-            batch,
-            size=(224,224),
-            mode="bicubic",
-            align_corners=False,
+        inputs = processor(
+            images=pil_images,
+            return_tensors="pt"
         )
-        batch = (batch - mean) / std
+
+        inputs = {
+            k: v.to(device)
+            for k, v in inputs.items()
+        }
+
+        feats = model.get_image_features(
+            **inputs
+        )
         torch.cuda.synchronize()
         resize_time += time.time() - t_resize
         t = time.time()
 
-        print(
-            "[ENCODE BATCH]",
-            batch.shape
-        )
-        feats = model.encode_image(batch)
-
         torch.cuda.synchronize()
-
         encode_time += time.time() - t
 
         feats = feats / feats.norm(
             dim=-1,
             keepdim=True,
         )
-
         all_feats.append(feats)
-
-
         all_times.extend(
             idx / fps
             for idx in chunk
@@ -1100,8 +1127,8 @@ def run_single_config(item, config):
 
     if config["method"] == "map_summary":
         return run_map_summary(item, config)
-
     raise ValueError(f"Unknown method: {config['method']}")
+
 
 
 def run_experiment(dataset, output, max_examples=None, resume=True):
@@ -1211,7 +1238,7 @@ def load_config_file(path):
     
 
 def main():
-
+    init_models()
     global EXPERIMENT_CONFIGS
 
     parser = argparse.ArgumentParser()

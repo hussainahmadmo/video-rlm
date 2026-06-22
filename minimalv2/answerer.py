@@ -87,14 +87,25 @@ def sample_window_frames(
     max_frames: int = 4,
 ) -> List[Image.Image]:
     frames: List[Image.Image] = []
+    picked_ts: List[float] = []
+
     for ts, img in iter_frames(video_path, fps=sample_fps):
         if ts < t0:
             continue
         if ts > t1:
             break
         frames.append(img)
+        picked_ts.append(ts)
         if len(frames) >= max_frames:
             break
+
+    print(
+        f"[sample_window_frames] video={video_path} "
+        f"window=({t0:.1f}, {t1:.1f}) fps={sample_fps} "
+        f"max_frames={max_frames} picked_ts={picked_ts}"
+        f"picked_ts={picked_ts}"
+
+    )
     return frames
 
 def _downscale(img: Image.Image, max_side: int) -> Image.Image:

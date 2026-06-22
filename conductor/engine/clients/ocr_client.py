@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import time
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 
+_OCR_POOL = ThreadPoolExecutor(max_workers=4)
 
 class OCRClient:
     def __init__(
@@ -129,18 +131,47 @@ class OCRClient:
         return sampled
 
     async def read_frames(self, frames: list) -> dict[str, Any]:
-        """
-        Minimal stub OCR model call.
-        Replace this later with a real OCR/VLM call.
-        """
+        import asyncio
+        import numpy as np
+        import pytesseract
+        from PIL import Image
+
         self._model_calls += 1
-
         t0 = time.time()
-        texts = []
-        for i, _frame in enumerate(frames):
-            texts.append(f"dummy OCR text from frame {i}")
-        t1 = time.time()
 
+        def to_pil(frame):
+            if isinstance(frame, Image.Image):
+                return frame
+
+            if isinstance(frame, np.ndarray):
+                if frame.ndim == 3 and frame.shape[2] == 3:
+                    # assume OpenCV-style BGR
+                    return Image.fromarray(frame[:, :, ::-1])
+                return Image.fromarray(frame)
+
+            if isinstance(frame, str):
+                # treat as image path
+                return Image.open(frame).convert("RGB")
+
+            if isinstance(frame, dict):
+                # try common fields
+                if "image" in frame:
+                    return to_pil(frame["image"])
+                if "frame" in frame:
+                    return to_pil(frame["frame"])
+                if "path" in frame:
+                    return Image.open(frame["path"]).convert("RGB")
+
+            raise TypeError(f"Unsupported frame type for OCR: {type(frame)} value={repr(frame)[:200]}")
+
+        def ocr_one(frame):
+            img = to_pil(frame)
+            text = pytesseract.image_to_string(img)
+            return text.strip()
+
+        texts = await asyncio.to_thread(lambda: [ocr_one(f) for f in frames])
+
+        t1 = time.time()
         self._timing["model_inference_s"] += (t1 - t0)
 
         return {

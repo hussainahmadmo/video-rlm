@@ -15,7 +15,6 @@ from cheap_answerer import TextAnswerer, TextAnswererConfig
 from model_registry import default_registry, pick_answer_model, pick_text_model
 from answerer import VLLMAnswerer, VLLMAnswererConfig
 from llm_profiler import profile_query_llm
-
 REG = default_registry()
 
 LoadLevel = Literal["low", "medium", "high"]
@@ -54,16 +53,12 @@ class QueryProfile:
     enable_cheap_stage: bool = False
     text_answer_min_conf: float = 0.75
     min_answer_conf: float = 0.60
-
-
 @dataclass
 class SchedulerState:
     load_level: LoadLevel = "low"
     current_active_requests: int = 0
     available_memory_fraction: float = 1.0
     queue_delay_s: float = 0.0
-
-
 @dataclass
 class ExecutionConfig:
     name: str
@@ -110,8 +105,6 @@ class ExecutionConfig:
 
     # cost estimate for load-aware scheduling
     estimated_cost: float = 1.0
-
-
 @dataclass
 class RunContext:
     query: str
@@ -140,6 +133,7 @@ class RunContext:
     ocr_outputs: list = field(default_factory=list)
     asr_outputs: list = field(default_factory=list)
     asr_windows: list[tuple[float, float]] = field(default_factory=list)
+    total_asr_time_s: float = 0.0
 
     # answer outputs
     pred: Optional[str] = None
@@ -165,7 +159,6 @@ class RunContext:
         "stop_reason": None,
     })
 
-
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
@@ -184,7 +177,6 @@ def reasoning_metrics(state: BeliefState) -> dict:
         "probe_segments_scanned": getattr(state, "probe_segments_scanned", None),
     }
 
-
 def detect_direction(q: str) -> str:
     q = q.lower()
     after = any(w in q for w in ["after", "afterwards", "then", "next", "following", "later"])
@@ -195,12 +187,10 @@ def detect_direction(q: str) -> str:
         return "before"
     return "after"
 
-
 def _safe_get(obj: Any, key: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
-
 
 def estimate_config_cost(config: ExecutionConfig) -> float:
     cost = 0.0
@@ -225,7 +215,6 @@ def estimate_config_cost(config: ExecutionConfig) -> float:
         cost += 3.0
 
     return cost
-
 
 def budget_threshold_for_load(scheduler_state: SchedulerState) -> float:
     if scheduler_state.load_level == "low":
@@ -295,7 +284,6 @@ def infer_query_profile(ctx: RunContext) -> None:
 
     print("PROFILER ANALYSIS:", profiler_analysis)
     print("QUERY PROFILE:", asdict(qp))
-
 
 #first adaptation step
 def candidate_configs_from_profile(qp: QueryProfile) -> list[ExecutionConfig]:
@@ -533,7 +521,41 @@ def candidate_configs_from_profile(qp: QueryProfile) -> list[ExecutionConfig]:
 
     return cfgs
 
-#
+def config_priority_for_load(cfg: ExecutionConfig, scheduler_state: SchedulerState) -> tuple:
+    """
+    Higher tuple is better.
+    Under low load, prefer richer multimodal / non-CLIP-only configs.
+    Under high load, prefer cheaper configs.
+    """
+    multimodal_score = int(cfg.run_asr) + int(cfg.run_ocr) + int(cfg.run_vlm)
+    clip_only_penalty = int(
+        cfg.run_clip_probe and not cfg.run_asr and not cfg.run_ocr
+    )
+
+    if scheduler_state.load_level == "low":
+        return (
+            multimodal_score,                  # prefer more modalities
+            int(cfg.proposal_strategy == "hybrid"),
+            int(cfg.proposal_strategy == "asr_first"),
+            -clip_only_penalty,                # avoid pure clip-first if alternatives exist
+            cfg.estimated_cost,                # among similar configs, allow richer cost
+        )
+
+    if scheduler_state.load_level == "medium":
+        return (
+            int(cfg.proposal_strategy == "hybrid"),
+            multimodal_score,
+            -clip_only_penalty,
+            -cfg.estimated_cost,               # slightly prefer cheaper
+        )
+
+    # high load
+    return (
+        -cfg.estimated_cost,                  # cheapest first
+        int(cfg.run_cheap_text_stage),
+        int(not cfg.run_vlm),
+    )
+
 def pick_fitting_config(
     candidate_configs: list[ExecutionConfig],
     scheduler_state: SchedulerState,
@@ -541,12 +563,40 @@ def pick_fitting_config(
     threshold = budget_threshold_for_load(scheduler_state)
 
     fitting = [cfg for cfg in candidate_configs if cfg.estimated_cost <= threshold]
-    if fitting:
-        fitting.sort(key=lambda c: c.estimated_cost, reverse=True)
-        return fitting[0]
+    pool = fitting if fitting else candidate_configs
 
-    candidate_configs = sorted(candidate_configs, key=lambda c: c.estimated_cost)
-    return candidate_configs[0]
+    pool = sorted(
+        pool,
+        key=lambda cfg: config_priority_for_load(cfg, scheduler_state),
+        reverse=True,
+    )
+    return pool[0]
+
+def filter_candidate_configs_for_load(
+    candidate_configs: list[ExecutionConfig],
+    scheduler_state: SchedulerState,
+) -> list[ExecutionConfig]:
+    """
+    Optional pre-filter before config selection.
+
+    Under low load:
+    - prefer richer configs if they exist
+    - specifically keep configs that use ASR, OCR, or non-clip-only
+      proposal strategies such as hybrid / asr_first
+
+    Under medium/high load:
+    - do not filter; let the ranking function decide
+
+    If no richer configs exist, return the original list unchanged.
+    """
+    if scheduler_state.load_level != "low":
+        return candidate_configs
+
+    richer = [
+        cfg for cfg in candidate_configs
+        if cfg.run_asr or cfg.run_ocr or cfg.proposal_strategy in {"hybrid", "asr_first"}
+    ]
+    return richer if richer else candidate_configs
 
 def select_config_with_override(
     candidate_configs: list[ExecutionConfig],
@@ -589,15 +639,45 @@ def setup_run(
     max_wallclock_s: float,
     scheduler_state: SchedulerState,
     force_config_name: Optional[str] = None,
+    force_execution_config: Optional[ExecutionConfig] = None,
 ) -> None:
+    # Step 1:
+    # Run the query profiler to produce a normalized QueryProfile.
+    # This gives us the query type, preferred tools, and default knobs.
     infer_query_profile(ctx)
-
+    # Step 2:
+    # Generate all candidate execution configs that are compatible
+    # with the query profile.
     candidate_configs = candidate_configs_from_profile(ctx.query_profile)
-    ctx.execution_config = select_config_with_override(
-        candidate_configs,
-        scheduler_state,
-        force_config_name=force_config_name,
-    )
+
+    # Step 3:
+    # Only apply load-based filtering when we are NOT forcing a config.
+    # Why:
+    # If force_config_name is provided (e.g. "visual_expensive" for a baseline),
+    # we should not remove that config before override selection happens.
+    # Otherwise, low-load filtering could remove the forced config an cause an "Unknown force_config_name" error.
+    if force_config_name is None:
+        candidate_configs = [force_execution_config]
+        ctx.execution_config = force_execution_config
+    else:
+        candidate_configs = candidate_configs_from_profile(ctx.query_profile)
+        if force_config_name is None:
+            candidate_configs = filter_candidate_configs_for_load(
+                candidate_configs,
+                scheduler_state
+            )
+        ctx.execution_config = select_config_with_override(
+            candidate_configs,
+            scheduler_state,
+            force_config_name=force_config_name,
+        )
+            
+    # Step 4:
+    # Pick the final execution config.
+    # - If force_config_name is set, this bypasses normal load-aware selection
+    #   and directly chooses the requested config.
+    # - Otherwise, the scheduler selects the best fitting config according
+    #   to cost budget and load-aware priority ranking.
 
     ctx.state = BeliefState()
     ctx.budget = Budget(
@@ -872,10 +952,31 @@ def select_vlm_windows(query_mode: str, trace, *, direction: str, k_followups: i
     print("SELECTED VLM WINDOWS:", out)
     return out
 
+
+import cv2
+
+def get_video_duration_s(video_path: str) -> float:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
+
+    if fps is None or fps <= 0 or frame_count is None or frame_count <= 0:
+        raise RuntimeError(f"Could not determine duration for video: {video_path}")
+
+    return float(frame_count) / float(fps)
+
+
 #Coarse ASR-first window proposal:
 #partition the video into fixed-duration chunks, transcribe each chunk,
 #score chunks by transcript overlap with query, and return the
 #top-ranked windows as ASR candidates for downstream answering.
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 def propose_asr_windows_from_chunks(
     ctx: RunContext,
     *,
@@ -883,12 +984,27 @@ def propose_asr_windows_from_chunks(
     asr_base_url: str,
     chunk_len_s: float = 30.0,
     topk: int = 5,
-) -> list[tuple[float, float]]:
+    max_workers: int = 8,
+) -> list[dict]:
+    """
+    Returns selected scored ASR chunks, not just windows.
+    Each item has:
+      {"window": (t0, t1), "score": ..., "asr": ..., "text_preview": ...}
+
+    Logged timing:
+      - asr_chunk_scan_wallclock_s: end-to-end elapsed time for scanning this video
+      - asr_chunk_request_time_sum_s: sum of per-chunk request_s (excludes extraction)
+      - asr_chunk_request_time_avg_s: average per-chunk request_s
+      - asr_chunk_request_time_max_s: max per-chunk request_s
+    """
     if ctx.clip_candidates:
         max_t1 = max(float(getattr(c, "t1", 0.0)) for c in ctx.clip_candidates)
     elif ctx.vlm_windows:
         max_t1 = max(float(t1) for _, t1 in ctx.vlm_windows)
     else:
+        max_t1 = get_video_duration_s(ctx.video)
+
+    if max_t1 <= 0:
         return []
 
     windows: list[tuple[float, float]] = []
@@ -898,9 +1014,9 @@ def propose_asr_windows_from_chunks(
         t += chunk_len_s
 
     q_words = set(ctx.query.lower().replace("?", "").replace(",", "").split())
-    scored = []
 
-    for (t0, t1) in windows:
+    def _run_one(window: tuple[float, float]) -> dict:
+        t0, t1 = window
         a = asr_window(
             ctx.video,
             t0,
@@ -916,14 +1032,51 @@ def propose_asr_windows_from_chunks(
         txt_words = set(txt.replace("?", "").replace(",", "").split())
         overlap = len(q_words & txt_words)
 
-        scored.append({
+        timing = (a.evidence or {}).get("timing", {}) or {}
+        request_s = timing.get("request_s", None)
+
+        return {
             "window": (t0, t1),
             "score": overlap,
             "asr": a,
             "text_preview": txt[:200],
-        })
+            "request_s": float(request_s) if request_s is not None else None,
+        }
+
+    scan_start = time.time()
+
+    scored: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_run_one, w) for w in windows]
+        for fut in as_completed(futures):
+            scored.append(fut.result())
+
+    scan_end = time.time()
+    scan_wallclock_s = float(scan_end - scan_start)
 
     scored.sort(key=lambda x: x["score"], reverse=True)
+
+    request_times = [
+        float(s["request_s"])
+        for s in scored
+        if s.get("request_s") is not None
+    ]
+
+    proposal_total_request_s = sum(request_times)
+    proposal_avg_request_s = (
+        proposal_total_request_s / len(request_times) if request_times else None
+    )
+    proposal_max_request_s = max(request_times) if request_times else None
+
+    ctx.decision_log["answer_stage"]["asr_chunk_scan_wallclock_s"] = scan_wallclock_s
+    ctx.decision_log["answer_stage"]["asr_chunk_request_time_sum_s"] = proposal_total_request_s
+    ctx.decision_log["answer_stage"]["asr_chunk_request_time_avg_s"] = proposal_avg_request_s
+    ctx.decision_log["answer_stage"]["asr_chunk_request_time_max_s"] = proposal_max_request_s
+
+    print("WHOLE VIDEO ASR SCAN WALLCLOCK S:", scan_wallclock_s)
+    print("TOTAL ASR REQUEST TIME S (NO EXTRACTION):", proposal_total_request_s)
+    print("AVG ASR CHUNK REQUEST TIME S (NO EXTRACTION):", proposal_avg_request_s)
+    print("MAX ASR CHUNK REQUEST TIME S (NO EXTRACTION):", proposal_max_request_s)
 
     ctx.decision_log["answer_stage"]["asr_chunk_scan"] = [
         {
@@ -931,16 +1084,16 @@ def propose_asr_windows_from_chunks(
             "t1": float(s["window"][1]),
             "score": float(s["score"]),
             "text_preview": s["text_preview"],
+            "request_s": s["request_s"],
         }
         for s in scored
     ]
 
-    top = [s["window"] for s in scored[:topk] if s["score"] > 0]
+    top = [s for s in scored[:topk] if s["score"] > 0]
     if not top:
-        top = [s["window"] for s in scored[:topk]]
+        top = scored[:topk]
 
     return top
-
 
 def merge_time_windows(
     windows_a: list[tuple[float, float]],
@@ -1042,13 +1195,15 @@ def collect_asr_evidence(
         raise ValueError("ASR requested by config, but asr_model or asr_base_url is not set.")
 
     if cfg.proposal_strategy == "asr_first":
-        ctx.asr_windows = propose_asr_windows_from_chunks(
+        selected = propose_asr_windows_from_chunks(
             ctx,
             asr_model=asr_model,
             asr_base_url=asr_base_url,
             chunk_len_s=cfg.asr_chunk_len_s,
             topk=cfg.asr_chunk_topk,
         )
+        ctx.asr_windows = [x["window"] for x in selected]
+        ctx.asr_outputs = [(x["window"], x["asr"]) for x in selected]
     elif cfg.proposal_strategy == "hybrid":
         asr_from_chunks = propose_asr_windows_from_chunks(
             ctx,
@@ -1057,7 +1212,12 @@ def collect_asr_evidence(
             chunk_len_s=cfg.asr_chunk_len_s,
             topk=cfg.asr_chunk_topk,
         )
-        ctx.asr_windows = merge_time_windows(ctx.vlm_windows, asr_from_chunks, max_windows=cfg.max_vlm_windows)
+        asr_chunk_windows = [x["window"] for x in asr_from_chunks]
+        ctx.asr_windows = merge_time_windows(
+            ctx.vlm_windows,
+            asr_chunk_windows,
+            max_windows=cfg.max_vlm_windows,
+        )
     else:
         ctx.asr_windows = list(ctx.vlm_windows)
         if not ctx.asr_windows:
@@ -1071,25 +1231,27 @@ def collect_asr_evidence(
             ctx.asr_windows = extra[:cfg.max_vlm_windows]
 
     print("ASR WINDOWS:", ctx.asr_windows)
+    print("TOTAL ASR TIME FOR WHOLE VIDEO S:", ctx.total_asr_time_s)
 
     ctx.decision_log["answer_stage"]["asr_windows"] = [
         {"t0": float(t0), "t1": float(t1)}
         for (t0, t1) in ctx.asr_windows
     ]
 
-    for (t0, t1) in ctx.asr_windows:
-        a = asr_window(
-            ctx.video,
-            t0,
-            t1,
-            stride=0.5,
-            resolution="high",
-            query=ctx.query,
-            model=asr_model,
-            base_url=asr_base_url,
-        )
-        ctx.asr_outputs.append(((t0, t1), a))
-
+    if cfg.proposal_strategy != "asr_first":
+        for (t0, t1) in ctx.asr_windows:
+            a = asr_window(
+                ctx.video,
+                t0,
+                t1,
+                stride=0.5,
+                resolution="high",
+                query=ctx.query,
+                model=asr_model,
+                base_url=asr_base_url,
+            )
+            ctx.asr_outputs.append(((t0, t1), a))
+            ctx.total_asr_time_s += float(a.wallclock_s)
 
 def collect_evidence(
     ctx: RunContext,
@@ -1317,12 +1479,17 @@ def run(
     available_memory_fraction: float = 1.0,
     queue_delay_s: float = 0.0,
     force_config_name: Optional[str] = None,
+    force_execution_config: Optional[ExecutionConfig] = None,
 ):
     """
     force_config_name: 
         Optional ablation override. If None, the system uses normal load aware config
         For example, under high load the scheduler may choose a cheaper config
         such as "asr_cheap"; setting force_config_name bypasses that choice.
+    force_execution_config:
+        Optional fully fixed execution config. If provided, bypasses profiler-driven
+        candidate generation and load-based config selection. Useful for true baselines
+        like asr_for_all / ocr_for_all / unified_vlm.
     """
 
 
@@ -1347,7 +1514,23 @@ def run(
         max_wallclock_s=max_wallclock_s,
         scheduler_state=scheduler_state,
         force_config_name=force_config_name,
+        force_execution_config=force_execution_config,
     )
+
+    cfg = ctx.execution_config
+    print("\n=== SELECTED CONFIG ===")
+    print("config_name:", cfg.name)
+    print("proposal_strategy:", cfg.proposal_strategy)
+    print("preferred_tools:", cfg.preferred_tools)
+    print("run_clip_probe:", cfg.run_clip_probe)
+    print("run_search_loop:", cfg.run_search_loop)
+    print("run_vlm:", cfg.run_vlm)
+    print("run_ocr:", cfg.run_ocr)
+    print("run_asr:", cfg.run_asr)
+    print("run_cheap_text_stage:", cfg.run_cheap_text_stage)
+    print("run_fallback_vlm:", cfg.run_fallback_vlm)
+    print("estimated_cost:", cfg.estimated_cost)
+    print("=======================\n")
 
     run_probe(ctx)
     build_actions_for_config(ctx)
@@ -1375,3 +1558,121 @@ def run(
         force_answer_model=force_answer_model,
     )
     return build_result(ctx)
+
+
+
+def make_fixed_baseline_config(method: str) -> Optional[ExecutionConfig]:
+    """
+    Return a true fixed baseline config that does NOT depend on the profiler.
+    This is used for benchmarks like asr_for_all / ocr_for_all / unified_vlm.
+    """
+    if method == "asr_for_all":
+        cfg = ExecutionConfig(
+            name="asr_for_all_forced",
+            proposal_strategy="asr_first",
+            run_clip_probe=False,
+            run_search_loop=False,
+            run_vlm=False,
+            run_ocr=False,
+            run_asr=True,
+            run_cheap_text_stage=True,
+            run_fallback_vlm=False,
+            preferred_tools=("asr",),
+            asr_chunk_len_s=30.0,
+            asr_chunk_topk=5,
+            cheap_answer_tier="cheap",
+            text_answer_min_conf=0.75,
+        )
+        cfg.estimated_cost = estimate_config_cost(cfg)
+        return cfg
+
+    if method == "ocr_for_all":
+        cfg = ExecutionConfig(
+            name="ocr_for_all_forced",
+            proposal_strategy="clip_first",
+            run_clip_probe=True,
+            run_search_loop=True,
+            run_vlm=False,
+            run_ocr=True,
+            run_asr=False,
+            run_cheap_text_stage=True,
+            run_fallback_vlm=False,
+            preferred_tools=("ocr",),
+            probe_fps=1.0,
+            probe_seg_len_s=5.0,
+            probe_topk=50,
+            window_len_s=4.0,
+            action_topk=50,
+            strides=(0.5,),
+            ocr_max_frames=8,
+            max_vlm_windows=2,
+            cheap_answer_tier="cheap",
+            text_answer_min_conf=0.75,
+        )
+        cfg.estimated_cost = estimate_config_cost(cfg)
+        return cfg
+
+    if method == "ocr_asr_vlm_for_all":
+        cfg = ExecutionConfig(
+            name="ocr_asr_vlm_for_all_forced",
+            proposal_strategy="hybrid",
+            run_clip_probe=True,
+            run_search_loop=True,
+            run_vlm=True,
+            run_ocr=True,
+            run_asr=True,
+            run_cheap_text_stage=True,
+            run_fallback_vlm=False,
+            preferred_tools=("ocr", "asr"),
+            probe_fps=1.0,
+            probe_seg_len_s=5.0,
+            probe_topk=50,
+            window_len_s=4.0,
+            action_topk=50,
+            strides=(0.5,),
+            asr_chunk_len_s=30.0,
+            asr_chunk_topk=5,
+            ocr_max_frames=8,
+            max_vlm_windows=2,
+            expand_first_window_s=2.0,
+            answer_tier="cheap",
+            answer_max_frames_per_window=4,
+            answer_max_images_total=4,
+            answer_jpeg_quality=92,
+            cheap_answer_tier="cheap",
+            text_answer_min_conf=0.75,
+            min_answer_conf=0.35,
+        )
+        cfg.estimated_cost = estimate_config_cost(cfg)
+        return cfg
+
+    if method == "unified_vlm":
+        cfg = ExecutionConfig(
+            name="unified_vlm_forced",
+            proposal_strategy="clip_first",
+            run_clip_probe=True,
+            run_search_loop=True,
+            run_vlm=True,
+            run_ocr=False,
+            run_asr=False,
+            run_cheap_text_stage=False,
+            run_fallback_vlm=False,
+            preferred_tools=("clip",),
+            probe_fps=1.0,
+            probe_seg_len_s=5.0,
+            probe_topk=50,
+            window_len_s=4.0,
+            action_topk=50,
+            strides=(0.5,),
+            max_vlm_windows=2,
+            expand_first_window_s=2.0,
+            answer_tier="cheap",
+            answer_max_frames_per_window=4,
+            answer_max_images_total=4,
+            answer_jpeg_quality=92,
+            min_answer_conf=0.35,
+        )
+        cfg.estimated_cost = estimate_config_cost(cfg)
+        return cfg
+
+    return None

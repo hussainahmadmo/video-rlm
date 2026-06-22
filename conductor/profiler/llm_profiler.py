@@ -49,11 +49,13 @@ Decision rules:
 - Use "vlm_anchor_then_asr" when the question asks what was said while/when a visible object, action, person, scene, or event is shown.
 - Use "asr_anchor_then_vlm" when the question asks what visual thing appears when/after/before a spoken phrase is said.
 - Use "vlm_anchor_then_ocr" when the question asks what text is visible on a visually specified object or region.
+- Use "asr_anchor_then_ocr" when the question asks for visible written text near, during, after, or before a spoken reference.
 - Use "ocr_anchor_then_vlm" when visible text identifies the window, but the answer is visual.
 - Do not use temporal ordering categories for now.
 - Do not output "clip". Use "vlm" for all visual inspection.
 - If both speech and visual anchoring are needed, evidence_sources must include both "vlm" and "asr".
 - If both text and visual anchoring are needed, evidence_sources must include both "vlm" and "ocr".
+- If both speech and visible text anchoring are needed, evidence_sources must include both "asr" and "ocr".
 - Output JSON only.
 """
 
@@ -79,25 +81,47 @@ class ResourceState:
 @dataclass(frozen=True)
 class WorkflowConfig:
     """
-    A candidate multimodal workflow configuration.
+    A one-shot candidate multimodal workflow configuration.
+    Each WorkflowConfig is a concrete plan that VIMIO may execute for a query
+    after profiling. It fixes three things before execution starts:
 
-    This is the VIMIO equivalent of a METIS candidate RAG configuration.
+        1. Evidence sources:
+            Which stages/modalities are used, e.g., ASR, OCR, VLM, or combinations.
+        2. Inspection pattern:
+            The ordering and role of those stages, e.g., ASR-only, VLM-only,
+            ASR -> VLM, OCR -> VLM, or ASR -> OCR.
+    
+        3. One-shot execution budget:
+            How much evidence the selected workflow is allowed to inspect. In this
+            prototype, the main budget is action_topk: the number of candidate
+            windows inspected by expensive stages such as the VLM. The workflow does
+            not iteratively inspect more windows based on intermediate results.
+
+
     """
+    # Human-readable configuration name, e.g., "asr_to_vlm_medium".
     name: str
-
-    # High-level workflow structure
+    # Which evidence sources/stages are invoked, e.g., ("asr", "vlm").
     evidence_sources: Tuple[str, ...]
+    # How stages are ordered and used, e.g., "asr_anchor_then_vlm".
     inspection_pattern: str
-
-    # Execution budget
+    # Coarse probing rate used to sample/search the video before final inspection.
+    # Higher values provide denser coverage but increase preprocessing cost.
     probe_fps: float
+    # Number of coarse candidate windows retained before final inspection.
+    # This controls the size of the candidate pool.
     probe_topk: int
+    # Main one-shot budget: number of candidate windows inspected by the selected
+    # expensive stage, such as VLM or OCR. This replaces iterative max_steps.
     action_topk: int
+    # Length, in seconds, of each candidate window inspected.
+    # Longer windows provide more context but increase processing cost.
     window_len_s: float
-    max_steps: int
-
-    # Used for ranking candidates inside the pruned space
+    # Coarse expected quality/robustness label. Currently useful for logging,
+    # analysis, and future scheduler policies.
     quality_tier: str  # "risky" | "medium" | "safe"
+    # Human-readable explanation for why this candidate exists.
+
     rationale: str = ""
 
 
@@ -207,34 +231,36 @@ def _patch_query_profile_with_guardrails(
     pattern = str(profile.get("inspection_pattern", "")).strip()
 
     valid_patterns = {
+
         "vlm_only",
         "asr_only",
         "ocr_only",
+
         "vlm_anchor_then_asr",
+
         "asr_anchor_then_vlm",
+
         "vlm_anchor_then_ocr",
         "ocr_anchor_then_vlm",
+        "asr_anchor_then_ocr",
     }
-
     if pattern not in valid_patterns:
-        if needs_asr and needs_vlm:
+        if needs_asr and needs_ocr:
+            pattern = "asr_anchor_then_ocr"
+        elif needs_asr and needs_vlm:
             if target == "speech_with_visual_anchor":
                 pattern = "vlm_anchor_then_asr"
             else:
                 pattern = "asr_anchor_then_vlm"
-
         elif needs_ocr and needs_vlm:
             if target == "text_with_visual_anchor":
                 pattern = "vlm_anchor_then_ocr"
             else:
                 pattern = "ocr_anchor_then_vlm"
-
         elif needs_asr:
             pattern = "asr_only"
-
         elif needs_ocr:
             pattern = "ocr_only"
-
         else:
             pattern = "vlm_only"
 
@@ -280,6 +306,12 @@ def _patch_query_profile_with_guardrails(
         profile["evidence_sources"] = ["ocr", "vlm"]
         profile["answer_type"] = "visual_answer"
         profile["reference_type"] = "text_reference"
+        profile["enable_cheap_stage"] = False
+
+    elif pattern == "asr_anchor_then_ocr":
+        profile["evidence_sources"] = ["asr", "ocr"]
+        profile["answer_type"] = "text_span"
+        profile["reference_type"] = "speech_reference"
         profile["enable_cheap_stage"] = False
 
     profile.pop("temporal_requirement", None)
@@ -370,7 +402,6 @@ def profile_to_candidate_configs(
                 probe_topk=16,
                 action_topk=0,
                 window_len_s=60.0,
-                max_steps=2,
                 answer_tier="cheap",
                 cheap_answer_tier="cheap",
                 quality_tier="safe",
@@ -391,7 +422,6 @@ def profile_to_candidate_configs(
                 probe_topk=8,
                 action_topk=0,
                 window_len_s=5.0,
-                max_steps=4,
                 answer_tier="cheap",
                 cheap_answer_tier="cheap",
                 quality_tier="medium",
@@ -405,7 +435,6 @@ def profile_to_candidate_configs(
                 probe_topk=16,
                 action_topk=0,
                 window_len_s=5.0,
-                max_steps=6,
                 answer_tier="cheap",
                 cheap_answer_tier="cheap",
                 quality_tier="safe",
@@ -426,7 +455,6 @@ def profile_to_candidate_configs(
                 probe_topk=8,
                 action_topk=4,
                 window_len_s=5.0,
-                max_steps=6,
                 answer_tier="heavy",
                 cheap_answer_tier="none",
                 quality_tier="medium",
@@ -440,7 +468,6 @@ def profile_to_candidate_configs(
                 probe_topk=12,
                 action_topk=6,
                 window_len_s=5.0,
-                max_steps=8,
                 answer_tier="heavy",
                 cheap_answer_tier="none",
                 quality_tier="safe",
@@ -458,7 +485,6 @@ def profile_to_candidate_configs(
                     probe_topk=16,
                     action_topk=8,
                     window_len_s=8.0,
-                    max_steps=10,
                     answer_tier="heavy",
                     cheap_answer_tier="none",
                     quality_tier="safe",
@@ -481,7 +507,6 @@ def profile_to_candidate_configs(
                 probe_topk=8,
                 action_topk=2,
                 window_len_s=5.0,
-                max_steps=5,
                 answer_tier="heavy",
                 cheap_answer_tier="none",
                 quality_tier="medium",
@@ -495,7 +520,6 @@ def profile_to_candidate_configs(
                 probe_topk=16,
                 action_topk=4,
                 window_len_s=5.0,
-                max_steps=8,
                 answer_tier="heavy",
                 cheap_answer_tier="none",
                 quality_tier="safe",
@@ -509,7 +533,6 @@ def profile_to_candidate_configs(
                 probe_topk=24,
                 action_topk=8,
                 window_len_s=8.0,
-                max_steps=10,
                 answer_tier="heavy",
                 cheap_answer_tier="none",
                 quality_tier="safe",
@@ -530,7 +553,6 @@ def profile_to_candidate_configs(
                 probe_topk=8,
                 action_topk=2,
                 window_len_s=5.0,
-                max_steps=5,
                 answer_tier="heavy",
                 cheap_answer_tier="none",
                 quality_tier="medium",
@@ -544,7 +566,6 @@ def profile_to_candidate_configs(
                 probe_topk=12,
                 action_topk=4,
                 window_len_s=5.0,
-                max_steps=8,
                 answer_tier="heavy",
                 cheap_answer_tier="none",
                 quality_tier="safe",
@@ -565,7 +586,6 @@ def profile_to_candidate_configs(
                 probe_topk=8,
                 action_topk=2,
                 window_len_s=5.0,
-                max_steps=5,
                 answer_tier="heavy",
                 cheap_answer_tier="none",
                 quality_tier="medium",
@@ -579,7 +599,6 @@ def profile_to_candidate_configs(
                 probe_topk=16,
                 action_topk=4,
                 window_len_s=5.0,
-                max_steps=8,
                 answer_tier="heavy",
                 cheap_answer_tier="none",
                 quality_tier="safe",
@@ -600,7 +619,6 @@ def profile_to_candidate_configs(
                 probe_topk=8,
                 action_topk=2,
                 window_len_s=5.0,
-                max_steps=5,
                 answer_tier="heavy",
                 cheap_answer_tier="none",
                 quality_tier="medium",
@@ -614,7 +632,6 @@ def profile_to_candidate_configs(
                 probe_topk=12,
                 action_topk=4,
                 window_len_s=5.0,
-                max_steps=8,
                 answer_tier="heavy",
                 cheap_answer_tier="none",
                 quality_tier="safe",
@@ -622,6 +639,45 @@ def profile_to_candidate_configs(
             ),
         ]
 
+    # ---------------------------------------------------------------
+    # ASR anchors OCR: speech localizes the timestamp, OCR reads frames.
+    # ---------------------------------------------------------------
+    if pattern == "asr_anchor_then_ocr":
+        return [
+            WorkflowConfig(
+                name="asr_to_ocr_small",
+                evidence_sources=("asr", "ocr"),
+                inspection_pattern="asr_anchor_then_ocr",
+                probe_fps=0.5,
+                probe_topk=8,
+                action_topk=2,
+                window_len_s=5.0,
+                quality_tier="medium",
+                rationale="ASR localizes the spoken reference; OCR reads selected nearby frames.",
+            ),
+            WorkflowConfig(
+                name="asr_to_ocr_medium",
+                evidence_sources=("asr", "ocr"),
+                inspection_pattern="asr_anchor_then_ocr",
+                probe_fps=0.5,
+                probe_topk=16,
+                action_topk=4,
+                window_len_s=5.0,
+                quality_tier="safe",
+                rationale="ASR localizes the spoken reference; OCR reads more nearby frames.",
+            ),
+            WorkflowConfig(
+                name="asr_to_ocr_large",
+                evidence_sources=("asr", "ocr"),
+                inspection_pattern="asr_anchor_then_ocr",
+                probe_fps=1.0,
+                probe_topk=24,
+                action_topk=8,
+                window_len_s=8.0,
+                quality_tier="safe",
+                rationale="Larger ASR-anchored OCR workflow for harder slide/text evidence.",
+            ),
+        ]
     # Fallback
     return [
         WorkflowConfig(
@@ -632,7 +688,6 @@ def profile_to_candidate_configs(
             probe_topk=8,
             action_topk=4,
             window_len_s=5.0,
-            max_steps=8,
             answer_tier="heavy",
             cheap_answer_tier="none",
             quality_tier="medium",
@@ -724,6 +779,12 @@ def workflow_config_to_execution_policy(
     config: WorkflowConfig,
     qp: QueryProfile,
 ) -> ExecutionPolicy:
+    """
+        Compile a one-shot WorkflowConfig into the ExecutionPolicy expected by the
+        downstream runner.
+        WorkflowConfig is the profiler/scheduler-level representation.
+        ExecutionPolicy is the runner-level representation.
+    """
     preferred_tools = tuple(
         "vlm" if x == "clip" else x
         for x in config.evidence_sources
@@ -757,7 +818,6 @@ def workflow_config_to_execution_policy(
         strides=(0.5,),
         action_topk=config.action_topk,
 
-        max_steps=config.max_steps,
         eps_marginal_gain=0.01,
         escalate_if_low_confidence=True,
         min_retrieval_conf=0.15,
