@@ -7,29 +7,6 @@ from typing import Literal
 
 LoadLevel = Literal["low", "medium", "high"]
 
-WorkflowFamily = Literal[
-    "visual_only",
-    "asr_only",
-    "ocr_only",
-    "asr_anchored_visual",
-    "ocr_anchored_visual",
-    "multimodal",
-]
-
-ProposalStrategy = Literal[
-    "uniform",
-    "clip_first",
-    "asr_first",
-    "ocr_first",
-    "hybrid",
-]
-
-SynthesisStrategy = Literal[
-    "one_shot",
-    "global_summary",
-    "map_summary",
-]
-
 SchedulingPolicy = Literal[
     "fifo",
     "demand_aware",
@@ -67,12 +44,6 @@ class ExecutionConfig:
     name: str
 
     # ------------------------------------------------------------
-    # Semantic workflow choice
-    # ------------------------------------------------------------
-    workflow_family: WorkflowFamily = "visual_only"
-    proposal_strategy: ProposalStrategy = "clip_first"
-
-    # ------------------------------------------------------------
     # Visual budget knobs
     # ------------------------------------------------------------
     window_len_s: float = 8.0
@@ -84,11 +55,6 @@ class ExecutionConfig:
     probe_fps: float = 1.0
     probe_seg_len_s: float = 5.0
     probe_topk: int = 20
-
-    # ------------------------------------------------------------
-    # Synthesis strategy
-    # ------------------------------------------------------------
-    synthesis_strategy: SynthesisStrategy = "one_shot"
 
     # Total generated-token budget across all calls.
     total_output_token_budget: int = 4096
@@ -140,15 +106,6 @@ class ExecutionConfig:
     def infer_cost_fields(self) -> None:
         self.estimated_num_images = self.action_topk * self.frames_per_window
         self.estimated_output_tokens = self.total_output_token_budget
-
-        if self.synthesis_strategy == "one_shot":
-            self.estimated_vlm_calls = 1
-        elif self.synthesis_strategy == "global_summary":
-            self.estimated_vlm_calls = 2
-        elif self.synthesis_strategy == "map_summary":
-            self.estimated_vlm_calls = self.action_topk + 1
-        else:
-            raise ValueError(f"Unknown synthesis_strategy={self.synthesis_strategy}")
 
         # Simple cost proxy. Later replace with measured latency model.
         self.estimated_cost = (

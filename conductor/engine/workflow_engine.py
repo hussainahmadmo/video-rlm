@@ -21,9 +21,6 @@ class WorkflowEngine:
         max_visual_concurrency: int = 1,
     ):
         self.runners = runners
-        self.reuse_cache = reuse_cache
-        self.workflows: Dict[str, Workflow] = {}
-
         self.max_visual_concurrency = max_visual_concurrency
 
         # Shared resource gate for heavy visual encoder work
@@ -33,17 +30,6 @@ class WorkflowEngine:
         self._active_visual = 0
         self._max_observed_visual = 0
         print(f"[ENGINE] max_visual_concurrency={max_visual_concurrency}")
-
-    def create_workflow(self, *, question: str, video_path: str, metadata: dict | None = None) -> Workflow:
-        workflow_id = str(uuid.uuid4())
-        wf = Workflow(
-            workflow_id=workflow_id,
-            question=question,
-            video_path=video_path,
-            metadata=metadata or {},
-        )
-        self.workflows[workflow_id] = wf
-        return wf
     
     def add_stage(
         self,
