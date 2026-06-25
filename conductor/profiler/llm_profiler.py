@@ -6,10 +6,6 @@ from typing import Any, Dict, List, Tuple
 
 import requests
 
-from .policy_schema import ExecutionPolicy
-from .query_profile_schema import QueryProfile
-
-
 # ---------------------------------------------------------------------
 # 1. LLM profiler prompt
 # ---------------------------------------------------------------------
@@ -17,47 +13,110 @@ from .query_profile_schema import QueryProfile
 PROFILER_SYSTEM_PROMPT = """
 You are a query profiler for a video question answering system.
 
-Given a user query, output STRICT JSON ONLY with the following schema:
+Your job is to estimate how difficult a visual question is and what retrieval budget it may require.
+
+Output STRICT JSON ONLY:
 
 {
   "analysis": {
-    "primary_question_clause": "<string>",
-    "primary_question_target": "visual" | "speech" | "text" | "speech_with_visual_anchor" | "text_with_visual_anchor",
-    "needs_vlm": true | false,
-    "needs_asr": true | false,
-    "needs_ocr": true | false,
-    "notes": "<short string>",
     "visual_detail_level": "low" | "medium" | "high",
-    "object_scale": "large" | "medium" | "small" | "unknown",
-    "needs_precise_local_view": true | false
-  },
-  "profile": {
-    "evidence_sources": ["vlm" | "ocr" | "asr", ...],
-    "answer_type": "visual_answer" | "spoken_span" | "text_span",
-    "reference_type": "none" | "direct_answer" | "text_reference" | "speech_reference" | "visual_reference",
-    "inspection_pattern": "vlm_only" | "asr_only" | "ocr_only" | "vlm_anchor_then_asr" | "asr_anchor_then_vlm" | "vlm_anchor_then_ocr" | "ocr_anchor_then_vlm" | "asr_anchor_then_ocr",
-    "confidence": <float 0..1>,
-    "rationale": "<short string>"
+    "object_scale": "large" | "medium" | "small",
+    "needs_precise_local_view": true | false,
+    "rationale": "<short explanation>"
   }
 }
 
-Decision rules:
+Guidelines:
 
-- Use "asr_only" when the question asks only what was said or spoken.
-- Use "vlm_only" when the question asks only about visible objects, actions, scenes, colors, shape, clothing, or visual attributes.
-- Use "ocr_only" when the question asks only for visible written text.
-- Use "vlm_anchor_then_asr" when the question asks what was said while/when a visible object, action, person, scene, or event is shown.
-- Use "asr_anchor_then_vlm" when the question asks what visual thing appears when/after/before a spoken phrase is said.
-- Use "vlm_anchor_then_ocr" when the question asks what text is visible on a visually specified object or region.
-- Use "asr_anchor_then_ocr" when the question asks for visible written text near, during, after, or before a spoken reference.
-- Use "ocr_anchor_then_vlm" when visible text identifies the window, but the answer is visual.
-- Do not use temporal ordering categories for now.
-- Do not output "clip". Use "vlm" for all visual inspection.
-- If both speech and visual anchoring are needed, evidence_sources must include both "vlm" and "asr".
-- If both text and visual anchoring are needed, evidence_sources must include both "vlm" and "ocr".
-- If both speech and visible text anchoring are needed, evidence_sources must include both "asr" and "ocr".
-- Output JSON only.
+visual_detail_level:
+- low:
+  large objects, simple actions, scene-level questions.
+  Example: "Is the person cooking?"
+  Example: "What sport is being played?"
+
+- medium:
+  requires identifying objects, interactions, or moderate detail.
+  Example: "What tool is the person using?"
+  Example: "What is the person carrying?"
+
+- high:
+  requires fine-grained visual evidence.
+  Example: "What number is on the jersey?"
+  Example: "What color is the label on the bottle?"
+  Example: "Which button is pressed?"
+
+object_scale:
+- large: object occupies a substantial portion of the frame.
+- medium: object is visible but not dominant.
+- small: object is small, distant, or hard to see.
+
+needs_precise_local_view:
+- true when answering depends on a small region, fine detail,
+  text-like visual evidence, or subtle object attributes.
+- false otherwise.
+
+Output JSON only.
 """
+
+
+@dataclass(frozen=True)
+class BudgetConfig:
+
+    # Human-readable configuration name, e.g., "asr_to_vlm_medium".
+    name: str
+    # Higher values provide denser coverage but increase preprocessing cost.
+    probe_fps: float
+    # Number of coarse candidate windows retained before final inspection.
+    # This controls the size of the candidate pool.
+    probe_topk: int
+    # Main one-shot budget: number of candidate windows inspected by the selected
+    # expensive stage, such as VLM or OCR. This replaces iterative max_steps.
+    action_topk: int
+    # Length, in seconds, of each candidate window inspected.
+    # Longer windows provide more context but increase processing cost.
+    window_len_s: float
+    # Coarse expected quality/robustness label. Currently useful for logging,
+    # analysis, and future scheduler policies.
+    quality_tier: str  # "risky" | "medium" | "safe"
+    # Human-readable explanation for why this candidate exists.
+    answer_tier: str = "heavy"
+    cheap_answer_tier: str = "none"
+    max_steps: int = 1
+    rationale: str = ""
+
+
+
+# ---------------------------------------------------------------------
+# Default workflow budgets
+# ---------------------------------------------------------------------
+
+LOW_BUDGET = BudgetConfig(
+    name="low_budget",
+    probe_fps=0.5,
+    probe_topk=4,
+    action_topk=4,
+    window_len_s=8.0,
+    quality_tier="risky",
+)
+
+MEDIUM_BUDGET = BudgetConfig(
+    name="medium_budget",
+    probe_fps=1.0,
+    probe_topk=8,
+    action_topk=8,
+    window_len_s=8.0,
+    quality_tier="medium",
+)
+
+HIGH_BUDGET = BudgetConfig(
+    name="high_budget",
+    probe_fps=2.0,
+    probe_topk=16,
+    action_topk=16,
+    window_len_s=8.0,
+    quality_tier="safe",
+)
+
 
 
 # ---------------------------------------------------------------------
@@ -78,77 +137,23 @@ class ResourceState:
     load_level: str = "low"  # "low" | "medium" | "high"
 
 
-@dataclass(frozen=True)
-class WorkflowConfig:
-    """
-    A one-shot candidate multimodal workflow configuration.
-    Each WorkflowConfig is a concrete plan that VIMIO may execute for a query
-    after profiling. It fixes three things before execution starts:
-
-        1. Evidence sources:
-            Which stages/modalities are used, e.g., ASR, OCR, VLM, or combinations.
-        2. Inspection pattern:
-            The ordering and role of those stages, e.g., ASR-only, VLM-only,
-            ASR -> VLM, OCR -> VLM, or ASR -> OCR.
-    
-        3. One-shot execution budget:
-            How much evidence the selected workflow is allowed to inspect. In this
-            prototype, the main budget is action_topk: the number of candidate
-            windows inspected by expensive stages such as the VLM. The workflow does
-            not iteratively inspect more windows based on intermediate results.
-
-
-    """
-    # Human-readable configuration name, e.g., "asr_to_vlm_medium".
-    name: str
-    # Which evidence sources/stages are invoked, e.g., ("asr", "vlm").
-    evidence_sources: Tuple[str, ...]
-    # How stages are ordered and used, e.g., "asr_anchor_then_vlm".
-    inspection_pattern: str
-    # Coarse probing rate used to sample/search the video before final inspection.
-    # Higher values provide denser coverage but increase preprocessing cost.
-    probe_fps: float
-    # Number of coarse candidate windows retained before final inspection.
-    # This controls the size of the candidate pool.
-    probe_topk: int
-    # Main one-shot budget: number of candidate windows inspected by the selected
-    # expensive stage, such as VLM or OCR. This replaces iterative max_steps.
-    action_topk: int
-    # Length, in seconds, of each candidate window inspected.
-    # Longer windows provide more context but increase processing cost.
-    window_len_s: float
-    # Coarse expected quality/robustness label. Currently useful for logging,
-    # analysis, and future scheduler policies.
-    quality_tier: str  # "risky" | "medium" | "safe"
-    # Human-readable explanation for why this candidate exists.
-
-    rationale: str = ""
-
-
 @dataclass
 class ProfilerResult:
     analysis: Dict[str, Any]
-    query_profile: QueryProfile
-
-    # METIS-style outputs
-    candidate_configs: List[WorkflowConfig]
-    chosen_config: WorkflowConfig
-
-    execution_policy: ExecutionPolicy
-
-    # Debugging / audit fields
-    raw_profile: Dict[str, Any]
+    candidate_configs: List[BudgetConfig]
+    requested_config: BudgetConfig
+    chosen_config: BudgetConfig
+    execution_policy: Dict[str, Any]
     raw_json: Dict[str, Any]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "analysis": self.analysis,
-            "query_profile": asdict(self.query_profile),
             "candidate_configs": [asdict(c) for c in self.candidate_configs],
             "chosen_config": asdict(self.chosen_config),
-            "execution_policy": asdict(self.execution_policy),
-            "raw_profile": self.raw_profile,
+            "execution_policy": self.execution_policy,
             "raw_json": self.raw_json,
+            "requested_config": asdict(self.requested_config),
         }
 
 
@@ -176,147 +181,6 @@ def _extract_json(text: str) -> Dict[str, Any]:
 
     raise ValueError("Could not parse JSON from profiler output")
 
-
-def _coerce_query_profile(d: Dict[str, Any]) -> QueryProfile:
-    """
-    Convert a raw profiler dict into your QueryProfile schema.
-    """
-    evidence_sources = tuple(d.get("evidence_sources", ["vlm"]))
-
-    if not evidence_sources:
-        evidence_sources = ("vlm",)
-
-    evidence_sources = tuple(
-        "vlm" if x == "clip" else x
-        for x in evidence_sources
-    )
-
-    return QueryProfile(
-        evidence_sources=evidence_sources,
-        answer_type=str(d.get("answer_type", "visual_answer")),
-        reference_type=str(d.get("reference_type", "none")),
-        inspection_pattern=str(d.get("inspection_pattern", "vlm_only")),
-        enable_cheap_stage=bool(d.get("enable_cheap_stage", False)),
-        confidence=float(d.get("confidence", 0.6)),
-        rationale=str(d.get("rationale", "")),
-    )
-
-
-def _patch_query_profile_with_guardrails(
-    query: str,
-    d: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Guardrails for profiler output.
-
-    Goal:
-    - Do not use temporal categories.
-    - Do not output clip.
-    - Use VLM for expensive visual inspection.
-    - Use ASR/OCR as cheap anchors when they can reduce VLM work.
-    """
-    analysis = d.get("analysis", {}) if isinstance(d.get("analysis"), dict) else {}
-    profile = d.get("profile", d) if isinstance(d.get("profile", d), dict) else dict(d)
-    profile = dict(profile)
-
-    needs_vlm = bool(analysis.get("needs_vlm", False))
-    needs_asr = bool(analysis.get("needs_asr", False))
-    needs_ocr = bool(analysis.get("needs_ocr", False))
-    target = str(analysis.get("primary_question_target", "")).strip()
-
-    evidence = profile.get("evidence_sources", [])
-    evidence = ["vlm" if x == "clip" else x for x in evidence]
-    profile["evidence_sources"] = evidence
-
-    pattern = str(profile.get("inspection_pattern", "")).strip()
-
-    valid_patterns = {
-
-        "vlm_only",
-        "asr_only",
-        "ocr_only",
-
-        "vlm_anchor_then_asr",
-
-        "asr_anchor_then_vlm",
-
-        "vlm_anchor_then_ocr",
-        "ocr_anchor_then_vlm",
-        "asr_anchor_then_ocr",
-    }
-    if pattern not in valid_patterns:
-        if needs_asr and needs_ocr:
-            pattern = "asr_anchor_then_ocr"
-        elif needs_asr and needs_vlm:
-            if target == "speech_with_visual_anchor":
-                pattern = "vlm_anchor_then_asr"
-            else:
-                pattern = "asr_anchor_then_vlm"
-        elif needs_ocr and needs_vlm:
-            if target == "text_with_visual_anchor":
-                pattern = "vlm_anchor_then_ocr"
-            else:
-                pattern = "ocr_anchor_then_vlm"
-        elif needs_asr:
-            pattern = "asr_only"
-        elif needs_ocr:
-            pattern = "ocr_only"
-        else:
-            pattern = "vlm_only"
-
-    profile["inspection_pattern"] = pattern
-
-    if pattern == "asr_only":
-        profile["evidence_sources"] = ["asr"]
-        profile["answer_type"] = "spoken_span"
-        profile["reference_type"] = "direct_answer"
-        profile["enable_cheap_stage"] = True
-
-    elif pattern == "ocr_only":
-        profile["evidence_sources"] = ["ocr"]
-        profile["answer_type"] = "text_span"
-        profile["reference_type"] = "direct_answer"
-        profile["enable_cheap_stage"] = True
-
-    elif pattern == "vlm_only":
-        profile["evidence_sources"] = ["vlm"]
-        profile["answer_type"] = "visual_answer"
-        profile["reference_type"] = "none"
-        profile["enable_cheap_stage"] = False
-
-    elif pattern == "vlm_anchor_then_asr":
-        profile["evidence_sources"] = ["vlm", "asr"]
-        profile["answer_type"] = "spoken_span"
-        profile["reference_type"] = "visual_reference"
-        profile["enable_cheap_stage"] = False
-
-    elif pattern == "asr_anchor_then_vlm":
-        profile["evidence_sources"] = ["asr", "vlm"]
-        profile["answer_type"] = "visual_answer"
-        profile["reference_type"] = "speech_reference"
-        profile["enable_cheap_stage"] = False
-
-    elif pattern == "vlm_anchor_then_ocr":
-        profile["evidence_sources"] = ["vlm", "ocr"]
-        profile["answer_type"] = "text_span"
-        profile["reference_type"] = "visual_reference"
-        profile["enable_cheap_stage"] = False
-
-    elif pattern == "ocr_anchor_then_vlm":
-        profile["evidence_sources"] = ["ocr", "vlm"]
-        profile["answer_type"] = "visual_answer"
-        profile["reference_type"] = "text_reference"
-        profile["enable_cheap_stage"] = False
-
-    elif pattern == "asr_anchor_then_ocr":
-        profile["evidence_sources"] = ["asr", "ocr"]
-        profile["answer_type"] = "text_span"
-        profile["reference_type"] = "speech_reference"
-        profile["enable_cheap_stage"] = False
-
-    profile.pop("temporal_requirement", None)
-
-    return profile
 
 
 # ---------------------------------------------------------------------
@@ -348,6 +212,9 @@ def _call_profiler_llm(
         "Authorization": f"Bearer {api_key or 'EMPTY'}",
     }
 
+
+    print(url)
+    print(json.dumps(payload, indent=2))
     r = requests.post(
         url,
         json=payload,
@@ -367,367 +234,15 @@ def _call_profiler_llm(
 
 
 # ---------------------------------------------------------------------
-# 5. METIS-style candidate configuration pruning
-# ---------------------------------------------------------------------
-
-def profile_to_candidate_configs(
-    qp: QueryProfile,
-    analysis: Dict[str, Any] | None = None,
-) -> List[WorkflowConfig]:
-    """
-    Rule-based mapping from query profile to a pruned set of candidate workflow
-    configurations.
-
-    This is the VIMIO equivalent of METIS mapping:
-        query profile -> pruned RAG configuration space
-
-    The profiler does not choose exact budgets. It narrows the space.
-    """
-    analysis = analysis or {}
-    pattern = qp.inspection_pattern
-
-    visual_detail = str(analysis.get("visual_detail_level", "medium"))
-    needs_precise = bool(analysis.get("needs_precise_local_view", False))
-
-    # ---------------------------------------------------------------
-    # ASR-only: no visual work should be created.
-    # ---------------------------------------------------------------
-    if pattern == "asr_only":
-        return [
-            WorkflowConfig(
-                name="asr_only_cheap",
-                evidence_sources=("asr",),
-                inspection_pattern="asr_only",
-                probe_fps=0.0,
-                probe_topk=16,
-                action_topk=0,
-                window_len_s=60.0,
-                answer_tier="cheap",
-                cheap_answer_tier="cheap",
-                quality_tier="safe",
-                rationale="Speech-only query; avoid visual encoder/VLM work.",
-            )
-        ]
-
-    # ---------------------------------------------------------------
-    # OCR-only: cheap text extraction; no VLM action by default.
-    # ---------------------------------------------------------------
-    if pattern == "ocr_only":
-        return [
-            WorkflowConfig(
-                name="ocr_only_small",
-                evidence_sources=("ocr",),
-                inspection_pattern="ocr_only",
-                probe_fps=0.5,
-                probe_topk=8,
-                action_topk=0,
-                window_len_s=5.0,
-                answer_tier="cheap",
-                cheap_answer_tier="cheap",
-                quality_tier="medium",
-                rationale="OCR-only query with small visual sampling budget.",
-            ),
-            WorkflowConfig(
-                name="ocr_only_large",
-                evidence_sources=("ocr",),
-                inspection_pattern="ocr_only",
-                probe_fps=1.0,
-                probe_topk=16,
-                action_topk=0,
-                window_len_s=5.0,
-                answer_tier="cheap",
-                cheap_answer_tier="cheap",
-                quality_tier="safe",
-                rationale="OCR-only query with larger sampling budget.",
-            ),
-        ]
-
-    # ---------------------------------------------------------------
-    # VLM-only: visual evidence is directly needed.
-    # ---------------------------------------------------------------
-    if pattern == "vlm_only":
-        configs = [
-            WorkflowConfig(
-                name="vlm_small",
-                evidence_sources=("vlm",),
-                inspection_pattern="vlm_only",
-                probe_fps=0.5,
-                probe_topk=8,
-                action_topk=4,
-                window_len_s=5.0,
-                answer_tier="heavy",
-                cheap_answer_tier="none",
-                quality_tier="medium",
-                rationale="Small VLM budget for visual query.",
-            ),
-            WorkflowConfig(
-                name="vlm_medium",
-                evidence_sources=("vlm",),
-                inspection_pattern="vlm_only",
-                probe_fps=0.5,
-                probe_topk=12,
-                action_topk=6,
-                window_len_s=5.0,
-                answer_tier="heavy",
-                cheap_answer_tier="none",
-                quality_tier="safe",
-                rationale="Medium VLM budget for visual query.",
-            ),
-        ]
-
-        if visual_detail == "high" or needs_precise:
-            configs.append(
-                WorkflowConfig(
-                    name="vlm_large_precise",
-                    evidence_sources=("vlm",),
-                    inspection_pattern="vlm_only",
-                    probe_fps=1.0,
-                    probe_topk=16,
-                    action_topk=8,
-                    window_len_s=8.0,
-                    answer_tier="heavy",
-                    cheap_answer_tier="none",
-                    quality_tier="safe",
-                    rationale="Larger VLM budget for fine-grained visual detail.",
-                )
-            )
-
-        return configs
-
-    # ---------------------------------------------------------------
-    # ASR anchors VLM: cheap ASR scans broadly, VLM only selected windows.
-    # ---------------------------------------------------------------
-    if pattern == "asr_anchor_then_vlm":
-        return [
-            WorkflowConfig(
-                name="asr_to_vlm_small",
-                evidence_sources=("asr", "vlm"),
-                inspection_pattern="asr_anchor_then_vlm",
-                probe_fps=0.5,
-                probe_topk=8,
-                action_topk=2,
-                window_len_s=5.0,
-                answer_tier="heavy",
-                cheap_answer_tier="none",
-                quality_tier="medium",
-                rationale="ASR localizes evidence; run VLM on a small number of windows.",
-            ),
-            WorkflowConfig(
-                name="asr_to_vlm_medium",
-                evidence_sources=("asr", "vlm"),
-                inspection_pattern="asr_anchor_then_vlm",
-                probe_fps=0.5,
-                probe_topk=16,
-                action_topk=4,
-                window_len_s=5.0,
-                answer_tier="heavy",
-                cheap_answer_tier="none",
-                quality_tier="safe",
-                rationale="ASR localizes evidence; run VLM on a moderate number of windows.",
-            ),
-            WorkflowConfig(
-                name="asr_to_vlm_large",
-                evidence_sources=("asr", "vlm"),
-                inspection_pattern="asr_anchor_then_vlm",
-                probe_fps=1.0,
-                probe_topk=24,
-                action_topk=8,
-                window_len_s=8.0,
-                answer_tier="heavy",
-                cheap_answer_tier="none",
-                quality_tier="safe",
-                rationale="Larger ASR-anchored VLM workflow for harder visual evidence.",
-            ),
-        ]
-
-    # ---------------------------------------------------------------
-    # VLM anchors ASR: visual event/window first, then speech in that window.
-    # ---------------------------------------------------------------
-    if pattern == "vlm_anchor_then_asr":
-        return [
-            WorkflowConfig(
-                name="vlm_to_asr_small",
-                evidence_sources=("vlm", "asr"),
-                inspection_pattern="vlm_anchor_then_asr",
-                probe_fps=0.5,
-                probe_topk=8,
-                action_topk=2,
-                window_len_s=5.0,
-                answer_tier="heavy",
-                cheap_answer_tier="none",
-                quality_tier="medium",
-                rationale="VLM finds visual anchor; ASR runs on selected windows.",
-            ),
-            WorkflowConfig(
-                name="vlm_to_asr_medium",
-                evidence_sources=("vlm", "asr"),
-                inspection_pattern="vlm_anchor_then_asr",
-                probe_fps=0.5,
-                probe_topk=12,
-                action_topk=4,
-                window_len_s=5.0,
-                answer_tier="heavy",
-                cheap_answer_tier="none",
-                quality_tier="safe",
-                rationale="VLM finds visual anchor with moderate budget.",
-            ),
-        ]
-
-    # ---------------------------------------------------------------
-    # OCR anchors VLM: text identifies window/region, final answer visual.
-    # ---------------------------------------------------------------
-    if pattern == "ocr_anchor_then_vlm":
-        return [
-            WorkflowConfig(
-                name="ocr_to_vlm_small",
-                evidence_sources=("ocr", "vlm"),
-                inspection_pattern="ocr_anchor_then_vlm",
-                probe_fps=0.5,
-                probe_topk=8,
-                action_topk=2,
-                window_len_s=5.0,
-                answer_tier="heavy",
-                cheap_answer_tier="none",
-                quality_tier="medium",
-                rationale="OCR anchors the visual window; small VLM budget.",
-            ),
-            WorkflowConfig(
-                name="ocr_to_vlm_medium",
-                evidence_sources=("ocr", "vlm"),
-                inspection_pattern="ocr_anchor_then_vlm",
-                probe_fps=0.5,
-                probe_topk=16,
-                action_topk=4,
-                window_len_s=5.0,
-                answer_tier="heavy",
-                cheap_answer_tier="none",
-                quality_tier="safe",
-                rationale="OCR anchors the visual window; medium VLM budget.",
-            ),
-        ]
-
-    # ---------------------------------------------------------------
-    # VLM anchors OCR: visual region/window first, then read text.
-    # ---------------------------------------------------------------
-    if pattern == "vlm_anchor_then_ocr":
-        return [
-            WorkflowConfig(
-                name="vlm_to_ocr_small",
-                evidence_sources=("vlm", "ocr"),
-                inspection_pattern="vlm_anchor_then_ocr",
-                probe_fps=0.5,
-                probe_topk=8,
-                action_topk=2,
-                window_len_s=5.0,
-                answer_tier="heavy",
-                cheap_answer_tier="none",
-                quality_tier="medium",
-                rationale="VLM finds visual region; OCR reads text.",
-            ),
-            WorkflowConfig(
-                name="vlm_to_ocr_medium",
-                evidence_sources=("vlm", "ocr"),
-                inspection_pattern="vlm_anchor_then_ocr",
-                probe_fps=0.5,
-                probe_topk=12,
-                action_topk=4,
-                window_len_s=5.0,
-                answer_tier="heavy",
-                cheap_answer_tier="none",
-                quality_tier="safe",
-                rationale="VLM finds visual region; OCR reads text with larger budget.",
-            ),
-        ]
-
-    # ---------------------------------------------------------------
-    # ASR anchors OCR: speech localizes the timestamp, OCR reads frames.
-    # ---------------------------------------------------------------
-    if pattern == "asr_anchor_then_ocr":
-        return [
-            WorkflowConfig(
-                name="asr_to_ocr_small",
-                evidence_sources=("asr", "ocr"),
-                inspection_pattern="asr_anchor_then_ocr",
-                probe_fps=0.5,
-                probe_topk=8,
-                action_topk=2,
-                window_len_s=5.0,
-                quality_tier="medium",
-                rationale="ASR localizes the spoken reference; OCR reads selected nearby frames.",
-            ),
-            WorkflowConfig(
-                name="asr_to_ocr_medium",
-                evidence_sources=("asr", "ocr"),
-                inspection_pattern="asr_anchor_then_ocr",
-                probe_fps=0.5,
-                probe_topk=16,
-                action_topk=4,
-                window_len_s=5.0,
-                quality_tier="safe",
-                rationale="ASR localizes the spoken reference; OCR reads more nearby frames.",
-            ),
-            WorkflowConfig(
-                name="asr_to_ocr_large",
-                evidence_sources=("asr", "ocr"),
-                inspection_pattern="asr_anchor_then_ocr",
-                probe_fps=1.0,
-                probe_topk=24,
-                action_topk=8,
-                window_len_s=8.0,
-                quality_tier="safe",
-                rationale="Larger ASR-anchored OCR workflow for harder slide/text evidence.",
-            ),
-        ]
-    # Fallback
-    return [
-        WorkflowConfig(
-            name="default_vlm_medium",
-            evidence_sources=("vlm",),
-            inspection_pattern="vlm_only",
-            probe_fps=0.5,
-            probe_topk=8,
-            action_topk=4,
-            window_len_s=5.0,
-            answer_tier="heavy",
-            cheap_answer_tier="none",
-            quality_tier="medium",
-            rationale="Fallback visual workflow.",
-        )
-    ]
-
-
-# ---------------------------------------------------------------------
 # 6. Resource-aware config selection
 # ---------------------------------------------------------------------
 
-def estimate_config_cost(config: WorkflowConfig) -> float:
-    """
-    Simple cost proxy.
-
-    Replace this later with real measurements:
-    - estimated visual encoder time
-    - estimated VLM latency
-    - GPU memory usage
-    - current queueing delay
-    """
-    # ASR/OCR-only configs are cheap.
-    if "vlm" not in config.evidence_sources:
-        return 1.0 + 0.05 * config.probe_topk
-
-    # Visual cost proxy.
-    visual_cost = (
-        config.action_topk
-        * max(config.window_len_s, 1.0)
-        * max(config.probe_fps, 0.1)
+def estimate_config_cost(config: BudgetConfig) -> float:
+    return (
+        config.probe_fps
+        * config.probe_topk
+        * config.action_topk
     )
-
-    if config.answer_tier == "heavy":
-        visual_cost *= 2.0
-
-    # More max steps means more possible iterative inspection.
-    visual_cost *= 1.0 + 0.05 * config.max_steps
-
-    return visual_cost
 
 
 def _cost_budget_for_resource_state(resource_state: ResourceState) -> float:
@@ -742,9 +257,9 @@ def _cost_budget_for_resource_state(resource_state: ResourceState) -> float:
 
 
 def choose_config_for_current_resources(
-    candidates: List[WorkflowConfig],
+    candidates: List[BudgetConfig],
     resource_state: ResourceState,
-) -> WorkflowConfig:
+) -> BudgetConfig:
     """
     METIS-style best-fit selector.
 
@@ -757,7 +272,7 @@ def choose_config_for_current_resources(
 
     budget = _cost_budget_for_resource_state(resource_state)
 
-    fitting: List[Tuple[float, WorkflowConfig]] = []
+    fitting: List[Tuple[float, BudgetConfig]] = []
     for cfg in candidates:
         cost = estimate_config_cost(cfg)
         if cost <= budget:
@@ -771,66 +286,14 @@ def choose_config_for_current_resources(
     return min(candidates, key=estimate_config_cost)
 
 
-# ---------------------------------------------------------------------
-# 7. Compile chosen WorkflowConfig into your existing ExecutionPolicy
-# ---------------------------------------------------------------------
+def budget_to_policy(config: BudgetConfig):
 
-def workflow_config_to_execution_policy(
-    config: WorkflowConfig,
-    qp: QueryProfile,
-) -> ExecutionPolicy:
-    """
-        Compile a one-shot WorkflowConfig into the ExecutionPolicy expected by the
-        downstream runner.
-        WorkflowConfig is the profiler/scheduler-level representation.
-        ExecutionPolicy is the runner-level representation.
-    """
-    preferred_tools = tuple(
-        "vlm" if x == "clip" else x
-        for x in config.evidence_sources
-    )
-
-    return ExecutionPolicy(
-        mode="attribute",
-        anchor_policy="best_score",
-        coverage_target=1,
-        require_temporal_pair=False,
-
-        preferred_tools=preferred_tools,
-
-        probe_tier="cheap",
-        caption_tier="none",
-        ocr_tier="cheap" if "ocr" in preferred_tools else "none",
-        asr_tier="cheap" if "asr" in preferred_tools else "none",
-
-        enable_cheap_stage=config.inspection_pattern in ("asr_only", "ocr_only"),
-        cheap_answer_tier=config.cheap_answer_tier,
-        text_answer_min_conf=0.75,
-
-        answer_tier=config.answer_tier,
-        fallback_answer_tier="none",
-
-        probe_fps=config.probe_fps,
-        probe_seg_len_s=60,
-        probe_topk=config.probe_topk,
-
-        window_len_s=config.window_len_s,
-        strides=(0.5,),
-        action_topk=config.action_topk,
-
-        eps_marginal_gain=0.01,
-        escalate_if_low_confidence=True,
-        min_retrieval_conf=0.15,
-        min_answer_conf=0.35,
-
-        confidence=qp.confidence,
-        rationale=(
-            f"{qp.rationale} | chosen_config={config.name}; "
-            f"config_rationale={config.rationale}"
-        ),
-    )
-
-
+    return {
+        "probe_fps": config.probe_fps,
+        "probe_topk": config.probe_topk,
+        "action_topk": config.action_topk,
+        "window_len_s": config.window_len_s,
+    }
 # ---------------------------------------------------------------------
 # 8. Main entry point: METIS-style VIMIO profiler + selector
 # ---------------------------------------------------------------------
@@ -838,6 +301,7 @@ def workflow_config_to_execution_policy(
 def profile_query_llm(
     query: str,
     *,
+    duration_s,
     base_url: str = "http://localhost:8000/v1",
     model: str = "gpt-4o-mini",
     temperature: float = 0.0,
@@ -854,7 +318,7 @@ def profile_query_llm(
 
     with the METIS-style path:
 
-        query -> QueryProfile -> candidate WorkflowConfigs
+        query -> QueryProfile -> candidate BudgetConfig
               -> resource-aware selection -> ExecutionPolicy
     """
     if resource_state is None:
@@ -870,53 +334,118 @@ def profile_query_llm(
     )
 
     analysis = raw_json.get("analysis", {})
-    raw_profile = raw_json.get("profile", raw_json)
-
     print("\n===== RAW PROFILER ANALYSIS =====")
     print(json.dumps(analysis, indent=2))
+    # Temporary: current orchestrator is visual-only.
 
-    print("\n===== RAW PARSED PROFILE =====")
-    print(json.dumps(raw_profile, indent=2))
+    candidate_configs = analysis_to_candidate_configs(analysis)
 
-    patched_profile = _patch_query_profile_with_guardrails(query, raw_json)
+    requested_config = choose_budget_from_profile(
+        analysis,
+        duration_s,
+    )
 
-    print("\n===== PATCHED PROFILE =====")
-    print(json.dumps(patched_profile, indent=2))
-
-    qp = _coerce_query_profile(patched_profile)
-
-    candidate_configs = profile_to_candidate_configs(qp, analysis=analysis)
+    chosen_config = adapt_budget_for_resources(
+        requested_config,
+        resource_state,
+    )
 
     print("\n===== CANDIDATE WORKFLOW CONFIGS =====")
     print(json.dumps([asdict(c) for c in candidate_configs], indent=2))
 
-    chosen_config = choose_config_for_current_resources(
-        candidates=candidate_configs,
-        resource_state=resource_state,
-    )
+    print("\n===== REQUESTED WORKFLOW CONFIG =====")
+    print(json.dumps(asdict(requested_config), indent=2))
+
+    print("\n===== RESOURCE STATE =====")
+    print(json.dumps(asdict(resource_state), indent=2))
 
     print("\n===== CHOSEN WORKFLOW CONFIG =====")
     print(json.dumps(asdict(chosen_config), indent=2))
 
-    policy = workflow_config_to_execution_policy(chosen_config, qp)
+    policy = budget_to_policy(chosen_config)
 
     print("\n===== COMPILED EXECUTION POLICY =====")
-    print(json.dumps(asdict(policy), indent=2))
+    print(json.dumps(policy, indent=2))
+
+    print("\n===== COMPILED EXECUTION POLICY =====")
+    print(json.dumps(policy, indent=2))
 
     return ProfilerResult(
         analysis=analysis,
-        query_profile=qp,
         candidate_configs=candidate_configs,
+        requested_config=requested_config,
         chosen_config=chosen_config,
         execution_policy=policy,
-        raw_profile=patched_profile,
         raw_json=raw_json,
+    )
+
+
+
+def choose_scan_rate(requirement, duration_s):
+
+    if duration_s < 60:
+
+        table = {
+            "local": 2.0,
+            "medium": 1.0,
+            "global": 0.5,
+        }
+
+    elif duration_s < 300:
+
+        table = {
+            "local": 1.0,
+            "medium": 0.5,
+            "global": 0.125,
+        }
+
+    else:
+
+        table = {
+            "local": 0.5,
+            "medium": 0.125,
+            "global": 0.03125,
+        }
+
+    return table[requirement]
+
+def choose_budget_from_profile(
+    analysis,
+    duration_s,
+):
+
+    probe_fps = choose_scan_rate(
+        analysis["temporal_requirement"],
+        duration_s,
+    )
+
+    topk = choose_topk(
+        analysis["candidate_requirement"]
+    )
+
+    window = choose_window(
+        analysis["context_requirement"]
+    )
+
+    budget = choose_vlm_budget(
+        analysis["precision_requirement"]
+    )
+
+    return BudgetConfig(
+        name="dynamic",
+        probe_fps=probe_fps,
+        probe_topk=topk,
+        action_topk=topk,
+        window_len_s=window,
+        vlm_budget=budget,
+        quality_tier="dynamic",
     )
 
 
 def profile_query_llm_legacy(
     query: str,
     *,
+    duration_s,
     base_url: str = "http://localhost:8000/v1",
     model: str = "gpt-4o-mini",
     temperature: float = 0.0,
@@ -935,3 +464,95 @@ def profile_query_llm_legacy(
         timeout_s=timeout_s,
     )
     return result.execution_policy, result.analysis
+
+
+
+def analysis_to_candidate_configs(
+    analysis: Dict[str, Any],
+) -> List[BudgetConfig]:
+
+    analysis = analysis or {}
+
+    detail = analysis.get("visual_detail_level", "medium")
+    precise = analysis.get("needs_precise_local_view", False)
+    scale = analysis.get("object_scale", "medium")
+
+    if detail == "low" and not precise:
+        return [
+            BudgetConfig(
+                name="low_budget",
+                probe_fps=0.5,
+                probe_topk=4,
+                action_topk=4,
+                window_len_s=8.0,
+                quality_tier="risky",
+            ),
+            BudgetConfig(
+                name="medium_budget",
+                probe_fps=1.0,
+                probe_topk=8,
+                action_topk=8,
+                window_len_s=8.0,
+                quality_tier="medium",
+            ),
+        ]
+
+    if detail == "medium":
+        return [
+            BudgetConfig(
+                name="medium_budget",
+                probe_fps=1.0,
+                probe_topk=8,
+                action_topk=8,
+                window_len_s=8.0,
+                quality_tier="medium",
+            ),
+            BudgetConfig(
+                name="high_budget",
+                probe_fps=2.0,
+                probe_topk=12,
+                action_topk=12,
+                window_len_s=8.0,
+                quality_tier="safe",
+            ),
+        ]
+
+    return [
+        BudgetConfig(
+            name="high_budget",
+            probe_fps=2.0,
+            probe_topk=16,
+            action_topk=16,
+            window_len_s=8.0,
+            quality_tier="safe",
+        )
+    ]
+
+
+
+
+
+def adapt_budget_for_resources(
+    requested: BudgetConfig,
+    resource_state: ResourceState,
+) -> BudgetConfig:
+
+    if resource_state.load_level == "low":
+        return requested
+
+    if resource_state.load_level == "medium":
+
+        if requested.name == "high_budget":
+            return MEDIUM_BUDGET
+
+        return requested
+
+    if resource_state.load_level == "high":
+
+        if requested.name == "high_budget":
+            return MEDIUM_BUDGET
+
+        if requested.name == "medium_budget":
+            return LOW_BUDGET
+
+        return requested
