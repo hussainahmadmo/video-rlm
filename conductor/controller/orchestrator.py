@@ -42,10 +42,6 @@ class Orchestrator:
         baseline_visual_max_frames: int = 60,
         encoder_visual_max_frames: int = 60,
     ) -> dict:
-        
-        #create a workflow object - 
-        # tell the engine - the user question, the path create a new workflow record for this run - without workflow
-        # object the engine does not know which stages belong together.
 
 
         if policy_mode == "baseline_full":
@@ -60,66 +56,113 @@ class Orchestrator:
             metadata={"duration_s": duration_s},
         )
 
-        profile_id = self.engine.add_stage(
-            wf.workflow_id,
-            StageType.PROFILE_QUERY,
-            payload={
-                "duration_s": duration_s,
-                "duration_min": duration_s / 60.0,
+        profile_id = None
+        prof = None
+
+        if policy_mode == "auto":
+            # Normal VIMIO: run the profiler and use its compiled policy.
+            profile_id = self.engine.add_stage(
+                wf.workflow_id,
+                StageType.PROFILE_QUERY,
+                payload={
+                    "duration_s": duration_s,
+                    "duration_min": duration_s / 60.0,
+                },
+            )
+
+            await self.engine.run_stage(
+                wf.workflow_id,
+                profile_id,
+            )
+
+            prof = self.engine.get_result(
+                wf.workflow_id,
+                profile_id,
+            )
+
+            artifacts = prof.artifacts or {}
+
+            print(
+                "[PROFILE_DEBUG] prof.artifacts keys:",
+                list(artifacts.keys()),
+            )
+            print(
+                "[PROFILE_DEBUG] prof.artifacts:",
+                artifacts,
+            )
+
+            policy = (
+                artifacts.get("execution_policy")
+                or artifacts.get("policy")
+                or artifacts.get("raw_json", {}).get(
+                    "execution_policy"
+                )
+                or artifacts.get("raw_json", {}).get("policy")
+                or {}
+            )
+
+            policy = dict(policy)
+
+            policy.setdefault("probe_topk", 8)
+            policy.setdefault("action_topk", 8)
+            policy.setdefault("probe_fps", 1.0)
+            policy.setdefault("window_len_s", 8.0)
+
+            vlm_budget = int(
+                policy.get("vlm_budget", 32)
+            )
+
+            policy.setdefault(
+                "answer_max_images_total",
+                vlm_budget,
+            )
+            policy.setdefault(
+                "answer_max_frames_per_window",
+                4,
+            )
+
+        else:
+            # Controlled experiment: skip the profiler completely.
+            required = {
+                "probe_fps": probe_fps,
+                "probe_topk": probe_topk,
+                "action_topk": action_topk,
+                "window_len_s": window_len_s,
+                "answer_max_images_total": (
+                    answer_max_images_total
+                ),
             }
-        )
 
-        #run the profiler first. The LLM profiler decides VIMIO policy.
-        await self.engine.run_stage(wf.workflow_id, profile_id)
+            missing = [
+                key
+                for key, value in required.items()
+                if value is None
+            ]
 
-        prof = self.engine.get_result(wf.workflow_id, profile_id)
+            if missing:
+                raise ValueError(
+                    "override mode requires explicit values for: "
+                    + ", ".join(missing)
+                )
 
-        artifacts = prof.artifacts or {}
+            policy = {
+                "probe_fps": float(probe_fps),
+                "probe_topk": int(probe_topk),
+                "action_topk": int(action_topk),
+                "window_len_s": float(window_len_s),
+                "answer_max_images_total": int(
+                    answer_max_images_total
+                ),
+                "answer_max_frames_per_window": int(
+                    answer_max_frames_per_window
+                    if answer_max_frames_per_window is not None
+                    else 4
+                ),
+            }
 
-        print("[PROFILE_DEBUG] prof.artifacts keys:", list(artifacts.keys()))
-        print("[PROFILE_DEBUG] prof.artifacts:", artifacts)
-
-        policy = (
-            artifacts.get("execution_policy")
-            or artifacts.get("policy")
-            or artifacts.get("raw_json", {}).get("execution_policy")
-            or artifacts.get("raw_json", {}).get("policy")
-            or {}
-        )
-
-        policy = dict(policy)
-
-        policy.setdefault("probe_topk", 8)
-        policy.setdefault("action_topk", 8)
-        policy.setdefault("probe_fps", 1.0)
-        policy.setdefault("window_len_s", 8.0)
-
-        # Convert profiler budget -> answer budget
-        vlm_budget = int(policy.get("vlm_budget", 32))
-
-        policy.setdefault("answer_max_images_total", vlm_budget)
-        policy.setdefault("answer_max_frames_per_window", 4)
-
-        # Optional controlled-ablation mode.
-        # In normal VIMIO auto mode, do not override the profiler.
-        if policy_mode == "override":
-            if probe_fps is not None:
-                policy["probe_fps"] = float(probe_fps)
-
-            if probe_topk is not None:
-                policy["probe_topk"] = int(probe_topk)
-
-            if window_len_s is not None:
-                policy["window_len_s"] = float(window_len_s)
-
-            if action_topk is not None:
-                policy["action_topk"] = int(action_topk)
-
-            if answer_max_frames_per_window is not None:
-                policy["answer_max_frames_per_window"] = int(answer_max_frames_per_window)
-
-            if answer_max_images_total is not None:
-                policy["answer_max_images_total"] = int(answer_max_images_total)
+            print(
+                "[POLICY_OVERRIDE] Skipped PROFILE_QUERY"
+            )
 
         policy["probe_fps"] = self._coerce_policy_number(policy, "probe_fps", 1.0, float)
         policy["probe_topk"] = self._coerce_policy_number(policy, "probe_topk", 8, int)
@@ -152,7 +195,14 @@ class Orchestrator:
             "answer_max_images_total": answer_max_images_total,
         }
 
-        # Now create proposal using profiler-selected policy.
+        # Now create proposal using profiler-selected policy
+
+        proposal_dependencies = (
+            [profile_id]
+            if profile_id is not None
+            else []
+        )
+
         proposal_id = self.engine.add_stage(
             wf.workflow_id,
             StageType.INITIAL_PROPOSAL,
@@ -162,7 +212,7 @@ class Orchestrator:
                 "probe_topk": int(policy["probe_topk"]),
                 "window_len_s": float(policy["window_len_s"]),
             },
-            depends_on=[profile_id],
+            depends_on=proposal_dependencies,
         )
         await self.engine.run_stage(wf.workflow_id, proposal_id)
         proposal = self.engine.get_result(wf.workflow_id, proposal_id)
@@ -249,7 +299,14 @@ class Orchestrator:
         )
 
         # Effective number of visual windows allowed.
-        effective_max_vlm_windows = min(action_topk, max_vlm_windows_policy)
+
+        effective_max_vlm_windows = min(
+            action_topk,
+            max_vlm_windows_policy,
+            max(1, answer_max_images_total_policy),
+        )
+
+        
 
         # Effective total image budget.
         # This prevents "top4" with 2 frames/window from accidentally exceeding the image budget.
@@ -303,6 +360,7 @@ class Orchestrator:
             probe_fps=probe_fps,
             answer_max_frames_per_window=effective_frames_per_window,
             policy=policy,
+            policy_mode=policy_mode,
         )
 
         
@@ -319,6 +377,7 @@ class Orchestrator:
         probe_fps: float,
         answer_max_frames_per_window: int = 4,
         policy: dict | None = None,
+        policy_mode: str = "auto",
     ):
         
         visual_stage_ids: list[str] = []
@@ -378,8 +437,14 @@ class Orchestrator:
 
             answer_text = f"ERROR: {answer_res.artifacts.get('error', 'answer stage failed')}"
 
+        all_stage_ids = []
 
-        all_stage_ids = [profile_id, proposal_id] + map_stage_ids + [answer_id]
+        if profile_id is not None:
+            all_stage_ids.append(profile_id)
+
+        all_stage_ids.append(proposal_id)
+        all_stage_ids.extend(map_stage_ids)
+        all_stage_ids.append(answer_id)
         stage_timing = self._collect_stage_timing(
             workflow_id=wf.workflow_id,
             stage_ids=all_stage_ids,
@@ -389,14 +454,14 @@ class Orchestrator:
             stage_ids=all_stage_ids,
             video_id=wf.video_path,
             question=question,
-            policy_mode="vimio",
+            policy_mode=policy_mode,
         )
 
         workflow_summary_csv = self._summarize_workflow_timing(
             workflow_id=wf.workflow_id,
             stage_ids=all_stage_ids,
             visual_results=visual_results,
-            policy_mode="vimio",
+            policy_mode=policy_mode,
             video_id=wf.video_path,
             question=question,
         )
@@ -405,7 +470,7 @@ class Orchestrator:
             "workflow_id": wf.workflow_id,
             "answer": answer_text,
             "confidence": answer_res.artifacts.get("confidence"),
-            "profile": prof.artifacts,
+            "profile": prof.artifacts if prof is not None else {},
             "proposal": proposal.artifacts,
             "debug": {
                 "num_visual_stages": len(visual_stage_ids),
