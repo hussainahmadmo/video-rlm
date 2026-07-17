@@ -12,6 +12,11 @@ from conductor.profiler.llm_profiler import (
     profile_query_llm,
     ResourceState,
 )
+
+from conductor.engine.services.hierarchical_retriever import (
+    HierarchicalRetriever,
+    RetrievalWindow,
+)
 class Orchestrator:
     def __init__(self, engine, decoder=None):
         self.engine = engine
@@ -58,6 +63,7 @@ class Orchestrator:
 
         profile_id = None
         prof = None
+        profile_artifacts: dict = {}
 
         if policy_mode == "auto":
             # Normal VIMIO: run the profiler and use its compiled policy.
@@ -80,24 +86,24 @@ class Orchestrator:
                 profile_id,
             )
 
-            artifacts = prof.artifacts or {}
+            profile_artifacts = prof.artifacts or {}
 
             print(
                 "[PROFILE_DEBUG] prof.artifacts keys:",
-                list(artifacts.keys()),
+                list(profile_artifacts.keys()),
             )
             print(
                 "[PROFILE_DEBUG] prof.artifacts:",
-                artifacts,
+                profile_artifacts,
             )
 
             policy = (
-                artifacts.get("execution_policy")
-                or artifacts.get("policy")
-                or artifacts.get("raw_json", {}).get(
+                profile_artifacts.get("execution_policy")
+                or profile_artifacts.get("policy")
+                or profile_artifacts.get("raw_json", {}).get(
                     "execution_policy"
                 )
-                or artifacts.get("raw_json", {}).get("policy")
+                or profile_artifacts.get("raw_json", {}).get("policy")
                 or {}
             )
 
@@ -174,9 +180,22 @@ class Orchestrator:
         policy["answer_max_images_total"] = self._coerce_policy_number(
             policy, "answer_max_images_total", 32, int
         )
+        policy.setdefault("retrieval_mode", "hierarchical")
+        policy.setdefault("retrieval_budget", 32)
+        policy.setdefault("retrieval_coarse_count", 16)
+        policy.setdefault("retrieval_parents_to_refine", 4)
+        policy.setdefault("clip_frames_per_window", 1)
+
+
+
         # ADD THIS BLOCK HERE
         print("\n[FINAL_POLICY]")
         for k in [
+            "retrieval_mode",
+            "retrieval_budget",
+            "retrieval_coarse_count",
+            "retrieval_parents_to_refine",
+            "clip_frames_per_window",
             "probe_fps",
             "probe_topk",
             "action_topk",
@@ -184,6 +203,7 @@ class Orchestrator:
             "answer_max_frames_per_window",
             "answer_max_images_total",
         ]:
+            
             print(f"{k}: {policy.get(k)}")
 
         policy["_explicit_knobs"] = {
@@ -197,10 +217,16 @@ class Orchestrator:
 
         # Now create proposal using profiler-selected policy
 
+
         proposal_dependencies = (
             [profile_id]
             if profile_id is not None
             else []
+        )
+
+        proposal_analysis = (
+            profile_artifacts.get("analysis")
+            or {}
         )
 
         proposal_id = self.engine.add_stage(
@@ -208,12 +234,13 @@ class Orchestrator:
             StageType.INITIAL_PROPOSAL,
             payload={
                 "duration_s": duration_s,
-                "probe_fps": float(policy["probe_fps"]),
-                "probe_topk": int(policy["probe_topk"]),
-                "window_len_s": float(policy["window_len_s"]),
+                "execution_policy": dict(policy),
+                "analysis": dict(proposal_analysis),
             },
             depends_on=proposal_dependencies,
         )
+
+
         await self.engine.run_stage(wf.workflow_id, proposal_id)
         proposal = self.engine.get_result(wf.workflow_id, proposal_id)
         proposal_artifacts = proposal.artifacts or {}
@@ -237,16 +264,23 @@ class Orchestrator:
 
         # Final fallback: make uniform 5-second windows over the video.
         # This lets METIS knob experiments run even if InitialProposalRunner is not producing candidates.
+
+        # Flat-retrieval fallback: create uniform chunks using
+        # the policy-selected window length.
         if not candidates:
             candidates = self._build_coarse_chunks(
                 duration_s=duration_s,
-                chunk_len_s=float(policy.get("window_len_s", 5.0)),
-                )
-
+                chunk_len_s=float(
+                    policy.get("window_len_s", 5.0)
+                ),
+            )
             actions = candidates
 
         if not actions:
             actions = candidates
+
+        # Preserve the original proposal candidates for flat fallback.
+        proposal_candidates = list(candidates)
             
         # ------------------------------------------------------------
         # Optional CLIP ranking before selecting top-k visual windows.
@@ -254,37 +288,83 @@ class Orchestrator:
         # candidate/actions for VLM.
         # ------------------------------------------------------------
 
-        if candidates:
-            try:
+
+        retrieval_mode = str(
+            policy.get("retrieval_mode", "flat")
+        )
+
+        try:
+            print(
+                f"[RETRIEVAL_ENABLED] "
+                f"mode={retrieval_mode} "
+                f"proposal_candidates={len(candidates)}"
+            )
+
+            if retrieval_mode == "hierarchical":
+                candidates, actions = (
+                    self._hierarchical_rank_candidates_and_actions(
+                        question=question,
+                        video_path=video_path,
+                        policy=policy,
+                        duration_s=duration_s,
+                    )
+                )
+
+            elif retrieval_mode == "flat":
+                if not proposal_candidates:
+                    raise ValueError(
+                        "Flat retrieval requires candidate windows"
+                    )
+
+                candidates, actions = (
+                    self._clip_rank_candidates_and_actions(
+                        question=question,
+                        video_path=video_path,
+                        candidates=proposal_candidates,
+                        policy=policy,
+                        duration_s=duration_s,
+                    )
+                )
+
+            else:
+                raise ValueError(
+                    f"Unknown retrieval_mode={retrieval_mode!r}"
+                )
+
+            print(
+                f"[RETRIEVAL_DONE] "
+                f"mode={retrieval_mode} "
+                f"candidates={len(candidates)} "
+                f"actions={len(actions)}"
+            )
+
+        except Exception as e:
+            import traceback
+
+            print(
+                f"[RETRIEVAL_ERROR] "
+                f"mode={retrieval_mode} "
+                f"{type(e).__name__}: {e}"
+            )
+            traceback.print_exc()
+
+            if retrieval_mode == "hierarchical" and proposal_candidates:
                 print(
-                    f"[CLIP_RANK_ENABLED] "
-                    f"num_candidates={len(candidates)} "
-                    f"proposal_strategy={policy.get('proposal_strategy')} "
+                    "[RETRIEVAL_FALLBACK] "
+                    "Falling back to flat retrieval"
                 )
 
-                candidates, actions = self._clip_rank_candidates_and_actions(
-                    question=question,
-                    video_path=video_path,
-                    candidates=candidates,
-                    policy=policy,
-                    duration_s=duration_s,
+                candidates, actions = (
+                    self._clip_rank_candidates_and_actions(
+                        question=question,
+                        video_path=video_path,
+                        candidates=proposal_candidates,
+                        policy=policy,
+                        duration_s=duration_s,
+                    )
                 )
-
-                print(
-                    f"[CLIP_RANK_DONE] "
-                    f"num_ranked_candidates={len(candidates)} "
-                    f"num_actions={len(actions)}"
-                )
-
-            except Exception as e:
-                import traceback
-                print(f"[CLIP_RANK_ERROR] {type(e).__name__}: {e}")
-                traceback.print_exc()
-
-                # Fallback: do not kill the whole run.
-                # Use unranked coarse candidates/actions.
-                if not actions:
-                    actions = candidates
+            else:
+                raise
 
         action_topk = int(policy.get("action_topk", 8))
         max_vlm_windows_policy = int(policy.get("max_vlm_windows", action_topk))
@@ -687,7 +767,177 @@ class Orchestrator:
             writer.writerow(summary)
 
         return str(path)
-    
+
+
+    def _score_hierarchical_windows_with_clip(
+        self,
+        *,
+        question: str,
+        video_path: str,
+        windows: list[RetrievalWindow],
+        policy: dict,
+    ) -> list[float]:
+        if self.decoder is None:
+            raise RuntimeError(
+                "Hierarchical CLIP scoring requires a decoder"
+            )
+
+        candidate_objs = [
+            CandidateWindow(
+                t0=float(window.t0),
+                t1=float(window.t1),
+                score=0.0,
+                source="hierarchical_candidate",
+            )
+            for window in windows
+        ]
+
+        ranked = self.clip_ranker.rank_windows(
+            question=question,
+            video_path=video_path,
+            windows=candidate_objs,
+            decoder=self.decoder,
+            # Keep this at 1 for the fixed retrieval-frame budget.
+            frames_per_window=1,
+            fps=float(policy.get("probe_fps", 1.0)),
+        )
+
+        score_by_window = {
+            (
+                round(float(candidate.t0), 6),
+                round(float(candidate.t1), 6),
+            ): float(candidate.score)
+            for candidate in ranked
+        }
+
+        missing_windows = [
+            window
+            for window in windows
+            if (
+                round(float(window.t0), 6),
+                round(float(window.t1), 6),
+            )
+            not in score_by_window
+        ]
+
+        if missing_windows:
+            missing_preview = [
+                (float(window.t0), float(window.t1))
+                for window in missing_windows[:5]
+            ]
+
+            raise RuntimeError(
+                f"CLIP returned scores for "
+                f"{len(score_by_window)} of {len(windows)} windows. "
+                f"Missing examples: {missing_preview}"
+            )
+
+        return [
+            score_by_window[
+                (
+                    round(float(window.t0), 6),
+                    round(float(window.t1), 6),
+                )
+            ]
+            for window in windows
+        ]
+
+
+    def _hierarchical_rank_candidates_and_actions(
+        self,
+        *,
+        question: str,
+        video_path: str,
+        policy: dict,
+        duration_s: float,
+    ) -> tuple[list[dict], list[dict]]:
+        if self.decoder is None:
+            raise RuntimeError(
+                "Hierarchical retrieval requires a decoder"
+            )
+
+        retrieval_budget = int(
+            policy.get("retrieval_budget", 32)
+        )
+
+        retriever = HierarchicalRetriever(
+            retrieval_budget=retrieval_budget
+        )
+
+        print(
+            "\n[HIERARCHICAL_RETRIEVAL]"
+            f" duration={duration_s:.2f}s"
+            f" budget={retrieval_budget}"
+            f" coarse={policy.get('retrieval_coarse_count', 16)}"
+            f" parents={policy.get('retrieval_parents_to_refine', 4)}"
+            f" final_topk={policy.get('action_topk', 4)}"
+        )
+
+        ranked_windows = retriever.retrieve(
+            question=question,
+            duration_s=duration_s,
+            score_windows=lambda query, windows: (
+                self._score_hierarchical_windows_with_clip(
+                    question=query,
+                    video_path=video_path,
+                    windows=windows,
+                    policy=policy,
+                )
+            ),
+            coarse_count=int(
+                policy.get("retrieval_coarse_count", 16)
+            ),
+            parents_to_refine=int(
+                policy.get("retrieval_parents_to_refine", 4)
+            ),
+            final_topk=int(
+                policy.get("action_topk", 4)
+            ),
+        )
+
+
+        candidates = [
+            {
+                "t0": float(window.t0),
+                "t1": float(window.t1),
+                "score": float(window.score),
+                "source": "hierarchical_clip",
+                "level": int(window.level),
+            }
+            for window in ranked_windows
+        ]
+
+        actions = build_action_space(
+            [
+                CandidateWindow(
+                    t0=c["t0"],
+                    t1=c["t1"],
+                    score=c["score"],
+                    source=c["source"],
+                )
+                for c in candidates
+            ],
+            window_len_s=float(
+                policy.get("window_len_s", 4.0)
+            ),
+            topk=int(
+                policy.get("action_topk", 4)
+            ),
+        )
+
+        action_dicts = [action.__dict__ for action in actions]
+
+        for action in action_dicts:
+            action["t0"] = max(0.0, float(action["t0"]))
+            action["t1"] = min(
+                float(duration_s),
+                float(action["t1"]),
+            )
+            action["source"] = "hierarchical_clip"
+            action["retrieval_level"] = 1
+
+        return candidates, action_dicts
+
     def _clip_rank_candidates_and_actions(
         self,
         *,
