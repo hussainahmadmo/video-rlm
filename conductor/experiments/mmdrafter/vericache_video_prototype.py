@@ -604,6 +604,18 @@ def manual_high_generate(
         inputs=inputs,
     )
 
+    eos_token_ids = model.generation_config.eos_token_id
+
+    if eos_token_ids is None:
+        eos_token_id_set: set[int] = set()
+    elif isinstance(eos_token_ids, int):
+        eos_token_id_set = {eos_token_ids}
+    else:
+        eos_token_id_set = {
+            int(token_id)
+            for token_id in eos_token_ids
+        }
+
     generated: list[torch.Tensor] = []
 
     for _ in range(max_new_tokens):
@@ -614,6 +626,15 @@ def manual_high_generate(
         )
 
         generated.append(token_id)
+
+        token_value = int(
+            token_id[0, 0].item()
+        )
+
+        # Match model.generate(): include EOS,
+        # then stop immediately.
+        if token_value in eos_token_id_set:
+            break
 
         state = advance_one_token(
             model=model,
@@ -631,7 +652,6 @@ def manual_high_generate(
         generated,
         dim=1,
     )
-
 @torch.inference_mode()
 def manual_high_generate_with_offload(
     *,
