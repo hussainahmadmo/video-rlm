@@ -62,6 +62,44 @@ def synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+@torch.inference_mode()
+def advance_token_block(
+    *,
+    model: Qwen2_5_VLForConditionalGeneration,
+    cache: Any,
+    attention_mask: torch.Tensor,
+    token_ids: torch.Tensor,
+    rope_deltas: torch.Tensor,
+) -> dict[str, Any]:
+    new_mask = append_attention_mask(
+        attention_mask,
+        int(token_ids.shape[1]),
+    )
+
+    position_ids, cache_position = build_cached_positions(
+        cache=cache,
+        token_ids=token_ids,
+        rope_deltas=rope_deltas,
+    )
+
+    outputs = model(
+        input_ids=token_ids,
+        attention_mask=new_mask,
+        position_ids=position_ids,
+        cache_position=cache_position,
+        past_key_values=cache,
+        rope_deltas=rope_deltas,
+        use_cache=True,
+        return_dict=True,
+    )
+
+    return {
+        "cache": outputs.past_key_values,
+        "next_logits": outputs.logits[:, -1, :],
+        "attention_mask": new_mask,
+        "rope_deltas": outputs.rope_deltas,
+    }
+
 def move_to_device(
     value: Any,
     device: torch.device,
@@ -215,6 +253,50 @@ def append_attention_mask(
         dim=1,
     )
 
+def build_cached_positions(
+    *,
+    cache: Any,
+    token_ids: torch.Tensor,
+    rope_deltas: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    past_length = int(
+        cache.get_seq_length()
+    )
+
+    token_count = int(
+        token_ids.shape[1]
+    )
+
+    cache_position = torch.arange(
+        past_length,
+        past_length + token_count,
+        dtype=torch.long,
+        device=token_ids.device,
+    )
+
+    position_ids = (
+        cache_position
+        .view(1, 1, token_count)
+        .expand(
+            3,
+            token_ids.shape[0],
+            token_count,
+        )
+    )
+
+    position_ids = (
+        position_ids
+        + rope_deltas
+        .to(token_ids.device)
+        .view(
+            1,
+            token_ids.shape[0],
+            1,
+        )
+    )
+
+    return position_ids, cache_position
+
 
 @torch.inference_mode()
 def prefill(
@@ -245,24 +327,20 @@ def generate_draft_block(
     cache: Any,
     next_logits: torch.Tensor,
     attention_mask: torch.Tensor,
+    rope_deltas: torch.Tensor,
     block_size: int,
     eos_token_id: int | None,
 ) -> dict[str, Any]:
-    """
-    Autoregressively draft one block and retain a cache
-    snapshot after every drafted token.
-
-    Snapshots make rollback straightforward after rejection.
-    """
-
     tokens: list[torch.Tensor] = []
     cache_snapshots: list[Cache] = []
     logits_snapshots: list[torch.Tensor] = []
     mask_snapshots: list[torch.Tensor] = []
+    rope_snapshots: list[torch.Tensor] = []
 
     current_cache = cache
     current_logits = next_logits
     current_mask = attention_mask
+    current_rope_deltas = rope_deltas
 
     for _ in range(block_size):
         token = (
@@ -278,16 +356,28 @@ def generate_draft_block(
             1,
         )
 
+        position_ids, cache_position = (
+            build_cached_positions(
+                cache=current_cache,
+                token_ids=token,
+                rope_deltas=current_rope_deltas,
+            )
+        )
+
         outputs = model(
             input_ids=token,
             attention_mask=current_mask,
+            position_ids=position_ids,
+            cache_position=cache_position,
             past_key_values=current_cache,
+            rope_deltas=current_rope_deltas,
             use_cache=True,
             return_dict=True,
         )
 
         current_cache = outputs.past_key_values
         current_logits = outputs.logits[:, -1, :]
+        current_rope_deltas = outputs.rope_deltas
 
         cache_snapshots.append(
             as_legacy_cache(current_cache)
@@ -298,6 +388,9 @@ def generate_draft_block(
         mask_snapshots.append(
             current_mask
         )
+        rope_snapshots.append(
+            current_rope_deltas
+        )
 
         if (
             eos_token_id is not None
@@ -307,15 +400,12 @@ def generate_draft_block(
             break
 
     return {
-        "draft_ids": torch.cat(
-            tokens,
-            dim=1,
-        ),
+        "draft_ids": torch.cat(tokens, dim=1),
         "cache_snapshots": cache_snapshots,
         "logits_snapshots": logits_snapshots,
         "mask_snapshots": mask_snapshots,
+        "rope_snapshots": rope_snapshots,
     }
-
 
 @torch.inference_mode()
 def verify_block(
@@ -324,6 +414,7 @@ def verify_block(
     high_cache: Any,
     high_next_logits: torch.Tensor,
     high_attention_mask: torch.Tensor,
+    high_rope_deltas: torch.Tensor,
     draft_ids: torch.Tensor,
 ) -> dict[str, Any]:
     """
@@ -349,10 +440,21 @@ def verify_block(
         draft_length,
     )
 
+    position_ids, cache_position = (
+        build_cached_positions(
+            cache=high_cache,
+            token_ids=draft_ids,
+            rope_deltas=high_rope_deltas,
+        )
+    )
+
     outputs = model(
         input_ids=draft_ids,
         attention_mask=combined_mask,
+        position_ids=position_ids,
+        cache_position=cache_position,
         past_key_values=high_cache,
+        rope_deltas=high_rope_deltas,
         use_cache=True,
         return_dict=True,
     )
@@ -419,8 +521,8 @@ def verify_block(
         "full_block_attention_mask": (
             combined_mask
         ),
+        "full_block_rope_deltas": outputs.rope_deltas,
     }
-
 
 @torch.inference_mode()
 def advance_one_token(
@@ -431,38 +533,17 @@ def advance_one_token(
     token_id: torch.Tensor,
     rope_deltas: torch.Tensor,
 ) -> dict[str, Any]:
-    past_length = int(
-        cache.get_seq_length()
-    )
-
     new_mask = append_attention_mask(
         attention_mask,
         token_id.shape[1],
     )
 
-    cache_position = torch.arange(
-        past_length,
-        past_length + token_id.shape[1],
-        dtype=torch.long,
-        device=token_id.device,
-    )
-
-    base_positions = torch.arange(
-        token_id.shape[1],
-        dtype=torch.long,
-        device=token_id.device,
-    )
-
-    position_ids = (
-        base_positions
-        + cache_position[0]
-        + rope_deltas.to(token_id.device).view(-1, 1)
-    )
-
-    position_ids = (
-        position_ids
-        .unsqueeze(0)
-        .expand(3, -1, -1)
+    position_ids, cache_position = (
+        build_cached_positions(
+            cache=cache,
+            token_ids=token_id,
+            rope_deltas=rope_deltas,
+        )
     )
 
     outputs = model(
@@ -548,6 +629,132 @@ def manual_high_generate(
         dim=1,
     )
 
+@torch.inference_mode()
+def manual_high_generate_with_offload(
+    *,
+    model: Qwen2_5_VLForConditionalGeneration,
+    inputs: dict[str, Any],
+    device: torch.device,
+    max_new_tokens: int,
+) -> torch.Tensor:
+    state = prefill(
+        model=model,
+        inputs=inputs,
+    )
+
+    cache_cpu = cache_to_cpu(
+        state["cache"]
+    )
+
+    next_logits_cpu = (
+        state["next_logits"]
+        .detach()
+        .cpu()
+        .pin_memory()
+    )
+
+    attention_mask_cpu = (
+        state["attention_mask"]
+        .detach()
+        .cpu()
+        .pin_memory()
+    )
+
+    rope_deltas_cpu = (
+        state["rope_deltas"]
+        .detach()
+        .cpu()
+        .pin_memory()
+    )
+
+    del state
+
+    generated: list[torch.Tensor] = []
+
+    for step in range(max_new_tokens):
+        cache_gpu = cache_to_device(
+            cache_cpu,
+            device,
+            model,
+        )
+
+        next_logits_gpu = next_logits_cpu.to(
+            device,
+            non_blocking=True,
+        )
+
+        attention_mask_gpu = attention_mask_cpu.to(
+            device,
+            non_blocking=True,
+        )
+
+        rope_deltas_gpu = rope_deltas_cpu.to(
+            device,
+            non_blocking=True,
+        )
+
+        synchronize(device)
+
+        token_id = (
+            next_logits_gpu
+            .argmax(dim=-1)
+            .unsqueeze(1)
+        )
+
+        generated.append(
+            token_id.detach().cpu()
+        )
+
+        print(
+            f"offload step={step}, "
+            f"cache_len={cache_gpu.get_seq_length()}, "
+            f"token={int(token_id[0, 0])}",
+            flush=True,
+        )
+
+        state = advance_one_token(
+            model=model,
+            cache=cache_gpu,
+            attention_mask=attention_mask_gpu,
+            token_id=token_id,
+            rope_deltas=rope_deltas_gpu,
+        )
+
+        cache_cpu = cache_to_cpu(
+            state["cache"]
+        )
+
+        next_logits_cpu = (
+            state["next_logits"]
+            .detach()
+            .cpu()
+            .pin_memory()
+        )
+
+        attention_mask_cpu = (
+            state["attention_mask"]
+            .detach()
+            .cpu()
+            .pin_memory()
+        )
+
+        rope_deltas_cpu = (
+            state["rope_deltas"]
+            .detach()
+            .cpu()
+            .pin_memory()
+        )
+        del state
+        del cache_gpu
+        del next_logits_gpu
+        del attention_mask_gpu
+        del rope_deltas_gpu
+        del token_id
+
+    return torch.cat(
+        generated,
+        dim=1,
+    )
 
 @torch.inference_mode()
 def vericache_decode(
@@ -608,6 +815,13 @@ def vericache_decode(
         .pin_memory()
     )
 
+    high_rope_deltas_cpu = (
+        high_state_gpu["rope_deltas"]
+        .detach()
+        .cpu()
+        .pin_memory()
+    )
+
     high_cache_cpu = cache_to_cpu(
         high_state_gpu["cache"]
     )
@@ -663,16 +877,25 @@ def vericache_decode(
 
         synchronize(device)
         draft_start = time.perf_counter()
+        draft_round_cache_cpu = cache_to_cpu(
+            draft_state["cache"],
+            pin_memory=False,
+        )
+
+        draft_round_mask = draft_state[
+            "attention_mask"
+        ]
+
+        draft_round_rope_deltas = draft_state[
+            "rope_deltas"
+        ]
 
         proposal = generate_draft_block(
             model=model,
             cache=draft_state["cache"],
-            next_logits=draft_state[
-                "next_logits"
-            ],
-            attention_mask=draft_state[
-                "attention_mask"
-            ],
+            next_logits=draft_state["next_logits"],
+            attention_mask=draft_state["attention_mask"],
+            rope_deltas=draft_state["rope_deltas"],
             block_size=current_block_size,
             eos_token_id=eos_token_id,
         )
@@ -715,6 +938,13 @@ def vericache_decode(
             )
         )
 
+        high_rope_deltas_gpu = (
+            high_rope_deltas_cpu.to(
+                device,
+                non_blocking=True,
+            )
+        )
+
         synchronize(device)
 
         total_transfer_in_s += (
@@ -728,12 +958,9 @@ def vericache_decode(
         verification = verify_block(
             model=model,
             high_cache=high_cache_gpu,
-            high_next_logits=(
-                high_next_logits_gpu
-            ),
-            high_attention_mask=(
-                high_attention_mask_gpu
-            ),
+            high_next_logits=high_next_logits_gpu,
+            high_attention_mask=high_attention_mask_gpu,
+            high_rope_deltas=high_rope_deltas_gpu,
             draft_ids=draft_ids,
         )
 
@@ -780,6 +1007,9 @@ def vericache_decode(
                 "attention_mask": proposal[
                     "mask_snapshots"
                 ][-1],
+                    "rope_deltas": proposal[
+                    "rope_snapshots"
+                ][-1],
             }
 
             next_high_cache = (
@@ -797,6 +1027,9 @@ def vericache_decode(
                     "full_block_attention_mask"
                 ]
             )
+            next_high_rope_deltas = verification[
+                "full_block_rope_deltas"
+            ]
 
             reached_eos = (
                 eos_token_id is not None
@@ -806,102 +1039,70 @@ def vericache_decode(
                 == eos_token_id
             )
         else:
-            correction_id = verification[
-                "correction_id"
-            ]
+            correction_id = (
+                verification["correction_id"]
+                .detach()
+                .clone()
+            )
 
             output_tokens.append(
-                int(
-                    correction_id[
-                        0,
-                        0,
-                    ].item()
-                )
+                int(correction_id[0, 0].item())
             )
 
-            # Roll high cache back to the accepted prefix.
-            accepted_high_length = (
-                high_prompt_length
-                + len(output_tokens)
-                - 1
-            )
-
-            high_prefix_cache = crop_cache(
-                verification[
-                    "full_block_cache"
+            committed_ids = torch.cat(
+                [
+                    draft_ids[:, :accepted_length],
+                    correction_id,
                 ],
-                accepted_high_length,
+                dim=1,
+            )
+
+            # The verification cache includes rejected tokens.
+            # Release it before loading the clean round-start cache.
+            del verification
+            del high_cache_gpu
+
+            clean_high_cache = cache_to_device(
+                high_cache_cpu,
+                device,
                 model,
             )
 
-            high_advanced = advance_one_token(
+            high_advanced = advance_token_block(
                 model=model,
-                cache=high_prefix_cache,
-                attention_mask=(
-                    append_attention_mask(
-                        high_attention_mask_gpu,
-                        accepted_length,
-                    )
-                ),
-                token_id=correction_id,
+                cache=clean_high_cache,
+                attention_mask=high_attention_mask_gpu,
+                token_ids=committed_ids,
+                rope_deltas=high_rope_deltas_gpu,
             )
 
-            next_high_cache = (
-                high_advanced["cache"]
+            next_high_cache = high_advanced["cache"]
+            next_high_logits = high_advanced["next_logits"]
+            next_high_mask = high_advanced["attention_mask"]
+            next_high_rope_deltas = high_advanced[
+                "rope_deltas"
+            ]
+
+            clean_draft_cache = cache_to_device(
+                draft_round_cache_cpu,
+                device,
+                model,
             )
-            next_high_logits = (
-                high_advanced["next_logits"]
-            )
-            next_high_mask = (
-                high_advanced[
-                    "attention_mask"
-                ]
-            )
 
-            # Roll drafter back to accepted tokens, then
-            # advance it with the high correction token.
-            if accepted_length == 0:
-                draft_prefix_cache = (
-                    draft_state["cache"]
-                )
-
-                draft_prefix_mask = (
-                    draft_state[
-                        "attention_mask"
-                    ]
-                )
-            else:
-
-                draft_prefix_cache = legacy_to_dynamic_cache(
-                    proposal["cache_snapshots"][
-                        accepted_length - 1
-                    ],
-                    model,
-                )
-            
-                draft_prefix_mask = proposal[
-                    "mask_snapshots"
-                ][accepted_length - 1]
-
-            draft_advanced = advance_one_token(
+            draft_state = advance_token_block(
                 model=model,
-                cache=draft_prefix_cache,
-                attention_mask=draft_prefix_mask,
-                token_id=correction_id,
+                cache=clean_draft_cache,
+                attention_mask=draft_round_mask,
+                token_ids=committed_ids,
+                rope_deltas=draft_round_rope_deltas,
             )
-
-            draft_state = draft_advanced
 
             reached_eos = (
                 eos_token_id is not None
-                and int(
-                    correction_id[
-                        0,
-                        0,
-                    ].item()
-                )
+                and int(correction_id[0, 0].item())
                 == eos_token_id
             )
+
 
         synchronize(device)
         transfer_out_start = (
@@ -926,6 +1127,13 @@ def vericache_decode(
             .pin_memory()
         )
 
+        high_rope_deltas_cpu = (
+            next_high_rope_deltas
+            .detach()
+            .cpu()
+            .pin_memory()
+        )
+
         synchronize(device)
 
         total_transfer_out_s += (
@@ -933,15 +1141,24 @@ def vericache_decode(
             - transfer_out_start
         )
 
-        del high_cache_gpu
+        if accepted_length == drafted_count:
+            del high_cache_gpu
+            del verification
+
         del high_next_logits_gpu
         del high_attention_mask_gpu
+        del high_rope_deltas_gpu
+
         del next_high_cache
         del next_high_logits
         del next_high_mask
-        del verification
+        del next_high_rope_deltas
+
         del proposal
         del draft_ids
+        del draft_round_cache_cpu
+        del draft_round_mask
+        del draft_round_rope_deltas
 
         if reached_eos:
             break
@@ -1085,24 +1302,17 @@ def main() -> None:
     synchronize(device)
     baseline_start = time.perf_counter()
 
-    # baseline_ids = high_only_generate(
-    #     model=model,
-    #     inputs=high_inputs_gpu,
-    #     max_new_tokens=args.max_new_tokens,
-    # )
-
-    # manual_ids = manual_high_generate(
-    #     model=model,
-    #     inputs=high_inputs_gpu,
-    #     max_new_tokens=args.max_new_tokens,
-    # )
-
-    # synchronize(device)
-
     baseline_ids = high_only_generate(
-    model=model,
-    inputs=high_inputs_gpu,
-    max_new_tokens=args.max_new_tokens,
+        model=model,
+        inputs=high_inputs_gpu,
+        max_new_tokens=args.max_new_tokens,
+    )
+
+    synchronize(device)
+
+    baseline_s = (
+        time.perf_counter()
+        - baseline_start
     )
 
     manual_ids = manual_high_generate(
@@ -1113,34 +1323,39 @@ def main() -> None:
 
     synchronize(device)
 
+    manual_match = torch.equal(
+        baseline_ids,
+        manual_ids,
+    )
+
     print(
         "generate token ids:",
-        baseline_ids[0].detach().cpu().tolist(),
+        baseline_ids[0]
+        .detach()
+        .cpu()
+        .tolist(),
         flush=True,
     )
 
     print(
         "manual token ids:",
-        manual_ids[0].detach().cpu().tolist(),
+        manual_ids[0]
+        .detach()
+        .cpu()
+        .tolist(),
         flush=True,
     )
 
     print(
         "manual cached match:",
-        torch.equal(
-            baseline_ids,
-            manual_ids,
-        ),
+        manual_match,
         flush=True,
     )
-
-    return
-
-
-    baseline_s = (
-        time.perf_counter()
-        - baseline_start
-    )
+    if not manual_match:
+        raise RuntimeError(
+            "Manual cached high decoding does not "
+            "match model.generate()."
+        )
 
     baseline_token_ids = (
         baseline_ids[0]
@@ -1148,6 +1363,8 @@ def main() -> None:
         .cpu()
         .tolist()
     )
+
+    del manual_ids
 
     baseline_text = processor.decode(
         baseline_token_ids,
