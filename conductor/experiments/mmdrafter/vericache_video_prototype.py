@@ -428,16 +428,49 @@ def advance_one_token(
     cache: Any,
     attention_mask: torch.Tensor,
     token_id: torch.Tensor,
+    rope_deltas: torch.Tensor,
 ) -> dict[str, Any]:
+    past_length = int(
+        cache.get_seq_length()
+    )
+
     new_mask = append_attention_mask(
         attention_mask,
-        1,
+        token_id.shape[1],
+    )
+
+    cache_position = torch.arange(
+        past_length,
+        past_length + token_id.shape[1],
+        dtype=torch.long,
+        device=token_id.device,
+    )
+
+    base_positions = torch.arange(
+        token_id.shape[1],
+        dtype=torch.long,
+        device=token_id.device,
+    )
+
+    position_ids = (
+        base_positions
+        + cache_position[0]
+        + rope_deltas.to(token_id.device).view(-1, 1)
+    )
+
+    position_ids = (
+        position_ids
+        .unsqueeze(0)
+        .expand(3, -1, -1)
     )
 
     outputs = model(
         input_ids=token_id,
         attention_mask=new_mask,
+        position_ids=position_ids,
+        cache_position=cache_position,
         past_key_values=cache,
+        rope_deltas=rope_deltas,
         use_cache=True,
         return_dict=True,
     )
@@ -446,6 +479,7 @@ def advance_one_token(
         "cache": outputs.past_key_values,
         "next_logits": outputs.logits[:, -1, :],
         "attention_mask": new_mask,
+        "rope_deltas": outputs.rope_deltas,
     }
 
 
@@ -472,6 +506,46 @@ def high_only_generate(
         :,
         prompt_length:,
     ]
+
+@torch.inference_mode()
+def manual_high_generate(
+    *,
+    model: Qwen2_5_VLForConditionalGeneration,
+    inputs: dict[str, Any],
+    max_new_tokens: int,
+) -> torch.Tensor:
+    state = prefill(
+        model=model,
+        inputs=inputs,
+    )
+
+    generated: list[torch.Tensor] = []
+
+    for _ in range(max_new_tokens):
+        token_id = (
+            state["next_logits"]
+            .argmax(dim=-1)
+            .unsqueeze(1)
+        )
+
+        generated.append(token_id)
+
+        state = advance_one_token(
+            model=model,
+            cache=state["cache"],
+            attention_mask=state[
+                "attention_mask"
+            ],
+            token_id=token_id,
+            rope_deltas=state[
+                "rope_deltas"
+            ],
+        )
+
+    return torch.cat(
+        generated,
+        dim=1,
+    )
 
 
 @torch.inference_mode()
@@ -1016,7 +1090,39 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
     )
 
+    manual_ids = manual_high_generate(
+        model=model,
+        inputs=high_inputs_gpu,
+        max_new_tokens=args.max_new_tokens,
+    )
+
     synchronize(device)
+
+    print(
+    "generate token ids:",
+    baseline_ids[0]
+    .detach()
+    .cpu()
+    .tolist(),
+    )
+
+    print(
+        "manual token ids:",
+        manual_ids[0]
+        .detach()
+        .cpu()
+        .tolist(),
+    )
+
+    print(
+        "manual cached match:",
+        torch.equal(
+            baseline_ids,
+            manual_ids,
+        ),
+    )
+
+    return
 
     baseline_s = (
         time.perf_counter()
