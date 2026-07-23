@@ -231,11 +231,11 @@ def prefill(
         "cache": outputs.past_key_values,
         "next_logits": outputs.logits[:, -1, :],
         "attention_mask": inputs["attention_mask"],
+        "rope_deltas": outputs.rope_deltas,
         "sequence_length": int(
             inputs["input_ids"].shape[1]
         ),
     }
-
 
 @torch.inference_mode()
 def generate_draft_block(
@@ -559,6 +559,9 @@ def vericache_decode(
         time.perf_counter()
         - draft_prefill_start
     )
+
+    del high_inputs
+    del draft_inputs
 
     output_tokens: list[int] = []
 
