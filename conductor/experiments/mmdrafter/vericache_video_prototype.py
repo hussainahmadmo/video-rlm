@@ -97,7 +97,10 @@ def advance_token_block(
         "cache": outputs.past_key_values,
         "next_logits": outputs.logits[:, -1, :],
         "attention_mask": new_mask,
-        "rope_deltas": outputs.rope_deltas,
+
+        # Keep the multimodal RoPE offset from prefill.
+        # Text-only cached decoding must not replace it.
+        "rope_deltas": rope_deltas,
     }
 
 def move_to_device(
@@ -377,7 +380,6 @@ def generate_draft_block(
 
         current_cache = outputs.past_key_values
         current_logits = outputs.logits[:, -1, :]
-        current_rope_deltas = outputs.rope_deltas
 
         cache_snapshots.append(
             as_legacy_cache(current_cache)
@@ -561,7 +563,8 @@ def advance_one_token(
         "cache": outputs.past_key_values,
         "next_logits": outputs.logits[:, -1, :],
         "attention_mask": new_mask,
-        "rope_deltas": outputs.rope_deltas,
+        # Preserve the multimodal RoPE offset computed during prefill.
+        "rope_deltas": rope_deltas,
     }
 
 
@@ -989,6 +992,36 @@ def vericache_decode(
         synchronize(device)
         verify_start = time.perf_counter()
 
+        print(
+            "verification round start:",
+            {
+                "output_tokens": output_tokens,
+                "draft_ids": (
+                    draft_ids[0]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ),
+                "high_cache_len": int(
+                    high_cache_gpu.get_seq_length()
+                ),
+                "high_mask_len": int(
+                    high_attention_mask_gpu.shape[1]
+                ),
+                "high_next_token": int(
+                    high_next_logits_gpu
+                    .argmax(dim=-1)[0]
+                    .item()
+                ),
+                "high_rope_deltas": (
+                    high_rope_deltas_gpu
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ),
+            },
+            flush=True,
+        )
         verification = verify_block_sequential(
             model=model,
             high_cache=high_cache_gpu,
@@ -1066,6 +1099,8 @@ def vericache_decode(
                 "state"
             ]["rope_deltas"]
 
+            
+
             reached_eos = (
                 eos_token_id is not None
                 and int(draft_ids[0, -1].item())
@@ -1096,6 +1131,27 @@ def vericache_decode(
             next_high_rope_deltas = verification[
                 "state"
             ]["rope_deltas"]
+
+
+            print(
+                "sequential rejection:",
+                {
+                    "draft_ids": draft_ids[0]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    "accepted_length": accepted_length,
+                    "correction_id": int(
+                        correction_id[0, 0].item()
+                    ),
+                    "next_high_token": int(
+                        next_high_logits
+                        .argmax(dim=-1)[0]
+                        .item()
+                    ),
+                },
+                flush=True,
+            )
 
             committed_ids = torch.cat(
                 [
@@ -1304,6 +1360,32 @@ def verify_block_sequential(
             :,
             token_index:token_index + 1,
         ]
+
+        print(
+            "verify step:",
+            {
+                "token_index": token_index,
+                "cache_len": int(
+                    state["cache"].get_seq_length()
+                ),
+                "mask_len": int(
+                    state["attention_mask"].shape[1]
+                ),
+                "verifier_id": int(
+                    verifier_id[0, 0].item()
+                ),
+                "draft_id": int(
+                    draft_id[0, 0].item()
+                ),
+                "rope_deltas": (
+                    state["rope_deltas"]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ),
+            },
+            flush=True,
+        )
 
         if not torch.equal(
             verifier_id,
