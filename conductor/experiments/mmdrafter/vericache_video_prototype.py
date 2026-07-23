@@ -756,6 +756,40 @@ def manual_high_generate_with_offload(
         dim=1,
     )
 
+
+@torch.inference_mode()
+def advance_token_sequence(
+    *,
+    model: Qwen2_5_VLForConditionalGeneration,
+    cache: Any,
+    attention_mask: torch.Tensor,
+    token_ids: torch.Tensor,
+    rope_deltas: torch.Tensor,
+) -> dict[str, Any]:
+    state = {
+        "cache": cache,
+        "attention_mask": attention_mask,
+        "rope_deltas": rope_deltas,
+        "next_logits": None,
+    }
+
+    for token_index in range(token_ids.shape[1]):
+        token_id = token_ids[
+            :,
+            token_index:token_index + 1,
+        ]
+
+        state = advance_one_token(
+            model=model,
+            cache=state["cache"],
+            attention_mask=state["attention_mask"],
+            token_id=token_id,
+            rope_deltas=state["rope_deltas"],
+        )
+
+    return state
+
+    
 @torch.inference_mode()
 def vericache_decode(
     *,
@@ -955,7 +989,7 @@ def vericache_decode(
         synchronize(device)
         verify_start = time.perf_counter()
 
-        verification = verify_block(
+        verification = verify_block_sequential(
             model=model,
             high_cache=high_cache_gpu,
             high_next_logits=high_next_logits_gpu,
@@ -979,6 +1013,10 @@ def vericache_decode(
             ]
         )
 
+        verification_full_accept = bool(
+            verification["full_accept"]
+        )
+
         total_accepted += accepted_length
 
         accepted_ids = draft_ids[
@@ -993,7 +1031,7 @@ def vericache_decode(
             .tolist()
         )
 
-        if accepted_length == drafted_count:
+        if verification_full_accept:
             full_block_accepts += 1
 
             draft_state = {
@@ -1007,47 +1045,57 @@ def vericache_decode(
                 "attention_mask": proposal[
                     "mask_snapshots"
                 ][-1],
-                    "rope_deltas": proposal[
+                "rope_deltas": proposal[
                     "rope_snapshots"
                 ][-1],
             }
 
-            next_high_cache = (
-                verification[
-                    "full_block_cache"
-                ]
-            )
-            next_high_logits = (
-                verification[
-                    "full_block_next_logits"
-                ]
-            )
-            next_high_mask = (
-                verification[
-                    "full_block_attention_mask"
-                ]
-            )
+            next_high_cache = verification[
+                "state"
+            ]["cache"]
+
+            next_high_logits = verification[
+                "state"
+            ]["next_logits"]
+
+            next_high_mask = verification[
+                "state"
+            ]["attention_mask"]
+
             next_high_rope_deltas = verification[
-                "full_block_rope_deltas"
-            ]
+                "state"
+            ]["rope_deltas"]
 
             reached_eos = (
                 eos_token_id is not None
-                and int(
-                    draft_ids[0, -1].item()
-                )
+                and int(draft_ids[0, -1].item())
                 == eos_token_id
             )
+
         else:
-            correction_id = (
-                verification["correction_id"]
-                .detach()
-                .clone()
-            )
+            correction_id = verification[
+                "correction_id"
+            ]
 
             output_tokens.append(
                 int(correction_id[0, 0].item())
             )
+
+            next_high_cache = verification[
+                "state"
+            ]["cache"]
+
+            next_high_logits = verification[
+                "state"
+            ]["next_logits"]
+
+            next_high_mask = verification[
+                "state"
+            ]["attention_mask"]
+
+            next_high_rope_deltas = verification[
+                "state"
+            ]["rope_deltas"]
 
             committed_ids = torch.cat(
                 [
@@ -1057,39 +1105,13 @@ def vericache_decode(
                 dim=1,
             )
 
-            # The verification cache includes rejected tokens.
-            # Release it before loading the clean round-start cache.
-            del verification
-            del high_cache_gpu
-
-            clean_high_cache = cache_to_device(
-                high_cache_cpu,
-                device,
-                model,
-            )
-
-            high_advanced = advance_token_block(
-                model=model,
-                cache=clean_high_cache,
-                attention_mask=high_attention_mask_gpu,
-                token_ids=committed_ids,
-                rope_deltas=high_rope_deltas_gpu,
-            )
-
-            next_high_cache = high_advanced["cache"]
-            next_high_logits = high_advanced["next_logits"]
-            next_high_mask = high_advanced["attention_mask"]
-            next_high_rope_deltas = high_advanced[
-                "rope_deltas"
-            ]
-
             clean_draft_cache = cache_to_device(
                 draft_round_cache_cpu,
                 device,
                 model,
             )
 
-            draft_state = advance_token_block(
+            draft_state = advance_token_sequence(
                 model=model,
                 cache=clean_draft_cache,
                 attention_mask=draft_round_mask,
@@ -1102,7 +1124,7 @@ def vericache_decode(
                 and int(correction_id[0, 0].item())
                 == eos_token_id
             )
-
+       
 
         synchronize(device)
         transfer_out_start = (
@@ -1141,9 +1163,15 @@ def vericache_decode(
             - transfer_out_start
         )
 
-        if accepted_length == drafted_count:
-            del high_cache_gpu
-            del verification
+        
+
+        del high_cache_gpu
+        del verification
+
+        if not verification_full_accept:
+            del clean_draft_cache
+            del committed_ids
+            del correction_id
 
         del high_next_logits_gpu
         del high_attention_mask_gpu
@@ -1243,6 +1271,93 @@ def load_inputs(path: str) -> dict[str, Any]:
 
     return payload["inputs"]
 
+@torch.inference_mode()
+def verify_block_sequential(
+    *,
+    model: Qwen2_5_VLForConditionalGeneration,
+    high_cache: Any,
+    high_next_logits: torch.Tensor,
+    high_attention_mask: torch.Tensor,
+    high_rope_deltas: torch.Tensor,
+    draft_ids: torch.Tensor,
+) -> dict[str, Any]:
+    state = {
+        "cache": high_cache,
+        "next_logits": high_next_logits,
+        "attention_mask": high_attention_mask,
+        "rope_deltas": high_rope_deltas,
+    }
+
+    accepted_length = 0
+    verifier_tokens: list[torch.Tensor] = []
+
+    for token_index in range(draft_ids.shape[1]):
+        verifier_id = (
+            state["next_logits"]
+            .argmax(dim=-1)
+            .unsqueeze(1)
+        )
+
+        verifier_tokens.append(verifier_id)
+
+        draft_id = draft_ids[
+            :,
+            token_index:token_index + 1,
+        ]
+
+        if not torch.equal(
+            verifier_id,
+            draft_id,
+        ):
+            correction_id = verifier_id
+
+            corrected_state = advance_one_token(
+                model=model,
+                cache=state["cache"],
+                attention_mask=state[
+                    "attention_mask"
+                ],
+                token_id=correction_id,
+                rope_deltas=state[
+                    "rope_deltas"
+                ],
+            )
+
+            return {
+                "accepted_length": accepted_length,
+                "correction_id": correction_id,
+                "state": corrected_state,
+                "verifier_ids": torch.cat(
+                    verifier_tokens,
+                    dim=1,
+                ),
+                "full_accept": False,
+            }
+
+        state = advance_one_token(
+            model=model,
+            cache=state["cache"],
+            attention_mask=state[
+                "attention_mask"
+            ],
+            token_id=draft_id,
+            rope_deltas=state[
+                "rope_deltas"
+            ],
+        )
+
+        accepted_length += 1
+
+    return {
+        "accepted_length": accepted_length,
+        "correction_id": None,
+        "state": state,
+        "verifier_ids": torch.cat(
+            verifier_tokens,
+            dim=1,
+        ),
+        "full_accept": True,
+    }
 
 def main() -> None:
     args = parse_args()
