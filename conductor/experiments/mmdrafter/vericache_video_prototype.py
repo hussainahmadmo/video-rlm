@@ -193,6 +193,7 @@ def crop_cache(
     dynamic_cache.crop(sequence_length)
     return dynamic_cache
 
+
 def append_attention_mask(
     attention_mask: torch.Tensor,
     token_count: int,
@@ -1084,10 +1085,24 @@ def main() -> None:
     synchronize(device)
     baseline_start = time.perf_counter()
 
+    # baseline_ids = high_only_generate(
+    #     model=model,
+    #     inputs=high_inputs_gpu,
+    #     max_new_tokens=args.max_new_tokens,
+    # )
+
+    # manual_ids = manual_high_generate(
+    #     model=model,
+    #     inputs=high_inputs_gpu,
+    #     max_new_tokens=args.max_new_tokens,
+    # )
+
+    # synchronize(device)
+
     baseline_ids = high_only_generate(
-        model=model,
-        inputs=high_inputs_gpu,
-        max_new_tokens=args.max_new_tokens,
+    model=model,
+    inputs=high_inputs_gpu,
+    max_new_tokens=args.max_new_tokens,
     )
 
     manual_ids = manual_high_generate(
@@ -1099,19 +1114,15 @@ def main() -> None:
     synchronize(device)
 
     print(
-    "generate token ids:",
-    baseline_ids[0]
-    .detach()
-    .cpu()
-    .tolist(),
+        "generate token ids:",
+        baseline_ids[0].detach().cpu().tolist(),
+        flush=True,
     )
 
     print(
         "manual token ids:",
-        manual_ids[0]
-        .detach()
-        .cpu()
-        .tolist(),
+        manual_ids[0].detach().cpu().tolist(),
+        flush=True,
     )
 
     print(
@@ -1120,9 +1131,11 @@ def main() -> None:
             baseline_ids,
             manual_ids,
         ),
+        flush=True,
     )
 
     return
+
 
     baseline_s = (
         time.perf_counter()
