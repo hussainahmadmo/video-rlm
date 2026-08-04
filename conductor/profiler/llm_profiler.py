@@ -1460,11 +1460,7 @@ def calibrate_policy_to_oracle_frontier(
             vlm_budget = 8
             name_suffix = "oracle_budget8"
 
-    topk = (
-        8
-        if requested.selection_mode == "top_k"
-        else requested.probe_topk
-    )
+    topk = 8
 
     return replace(
         requested,
