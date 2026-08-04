@@ -1,0 +1,4 @@
+dataset,fixed_raw_rows,fixed_configs,fixed_common_valid_qids,fixed_duplicate_valid_rows,vimio_raw_rows,vimio_valid_qids,vimio_duplicate_valid_rows,consistent_qids
+EgoSchema,9925,22,76,8253,76,76,0,76
+LVBench,1804,22,79,0,70,68,0,68
+VRBench,1469,22,33,726,35,35,0,33
