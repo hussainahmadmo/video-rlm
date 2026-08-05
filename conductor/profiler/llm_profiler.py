@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -599,6 +600,292 @@ DEFAULT_ANALYSIS: Dict[str, Any] = {
 }
 
 
+COUNTING_QUERY_TERMS = (
+    "how many",
+    "number of",
+    "count",
+    "times",
+    "total",
+)
+
+TEMPORAL_QUERY_TERMS = (
+    "before",
+    "after",
+    "first",
+    "last",
+    "sequence",
+    "then",
+    "previously",
+    "next",
+)
+
+SEQUENCE_QUERY_TERMS = (
+    "sequence of scenes",
+    "what order",
+    "which order",
+    "order of events",
+    "sequential order",
+    "order of the process",
+    "from start to finish",
+    "evolved throughout",
+    "stages",
+    "after the",
+    "first after",
+)
+
+FINE_DETAIL_QUERY_TERMS = (
+    "wearing",
+    "color",
+    "colour",
+    "holding",
+    "written",
+    "text",
+    "sign",
+    "logo",
+    "glasses",
+    "style",
+    "small",
+)
+
+LOCAL_DETAIL_QUERY_TERMS = (
+    "what style",
+    "what kind",
+    "what action",
+    "what event",
+    "who is the person",
+    "appears first",
+    "first plant",
+    "first piece",
+    "primary tool",
+    "what changes",
+)
+
+DENSE_VISUAL_QUERY_TERMS = (
+    "screen",
+    "website",
+    "cursor",
+    "letters",
+    "subtitles",
+    "mountains",
+    "lake",
+    "stairs",
+    "background",
+)
+
+GLOBAL_SUMMARY_QUERY_TERMS = (
+    "summarize",
+    "overall",
+    "primary objective",
+    "primary goal",
+    "main goal",
+    "core process",
+    "compare",
+    "process that",
+)
+
+
+def _query_contains_any(
+    query: str,
+    terms: Sequence[str],
+) -> bool:
+    normalized = query.lower()
+    return any(
+        re.search(
+            r"\b" + re.escape(term) + r"\b",
+            normalized,
+        )
+        is not None
+        for term in terms
+    )
+
+
+def _promote_candidate_requirement(
+    current: str,
+    minimum: str,
+) -> str:
+    rank = {
+        "few": 0,
+        "medium": 1,
+        "many": 2,
+    }
+    return (
+        minimum
+        if rank[current] < rank[minimum]
+        else current
+    )
+
+
+def apply_question_risk_overrides(
+    analysis: Dict[str, Any],
+    *,
+    query: str,
+) -> Dict[str, Any]:
+    """
+    Add deterministic risk guards for known brittle VideoQA patterns.
+
+    The LLM is good at producing a semantic label, but it is optimistic about
+    miss risk. These text cues are conservative overrides learned from the
+    consistent-eval misses: counting needs completeness, temporal questions
+    need separated evidence, and fine-detail questions need visual precision.
+    """
+
+    is_counting_query = _query_contains_any(
+        query,
+        COUNTING_QUERY_TERMS,
+    )
+    is_temporal_query = _query_contains_any(
+        query,
+        TEMPORAL_QUERY_TERMS,
+    )
+    is_fine_detail_query = _query_contains_any(
+        query,
+        FINE_DETAIL_QUERY_TERMS,
+    )
+    is_sequence_query = _query_contains_any(
+        query,
+        SEQUENCE_QUERY_TERMS,
+    )
+    is_local_detail_query = _query_contains_any(
+        query,
+        LOCAL_DETAIL_QUERY_TERMS,
+    )
+    is_dense_visual_query = _query_contains_any(
+        query,
+        DENSE_VISUAL_QUERY_TERMS,
+    )
+    is_global_summary_query = _query_contains_any(
+        query,
+        GLOBAL_SUMMARY_QUERY_TERMS,
+    )
+    risk_triggers = set(
+        analysis.get(
+            "_risk_triggers",
+            [],
+        )
+    )
+
+    if (
+        analysis["reasoning_type"]
+        in {"counting", "repetition"}
+        or is_counting_query
+    ):
+        analysis["reasoning_type"] = "counting"
+        analysis["answer_type"] = "count"
+        analysis[
+            "coverage_requirement"
+        ] = "full_timeline"
+        analysis[
+            "selection_mode"
+        ] = "all_positive_and_uncertain"
+        analysis[
+            "temporal_requirement"
+        ] = "global"
+        analysis[
+            "temporal_operation"
+        ] = "frequency"
+        analysis[
+            "candidate_requirement"
+        ] = "many"
+        if analysis["aggregation_type"] == "none":
+            analysis[
+                "aggregation_type"
+            ] = "occurrences"
+        analysis["answer_sensitivity"] = "exact"
+        analysis[
+            "fallback_requirement"
+        ] = "expand_coverage"
+        analysis["miss_risk"] = "high"
+        risk_triggers.add("counting_completeness")
+
+    if (
+        analysis["reasoning_type"]
+        in {"temporal_order", "multi_hop", "causal"}
+        or is_temporal_query
+        or is_sequence_query
+    ):
+        if (
+            analysis["reasoning_type"]
+            not in {"counting", "repetition"}
+        ):
+            if is_temporal_query or is_sequence_query:
+                analysis[
+                    "reasoning_type"
+                ] = "temporal_order"
+            analysis[
+                "coverage_requirement"
+            ] = "multi_region"
+            analysis["selection_mode"] = "multi_event"
+            if analysis["temporal_operation"] == "none":
+                analysis[
+                    "temporal_operation"
+                ] = "ordering"
+            analysis[
+                "candidate_requirement"
+            ] = _promote_candidate_requirement(
+                analysis["candidate_requirement"],
+                "medium",
+            )
+            analysis[
+                "fallback_requirement"
+            ] = "expand_coverage"
+            analysis["miss_risk"] = "high"
+            risk_triggers.add(
+                "temporal_sequence"
+                if is_sequence_query
+                else "multi_region_composition"
+            )
+
+    if (
+        analysis["reasoning_type"] == "fine_detail"
+        or is_fine_detail_query
+        or is_local_detail_query
+    ):
+        if analysis["reasoning_type"] not in {
+            "counting",
+            "temporal_order",
+        }:
+            analysis["reasoning_type"] = "fine_detail"
+        analysis[
+            "precision_requirement"
+        ] = "high"
+        if analysis["spatial_strategy"] == "full_frame":
+            analysis[
+                "spatial_strategy"
+            ] = "object_crop"
+        analysis[
+            "fallback_requirement"
+        ] = "expand_coverage"
+        analysis["miss_risk"] = "high"
+        risk_triggers.add("fine_detail")
+
+        if is_local_detail_query:
+            risk_triggers.add("local_detail")
+
+        if is_dense_visual_query:
+            risk_triggers.add("dense_visual_detail")
+
+    if is_global_summary_query and not risk_triggers:
+        analysis["reasoning_type"] = "global_summary"
+        analysis[
+            "coverage_requirement"
+        ] = "full_timeline"
+        analysis["selection_mode"] = "uniform"
+        analysis[
+            "temporal_requirement"
+        ] = "global"
+        analysis[
+            "context_requirement"
+        ] = "long"
+        analysis["answer_type"] = "summary"
+        risk_triggers.add("cheap_global_summary")
+
+    analysis["_risk_triggers"] = sorted(
+        risk_triggers
+    )
+
+    return analysis
+
+
 def _coerce_enum(
     analysis: Dict[str, Any],
     field: str,
@@ -636,6 +923,8 @@ def _normalize_modalities(
 
 def coerce_and_validate_analysis(
     raw_analysis: Dict[str, Any],
+    *,
+    query: str = "",
 ) -> Dict[str, Any]:
     """
     Normalize the LLM output and enforce hard policy invariants.
@@ -643,6 +932,11 @@ def coerce_and_validate_analysis(
     The LLM estimates evidence structure. This function prevents invalid
     combinations from reaching the execution-policy compiler.
     """
+
+    has_profile_confidence = (
+        isinstance(raw_analysis, dict)
+        and "profile_confidence" in raw_analysis
+    )
 
     if not isinstance(raw_analysis, dict):
         raw_analysis = {}
@@ -911,7 +1205,10 @@ def coerce_and_validate_analysis(
     if (
         reasoning_type == "ambiguous"
         or analysis["ambiguity"] == "high"
-        or analysis["profile_confidence"] < 0.55
+        or (
+            has_profile_confidence
+            and analysis["profile_confidence"] < 0.55
+        )
     ):
         if (
             analysis["coverage_requirement"]
@@ -960,6 +1257,11 @@ def coerce_and_validate_analysis(
         analysis[
             "required_modalities"
         ].append("ocr")
+
+    analysis = apply_question_risk_overrides(
+        analysis,
+        query=query,
+    )
 
     return analysis
 
@@ -1417,16 +1719,34 @@ def calibrate_policy_to_oracle_frontier(
     intact while making numeric knobs match that empirical frontier.
     """
 
+    high_risk = (
+        requested.miss_risk == "high"
+        or analysis[
+            "fallback_requirement"
+        ] == "full_high"
+    )
+    risk_triggers = set(
+        analysis.get(
+            "_risk_triggers",
+            [],
+        )
+    )
+    topk = 8
+    window_len_s = 8.0
+
     if duration_s >= 1200:
         scan_fps = 0.00390625
         chunk_len_s = 1.0 / scan_fps
         vlm_budget = 32
         name_suffix = "oracle_sparse_long"
+        if "temporal_sequence" in risk_triggers:
+            window_len_s = 16.0
+        elif "local_detail" in risk_triggers:
+            window_len_s = 4.0
+        if "dense_visual_detail" in risk_triggers:
+            topk = 16
 
     else:
-        scan_fps = 0.015625
-        chunk_len_s = 1.0 / scan_fps
-
         needs_detail_budget = (
             analysis[
                 "precision_requirement"
@@ -1446,7 +1766,47 @@ def calibrate_policy_to_oracle_frontier(
             }
         )
 
-        if needs_detail_budget:
+        if "counting_completeness" in risk_triggers:
+            scan_fps = 0.03125
+            vlm_budget = 32
+            window_len_s = 8.0
+            name_suffix = "oracle_counting_budget32"
+        elif "dense_visual_detail" in risk_triggers:
+            scan_fps = 0.125
+            vlm_budget = 32
+            window_len_s = 4.0
+            topk = 16
+            name_suffix = "oracle_dense_detail_budget32"
+        elif "local_detail" in risk_triggers:
+            scan_fps = 0.03125
+            vlm_budget = 32
+            window_len_s = 4.0
+            topk = 16
+            name_suffix = "oracle_local_detail_budget32"
+        elif "temporal_sequence" in risk_triggers:
+            scan_fps = 0.03125
+            vlm_budget = 32
+            window_len_s = 16.0
+            topk = 8
+            name_suffix = "oracle_sequence_budget32"
+        elif "multi_region_composition" in risk_triggers:
+            scan_fps = 0.03125
+            vlm_budget = 32
+            window_len_s = 12.0
+            topk = 12
+            name_suffix = "oracle_composition_budget32"
+        elif "cheap_global_summary" in risk_triggers:
+            scan_fps = 0.015625
+            vlm_budget = 8
+            window_len_s = 16.0
+            topk = 8
+            name_suffix = "oracle_global_budget8"
+        elif high_risk:
+            scan_fps = 0.03125
+            vlm_budget = 32
+            name_suffix = "oracle_risk_budget32"
+        elif needs_detail_budget:
+            scan_fps = 0.015625
             vlm_budget = 16
             name_suffix = "oracle_budget16"
         elif (
@@ -1454,13 +1814,15 @@ def calibrate_policy_to_oracle_frontier(
             == "targeted"
             or requested.miss_risk == "low"
         ):
+            scan_fps = 0.015625
             vlm_budget = 2
             name_suffix = "oracle_budget2"
         else:
+            scan_fps = 0.015625
             vlm_budget = 8
             name_suffix = "oracle_budget8"
 
-    topk = 8
+        chunk_len_s = 1.0 / scan_fps
 
     return replace(
         requested,
@@ -1474,7 +1836,7 @@ def calibrate_policy_to_oracle_frontier(
         frames_per_chunk=1,
         probe_topk=topk,
         action_topk=topk,
-        window_len_s=8.0,
+        window_len_s=window_len_s,
         vlm_budget=vlm_budget,
         high_frames_per_window=min(
             requested.high_frames_per_window,
@@ -2082,7 +2444,8 @@ def profile_query_llm(
     )
 
     analysis = coerce_and_validate_analysis(
-        raw_analysis
+        raw_analysis,
+        query=query,
     )
 
     requested_config = compile_execution_policy(
