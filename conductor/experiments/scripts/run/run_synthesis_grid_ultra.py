@@ -307,6 +307,59 @@ Be concise.
 """.strip()
 
 
+def build_timeline_window_summary_prompt(item, start_s, end_s, evidence_type):
+    detail_instruction = ""
+
+    if evidence_type in {
+        "screen_state_change",
+        "localized_object_attribute",
+        "localized_temporal_detail",
+    }:
+        detail_instruction = (
+            "\nPay special attention to small objects, clothing, text, "
+            "screen contents, and visible state changes."
+        )
+
+    return f"""
+This video segment is from {start_s:.1f}s to {end_s:.1f}s.
+
+Question:
+{item["question"]}
+
+Choices:
+{format_choices(item["choices"])}
+
+Describe the answer-relevant visual evidence in this segment.
+Preserve temporal order inside the segment.
+If the segment does not contain relevant evidence, say: "No relevant evidence."
+Do not choose the final answer yet.{detail_instruction}
+""".strip()
+
+
+def build_timeline_answer_prompt(item, window_summaries, evidence_type):
+    evidence_text = "\n\n".join(
+        f"[Window {w['window_idx']} | {w['start_s']:.1f}-{w['end_s']:.1f}s]\n{w['summary']}"
+        for w in window_summaries
+    )
+
+    instruction = (
+        "Use the ordered window summaries as the primary evidence. "
+        "For sequence questions, compare the chronological order of events "
+        "against each choice. For screen-state questions, focus on what "
+        "changed on screen and when."
+    )
+
+    return build_answer_prompt(
+        item["question"],
+        item["choices"],
+        extra_context=(
+            f"Evidence type: {evidence_type}\n"
+            f"{instruction}\n\n"
+            f"{evidence_text}"
+        ),
+    )
+
+
 def parse_confidence(response):
     """
     Parse confidence from model response.
@@ -534,8 +587,13 @@ def clip_topk_windows(
 
     model, processor, device = get_retrieval_model()
 
+    if isinstance(query, (list, tuple)):
+        queries = [str(q) for q in query]
+    else:
+        queries = [str(query)]
+
     text_inputs = processor(
-        text=[query],
+        text=queries,
         return_tensors="pt",
         padding=True,
         truncation=True,
@@ -548,7 +606,8 @@ def clip_topk_windows(
     }
 
     print("QUERY:")
-    print(query)
+    for idx, text_query in enumerate(queries):
+        print(f"[{idx}] {text_query}")
 
     print("INPUT_IDS SHAPE:")
     print(text_inputs["input_ids"].shape)
@@ -576,7 +635,8 @@ def clip_topk_windows(
         keepdim=True,
     )
 
-    scores = (scan["features"] @ text_feat.T).squeeze(-1)
+    scores_by_query = scan["features"] @ text_feat.T
+    scores = scores_by_query.max(dim=1).values
 
     scores = scores.cpu().numpy()
     raw_top = np.argsort(scores)[::-1][:k]
@@ -980,14 +1040,52 @@ def sample_frames_from_windows(
     }
 
 
-def build_clip_query(item):
-    return item["question"]
+def build_clip_query(item, config=None):
+    choices = item.get("choices") or []
+    evidence_type = None
+
+    if config:
+        evidence_type = config.get("evidence_type")
+
+    if evidence_type is None:
+        evidence_type = item.get("evidence_type")
+
+    option_aware_types = {
+        "sequence_ordering",
+        "screen_state_change",
+        "localized_temporal_detail",
+        "localized_object_attribute",
+        "first_or_next_event",
+    }
+
+    if evidence_type in option_aware_types and choices:
+        return [
+            (
+                item["question"]
+                + "\nCandidate answer: "
+                + str(choice)
+            )
+            for choice in choices
+        ]
+
+    question = item["question"].strip()
+
+    if len(question.split()) <= 12 and choices:
+        return [
+            question
+            + "\nCandidate answer: "
+            + str(choice)
+            for choice in choices
+        ]
+
+    return question
 
 
 def run_clip_oneshot(item, config):
     LATENCY_STATS.clear()
     query = build_clip_query(
         item,
+        config=config,
     )
 
     retrieval = clip_topk_windows(
@@ -1105,6 +1203,178 @@ def run_clip_oneshot(item, config):
                 frames["timestamps"],
         },
     }
+
+
+def select_windows_for_profiler_policy(item, config):
+    evidence_type = config.get("evidence_type")
+    duration_s = get_video_duration_s(item)
+
+    if evidence_type == "sequence_ordering":
+        num_windows = min(
+            int(config.get("timeline_windows", 12)),
+            int(config.get("vlm_budget", 32)),
+        )
+        windows = make_uniform_windows(
+            duration_s,
+            num_windows,
+        )
+        return {
+            "top_windows": [
+                {
+                    "window": window,
+                    "score": None,
+                    "source": "uniform_timeline",
+                }
+                for window in windows
+            ],
+            "selected_windows": windows,
+            "candidate_windows_examined": num_windows,
+            "selection_source": "uniform_timeline",
+        }
+
+    query = build_clip_query(
+        item,
+        config=config,
+    )
+    retrieval = clip_topk_windows(
+        video_path=item["video"],
+        query=query,
+        k=config["clip_topk"],
+        window_len_s=config["window_len_s"],
+        scan_fps=config["scan_fps"],
+    )
+    top_windows = retrieval["top_windows"]
+    selected_windows = apply_profiler_window_hints(
+        item=item,
+        top_windows=top_windows,
+        config=config,
+    )
+
+    return {
+        "top_windows": top_windows,
+        "selected_windows": selected_windows,
+        "candidate_windows_examined": retrieval[
+            "candidate_windows_examined"
+        ],
+        "selection_source": "option_aware_clip",
+    }
+
+
+def choose_timeline_windows(item, config):
+    selected = select_windows_for_profiler_policy(
+        item,
+        config,
+    )
+    windows = selected["selected_windows"]
+
+    if config.get("preserve_order") or config.get(
+        "evidence_type"
+    ) in {
+        "sequence_ordering",
+        "screen_state_change",
+    }:
+        windows = sorted(
+            windows,
+            key=lambda w: (w[0], w[1]),
+        )
+
+    max_windows = min(
+        len(windows),
+        int(config.get("map_max_windows", 12)),
+    )
+    windows = windows[:max_windows]
+    selected["selected_windows"] = windows
+
+    return selected
+
+
+def run_clip_map_answer(item, config):
+    LATENCY_STATS.clear()
+    evidence_type = config.get(
+        "evidence_type",
+        "generic",
+    )
+    selection = choose_timeline_windows(
+        item,
+        config,
+    )
+    selected_windows = selection["selected_windows"]
+
+    if not selected_windows:
+        raise RuntimeError("No windows selected")
+
+    frames_per_window = int(
+        config.get(
+            "map_frames_per_window",
+            3
+            if evidence_type == "sequence_ordering"
+            else 4,
+        )
+    )
+    window_summaries = []
+    actual_frames = 0
+
+    print(
+        f"[MAP] source={selection['selection_source']} "
+        f"windows={len(selected_windows)} "
+        f"frames_per_window={frames_per_window}"
+    )
+
+    for widx, (start_s, end_s) in enumerate(selected_windows):
+        frames = sample_uniform_frames(
+            video_path=item["video"],
+            num_frames=frames_per_window,
+            start_s=start_s,
+            end_s=end_s,
+        )
+        actual_frames += len(frames["frame_indices"])
+
+        prompt = build_timeline_window_summary_prompt(
+            item,
+            start_s,
+            end_s,
+            evidence_type,
+        )
+        summary = call_vlm_text(
+            frames,
+            prompt,
+        )
+        window_summaries.append({
+            "window_idx": widx,
+            "start_s": start_s,
+            "end_s": end_s,
+            "summary": summary,
+        })
+
+    answer_prompt = build_timeline_answer_prompt(
+        item,
+        window_summaries,
+        evidence_type,
+    )
+    response = call_llm_answer(answer_prompt)
+
+    return {
+        "prediction_label": parse_mcq_label(
+            response,
+            num_choices=len(item["choices"]),
+        ),
+        "prediction_text": response,
+        "num_vlm_calls": len(selected_windows) + 1,
+        "evidence": {
+            "clip_top_windows": selection["top_windows"],
+            "selected_windows": selected_windows,
+            "window_summaries": window_summaries,
+            "selection_source": selection["selection_source"],
+        },
+        "retrieval_effort": {
+            "candidate_windows": selection[
+                "candidate_windows_examined"
+            ],
+            "selected_windows": len(selected_windows),
+            "selected_frames": actual_frames,
+        },
+    }
+
 
 @torch.no_grad()
 def build_frame_scan_embeddings(
@@ -1398,6 +1668,9 @@ def run_single_config(item, config):
     if config["method"] == "clip_oneshot":
         return run_clip_oneshot(item, config)
 
+    if config["method"] == "clip_map_answer":
+        return run_clip_map_answer(item, config)
+
     if config["method"] == "global_summary":
         return run_global_summary(item, config)
 
@@ -1480,6 +1753,24 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
                 ),
             }
 
+            if config["evidence_type"] in {
+                "sequence_ordering",
+                "screen_state_change",
+            }:
+                config["method"] = "clip_map_answer"
+                config["map_max_windows"] = (
+                    12
+                    if config["evidence_type"] == "sequence_ordering"
+                    else
+                    10
+                )
+                config["map_frames_per_window"] = (
+                    3
+                    if config["evidence_type"] == "sequence_ordering"
+                    else
+                    4
+                )
+
             config = clamp_vimio_config_cost_aware(config, item)
 
             configs = [config]
@@ -1544,6 +1835,8 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
                 "num_windows": config.get("num_windows"),
                 "query_conditioned": config.get("query_conditioned"),
                 "vlm_budget": config.get("vlm_budget"),
+                "map_max_windows": config.get("map_max_windows"),
+                "map_frames_per_window": config.get("map_frames_per_window"),
                 "evidence_type": config.get("evidence_type"),
                 "expand_neighbors": config.get("expand_neighbors"),
                 "preserve_order": config.get("preserve_order"),
