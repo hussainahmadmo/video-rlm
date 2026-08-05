@@ -4,6 +4,7 @@ import io
 import json
 import time
 import re
+import textwrap
 from pathlib import Path
 
 import cv2
@@ -267,6 +268,63 @@ def build_answer_prompt(question, choices, extra_context=None):
         """.strip()
 
 
+def build_choice_evidence_comparison_prompt(
+    *,
+    question,
+    choices,
+    evidence_text,
+    task_instruction,
+    require_confidence=False,
+):
+    label_text = ", ".join(
+        chr(ord("A") + i)
+        for i in range(len(choices))
+    )
+    confidence_line = (
+        "Confidence: <number between 0.0 and 1.0>"
+        if require_confidence
+        else ""
+    )
+    confidence_instruction = (
+        "\nUse high confidence only if the evidence directly supports "
+        "the chosen answer and contradicts the main alternatives."
+        if require_confidence
+        else ""
+    )
+
+    return textwrap.dedent(
+        f"""
+        You are answering a multiple-choice question about a video.
+
+        Question:
+        {question}
+
+        Choices:
+        {format_choices(choices)}
+
+        Evidence:
+        {evidence_text}
+
+        Task:
+        {task_instruction}
+
+        First compare every answer choice against the evidence. For each choice,
+        list only concrete facts:
+        - supported evidence
+        - contradicted evidence
+        - missing evidence
+
+        Do not choose by general plausibility. Choose the option whose required
+        facts are most directly supported and least contradicted by the evidence.
+
+        Return your final answer at the end in exactly this format:
+        Answer: <one label from {label_text}>
+        {confidence_line}
+        {confidence_instruction}
+        """
+    ).strip()
+
+
 def build_global_summary_prompt(item, query_conditioned):
     if query_conditioned:
         return f"""
@@ -309,6 +367,33 @@ Do not guess the answer.
 Summarize the visual content in this video segment from {start_s:.1f}s to {end_s:.1f}s.
 Focus on concrete actions, objects, people, visible text, and scene changes.
 Be concise.
+""".strip()
+
+
+def build_structured_evidence_summary_prompt(item, start_s, end_s):
+    return f"""
+This video segment is from {start_s:.1f}s to {end_s:.1f}s.
+
+Question:
+{item["question"]}
+
+Choices:
+{format_choices(item["choices"])}
+
+Extract concrete visual evidence from this segment. Use the answer choices as a
+checklist, but do not choose the final answer.
+
+Return exactly:
+Main scene: <place and visible activity>
+People: <who is visible and what they are doing>
+Tools/objects: <specific visible tools, objects, materials, containers, surfaces>
+Actions: <specific physical actions, verbs only if directly visible>
+State changes: <what changes from start to end, if anything>
+Answer-choice evidence: <which choice facts are supported, contradicted, or missing>
+Uncertainty: <important ambiguities or things not visible>
+
+Do not infer hidden intent. Do not rename objects unless they are clearly visible.
+If evidence for a choice is missing, say it is missing.
 """.strip()
 
 
@@ -365,7 +450,13 @@ Do not choose the final answer yet.{detail_instruction}
 """.strip()
 
 
-def build_timeline_answer_prompt(item, window_summaries, evidence_type):
+def build_timeline_answer_prompt(
+    item,
+    window_summaries,
+    evidence_type,
+    *,
+    require_confidence=False,
+):
     evidence_text = "\n\n".join(
         f"[Window {w['window_idx']} | {w['start_s']:.1f}-{w['end_s']:.1f}s]\n{w['summary']}"
         for w in window_summaries
@@ -387,14 +478,27 @@ def build_timeline_answer_prompt(item, window_summaries, evidence_type):
             "and when."
         )
 
-    return build_answer_prompt(
-        item["question"],
-        item["choices"],
-        extra_context=(
+    if require_confidence:
+        return build_choice_evidence_comparison_prompt(
+            question=item["question"],
+            choices=item["choices"],
+            evidence_text=(
+                f"Evidence type: {evidence_type}\n"
+                f"Ordered window evidence:\n{evidence_text}"
+            ),
+            task_instruction=instruction,
+            require_confidence=True,
+        )
+
+    return build_choice_evidence_comparison_prompt(
+        question=item["question"],
+        choices=item["choices"],
+        evidence_text=(
             f"Evidence type: {evidence_type}\n"
-            f"{instruction}\n\n"
-            f"{evidence_text}"
+            f"Ordered window evidence:\n{evidence_text}"
         ),
+        task_instruction=instruction,
+        require_confidence=False,
     )
 
 
@@ -1213,13 +1317,21 @@ def run_clip_oneshot(item, config):
         config=config,
     )
 
-    prompt = build_answer_prompt(
-        item["question"],
-        item["choices"],
-        extra_context=evidence_hint,
-    )
+    if config.get("answer_with_confidence"):
+        prompt = build_answer_prompt_with_confidence(
+            item["question"],
+            item["choices"],
+            extra_context=evidence_hint,
+        )
+    else:
+        prompt = build_answer_prompt(
+            item["question"],
+            item["choices"],
+            extra_context=evidence_hint,
+        )
 
     response = call_vlm_answer(frames, prompt)
+    confidence = parse_confidence(response)
 
     print(
         f"[LATENCY] "
@@ -1242,6 +1354,7 @@ def run_clip_oneshot(item, config):
             num_choices=len(item["choices"])
         ),
         "prediction_text": response,
+        "prediction_confidence": confidence,
         "num_vlm_calls": 1,
 
         "retrieval_effort": {
@@ -1411,11 +1524,19 @@ def run_clip_map_answer(item, config):
         item,
         window_summaries,
         evidence_type,
+        require_confidence=bool(
+            config.get("answer_with_confidence")
+        ),
     )
     response = call_llm_answer(
         answer_prompt,
-        max_tokens=32,
+        max_tokens=(
+            256
+            if config.get("answer_with_confidence")
+            else 128
+        ),
     )
+    confidence = parse_confidence(response)
 
     return {
         "prediction_label": parse_mcq_label(
@@ -1423,6 +1544,7 @@ def run_clip_map_answer(item, config):
             num_choices=len(item["choices"]),
         ),
         "prediction_text": response,
+        "prediction_confidence": confidence,
         "num_vlm_calls": len(selected_windows) + 1,
         "evidence": {
             "clip_top_windows": selection["top_windows"],
@@ -1683,12 +1805,19 @@ def run_map_summary(item, config):
 
         actual_frames += len(frames["frame_indices"])
 
-        prompt = build_window_summary_prompt(
-            item,
-            start_s=start_s,
-            end_s=end_s,
-            query_conditioned=config["query_conditioned"],
-        )
+        if config.get("structured_evidence_summary"):
+            prompt = build_structured_evidence_summary_prompt(
+                item,
+                start_s=start_s,
+                end_s=end_s,
+            )
+        else:
+            prompt = build_window_summary_prompt(
+                item,
+                start_s=start_s,
+                end_s=end_s,
+                query_conditioned=config["query_conditioned"],
+            )
 
         summary = call_vlm_text(frames, prompt)
 
@@ -1704,18 +1833,45 @@ def run_map_summary(item, config):
         for w in window_summaries
     )
 
-    answer_prompt = build_answer_prompt(
-        item["question"],
-        item["choices"],
-        extra_context=evidence_text,
-    )
+    if config.get("choice_compare_answer"):
+        answer_prompt = build_choice_evidence_comparison_prompt(
+            question=item["question"],
+            choices=item["choices"],
+            evidence_text=evidence_text,
+            task_instruction=(
+                "Use the full-video timeline summaries to identify the "
+                "main activity, important actions, tools, objects, and "
+                "scene changes before selecting an answer. Prefer choices "
+                "whose required actions and objects are directly supported "
+                "by structured evidence, and penalize choices whose key facts "
+                "are listed as missing or contradicted."
+            ),
+            require_confidence=bool(
+                config.get("answer_with_confidence")
+            ),
+        )
+    else:
+        answer_prompt = build_answer_prompt(
+            item["question"],
+            item["choices"],
+            extra_context=evidence_text,
+        )
 
-    response = call_llm_answer(answer_prompt)
+    response = call_llm_answer(
+        answer_prompt,
+        max_tokens=(
+            256
+            if config.get("choice_compare_answer")
+            else 32
+        ),
+    )
+    confidence = parse_confidence(response)
 
 
     return {
         "prediction_label": parse_mcq_label(response, num_choices=len(item["choices"])),
         "prediction_text": response,
+        "prediction_confidence": confidence,
         "num_vlm_calls": config["num_windows"],
         "evidence": {"window_summaries": window_summaries},
         "retrieval_effort": {
@@ -1741,6 +1897,201 @@ def run_single_config(item, config):
     if config["method"] == "map_summary":
         return run_map_summary(item, config)
     raise ValueError(f"Unknown method: {config['method']}")
+
+
+UNCERTAIN_ANSWER_TERMS = (
+    "cannot determine",
+    "can't determine",
+    "not enough",
+    "insufficient",
+    "unclear",
+    "ambiguous",
+    "not visible",
+    "no relevant evidence",
+)
+
+
+def prediction_needs_evidence_fallback(pred):
+    if pred.get("prediction_label") is None:
+        return True
+
+    confidence = pred.get("prediction_confidence")
+    if confidence is not None and confidence < 0.55:
+        return True
+
+    text = str(
+        pred.get("prediction_text")
+        or ""
+    ).lower()
+    return any(
+        term in text
+        for term in UNCERTAIN_ANSWER_TERMS
+    )
+
+
+def make_evidence_fallback_config(config, item):
+    fallback = dict(config)
+    fallback["name"] = (
+        config.get("name", "vimio")
+        + "_fallback"
+    )
+    fallback["answer_with_confidence"] = True
+    fallback["fallback_source"] = config.get(
+        "name",
+        "vimio",
+    )
+
+    evidence_type = config.get("evidence_type")
+    duration_s = item.get("duration_s")
+    try:
+        duration_s = (
+            float(duration_s)
+            if duration_s is not None
+            else None
+        )
+    except Exception:
+        duration_s = None
+
+    if evidence_type in {
+        "sequence_ordering",
+        "screen_state_change",
+    }:
+        fallback["method"] = "clip_map_answer"
+        fallback["map_max_windows"] = (
+            12
+            if evidence_type
+            == "sequence_ordering"
+            else 10
+        )
+        fallback["map_frames_per_window"] = (
+            3
+            if evidence_type
+            == "sequence_ordering"
+            else 4
+        )
+        fallback["preserve_order"] = True
+        fallback["include_uniform_anchors"] = True
+        fallback["vlm_budget"] = max(
+            int(
+                config.get(
+                    "vlm_budget",
+                    32,
+                )
+            ),
+            32,
+        )
+        return fallback
+
+    if evidence_type == "counting_completeness":
+        fallback["scan_fps"] = 0.03125
+        fallback["clip_topk"] = 8
+        fallback["window_len_s"] = 8
+        fallback["vlm_budget"] = 32
+        fallback["include_uniform_anchors"] = True
+        return clamp_vimio_config_cost_aware(
+            fallback,
+            item,
+        )
+
+    if evidence_type in {
+        "localized_temporal_detail",
+        "localized_object_attribute",
+        "first_or_next_event",
+    }:
+        current_scan = float(
+            config.get(
+                "scan_fps",
+                0.015625,
+            )
+        )
+        fallback["scan_fps"] = (
+            0.03125
+            if current_scan >= 0.125
+            else 0.125
+        )
+        fallback["clip_topk"] = 8
+        fallback["window_len_s"] = 4
+        fallback["vlm_budget"] = 32
+        fallback["expand_neighbors"] = True
+        return clamp_vimio_config_cost_aware(
+            fallback,
+            item,
+        )
+
+    if duration_s is not None and duration_s >= 1200:
+        fallback["scan_fps"] = 0.00390625
+        fallback["clip_topk"] = 8
+        fallback["window_len_s"] = 8
+        fallback["vlm_budget"] = 32
+    else:
+        fallback["scan_fps"] = 0.03125
+        fallback["clip_topk"] = 12
+        fallback["window_len_s"] = 12
+        fallback["vlm_budget"] = 32
+
+    return clamp_vimio_config_cost_aware(
+        fallback,
+        item,
+    )
+
+
+def run_single_config_with_evidence_fallback(item, config):
+    primary = run_single_config(item, config)
+    primary["fallback_used"] = False
+
+    if not config.get("enable_evidence_fallback"):
+        return primary
+
+    if not prediction_needs_evidence_fallback(primary):
+        return primary
+
+    fallback_config = make_evidence_fallback_config(
+        config,
+        item,
+    )
+
+    print(
+        "[FALLBACK] weak evidence; rerun "
+        f"{fallback_config['method']} "
+        f"scan={fallback_config.get('scan_fps')} "
+        f"k={fallback_config.get('clip_topk')} "
+        f"window={fallback_config.get('window_len_s')} "
+        f"budget={fallback_config.get('vlm_budget')}",
+        flush=True,
+    )
+
+    fallback = run_single_config(
+        item,
+        fallback_config,
+    )
+    fallback["fallback_used"] = True
+    fallback["primary_prediction_label"] = primary.get(
+        "prediction_label"
+    )
+    fallback["primary_prediction_text"] = primary.get(
+        "prediction_text"
+    )
+    fallback["primary_prediction_confidence"] = primary.get(
+        "prediction_confidence"
+    )
+    fallback["fallback_config"] = {
+        key: fallback_config.get(key)
+        for key in (
+            "method",
+            "scan_fps",
+            "clip_topk",
+            "window_len_s",
+            "vlm_budget",
+            "evidence_type",
+            "map_max_windows",
+            "map_frames_per_window",
+        )
+    }
+
+    if fallback.get("prediction_label") is not None:
+        return fallback
+
+    return primary
 
 
 def clamp_vimio_config_for_long_video(config, item):
@@ -1815,6 +2166,8 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
                 "include_uniform_anchors": bool(
                     p.get("include_uniform_anchors")
                 ),
+                "answer_with_confidence": True,
+                "enable_evidence_fallback": True,
             }
 
             if config["evidence_type"] in {
@@ -1835,6 +2188,14 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
                     4
                 )
 
+            elif config["evidence_type"] == "global_process":
+                config["method"] = "map_summary"
+                config["num_windows"] = 8
+                config["frames_per_window"] = 3
+                config["query_conditioned"] = False
+                config["choice_compare_answer"] = True
+                config["structured_evidence_summary"] = True
+
             config = clamp_vimio_config_cost_aware(config, item)
 
             configs = [config]
@@ -1852,7 +2213,10 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
             start = time.time()
 
             try:
-                pred = run_single_config(item, config)
+                pred = run_single_config_with_evidence_fallback(
+                    item,
+                    config,
+                )
                 error = None
 
             except Exception as e:
@@ -1862,9 +2226,11 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
                 pred = {
                     "prediction_label": None,
                     "prediction_text": None,
+                    "prediction_confidence": None,
                     "num_vlm_calls": None,
                     "evidence": None,
                     "retrieval_effort": None,
+                    "fallback_used": False,
                 }
 
                 error = repr(e)
@@ -1907,10 +2273,29 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
                 "include_uniform_anchors": config.get("include_uniform_anchors"),
                 "prediction_label": prediction_label,
                 "prediction_text": pred["prediction_text"],
+                "prediction_confidence": pred.get(
+                    "prediction_confidence"
+                ),
                 "correct": prediction_label == item["answer_label"],
                 "latency_s": latency_s,
                 "num_vlm_calls": pred["num_vlm_calls"],
                 "evidence": pred["evidence"],
+                "fallback_used": pred.get(
+                    "fallback_used",
+                    False,
+                ),
+                "primary_prediction_label": pred.get(
+                    "primary_prediction_label"
+                ),
+                "primary_prediction_text": pred.get(
+                    "primary_prediction_text"
+                ),
+                "primary_prediction_confidence": pred.get(
+                    "primary_prediction_confidence"
+                ),
+                "fallback_config": pred.get(
+                    "fallback_config"
+                ),
                 "error": error,
                 "retrieval_effort":
                     pred.get("retrieval_effort"),
