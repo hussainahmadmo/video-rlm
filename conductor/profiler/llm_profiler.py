@@ -360,6 +360,12 @@ class BudgetConfig:
     miss_risk: str
     answer_sensitivity: str
 
+    # Retrieval robustness hints used by lightweight experiment runners.
+    evidence_type: str = "generic"
+    expand_neighbors: bool = False
+    preserve_order: bool = False
+    include_uniform_anchors: bool = False
+
     # Existing compatibility fields.
     answer_tier: str = "heavy"
     cheap_answer_tier: str = "none"
@@ -596,6 +602,7 @@ DEFAULT_ANALYSIS: Dict[str, Any] = {
     "miss_risk": "medium",
     "answer_sensitivity": "exact",
     "fallback_requirement": "expand_coverage",
+    "evidence_type": "generic",
     "rationale": "",
 }
 
@@ -621,9 +628,12 @@ TEMPORAL_QUERY_TERMS = (
 
 SEQUENCE_QUERY_TERMS = (
     "sequence of scenes",
+    "sequences of scenes",
     "what order",
     "which order",
     "order of events",
+    "sequence of events",
+    "sequences of events",
     "sequential order",
     "order of the process",
     "from start to finish",
@@ -631,6 +641,8 @@ SEQUENCE_QUERY_TERMS = (
     "stages",
     "after the",
     "first after",
+    "what happens next",
+    "scene to scene",
 )
 
 FINE_DETAIL_QUERY_TERMS = (
@@ -654,6 +666,8 @@ LOCAL_DETAIL_QUERY_TERMS = (
     "what event",
     "who is the person",
     "appears first",
+    "object that is falling",
+    "item in this",
     "first plant",
     "first piece",
     "primary tool",
@@ -664,6 +678,7 @@ DENSE_VISUAL_QUERY_TERMS = (
     "screen",
     "website",
     "cursor",
+    "display",
     "letters",
     "subtitles",
     "mountains",
@@ -682,6 +697,56 @@ GLOBAL_SUMMARY_QUERY_TERMS = (
     "compare",
     "process that",
 )
+
+SCREEN_STATE_QUERY_TERMS = (
+    "screen",
+    "website",
+    "cursor",
+    "display screen",
+    "on the screen",
+    "what happened on the screen",
+    "screen after",
+    "page",
+)
+
+
+def infer_evidence_type(
+    *,
+    is_counting_query: bool,
+    is_sequence_query: bool,
+    is_temporal_query: bool,
+    is_fine_detail_query: bool,
+    is_local_detail_query: bool,
+    is_dense_visual_query: bool,
+    is_global_summary_query: bool,
+    is_screen_state_query: bool,
+) -> str:
+    if is_counting_query:
+        return "counting_completeness"
+    if is_screen_state_query:
+        return "screen_state_change"
+    if (
+        is_temporal_query
+        and (
+            is_fine_detail_query
+            or is_local_detail_query
+            or is_dense_visual_query
+        )
+    ):
+        return "localized_temporal_detail"
+    if is_sequence_query:
+        return "sequence_ordering"
+    if is_temporal_query:
+        return "first_or_next_event"
+    if (
+        is_fine_detail_query
+        or is_local_detail_query
+        or is_dense_visual_query
+    ):
+        return "localized_object_attribute"
+    if is_global_summary_query:
+        return "global_process"
+    return "generic"
 
 
 def _query_contains_any(
@@ -757,11 +822,25 @@ def apply_question_risk_overrides(
         query,
         GLOBAL_SUMMARY_QUERY_TERMS,
     )
+    is_screen_state_query = _query_contains_any(
+        query,
+        SCREEN_STATE_QUERY_TERMS,
+    )
     risk_triggers = set(
         analysis.get(
             "_risk_triggers",
             [],
         )
+    )
+    evidence_type = infer_evidence_type(
+        is_counting_query=is_counting_query,
+        is_sequence_query=is_sequence_query,
+        is_temporal_query=is_temporal_query,
+        is_fine_detail_query=is_fine_detail_query,
+        is_local_detail_query=is_local_detail_query,
+        is_dense_visual_query=is_dense_visual_query,
+        is_global_summary_query=is_global_summary_query,
+        is_screen_state_query=is_screen_state_query,
     )
 
     if (
@@ -797,6 +876,19 @@ def apply_question_risk_overrides(
         analysis["miss_risk"] = "high"
         risk_triggers.add("counting_completeness")
 
+    if is_screen_state_query:
+        analysis["reasoning_type"] = "state_change"
+        analysis["coverage_requirement"] = "multi_region"
+        analysis["selection_mode"] = "multi_event"
+        analysis["temporal_operation"] = "state_transition"
+        analysis["precision_requirement"] = "high"
+        analysis["spatial_strategy"] = "ocr_crop"
+        analysis["fallback_requirement"] = "expand_coverage"
+        analysis["miss_risk"] = "high"
+        if "ocr" not in analysis["required_modalities"]:
+            analysis["required_modalities"].append("ocr")
+        risk_triggers.add("screen_state_change")
+
     if (
         analysis["reasoning_type"]
         in {"temporal_order", "multi_hop", "causal"}
@@ -805,7 +897,7 @@ def apply_question_risk_overrides(
     ):
         if (
             analysis["reasoning_type"]
-            not in {"counting", "repetition"}
+            not in {"counting", "repetition", "state_change"}
         ):
             if is_temporal_query or is_sequence_query:
                 analysis[
@@ -829,6 +921,8 @@ def apply_question_risk_overrides(
                 "fallback_requirement"
             ] = "expand_coverage"
             analysis["miss_risk"] = "high"
+            if is_sequence_query:
+                analysis["context_requirement"] = "long"
             risk_triggers.add(
                 "temporal_sequence"
                 if is_sequence_query
@@ -843,6 +937,7 @@ def apply_question_risk_overrides(
         if analysis["reasoning_type"] not in {
             "counting",
             "temporal_order",
+            "state_change",
         }:
             analysis["reasoning_type"] = "fine_detail"
         analysis[
@@ -879,6 +974,7 @@ def apply_question_risk_overrides(
         analysis["answer_type"] = "summary"
         risk_triggers.add("cheap_global_summary")
 
+    analysis["evidence_type"] = evidence_type
     analysis["_risk_triggers"] = sorted(
         risk_triggers
     )
@@ -1684,6 +1780,10 @@ def compile_execution_policy(
         answer_sensitivity=analysis[
             "answer_sensitivity"
         ],
+        evidence_type=analysis.get(
+            "evidence_type",
+            "generic",
+        ),
         max_steps=(
             2
             if analysis[
@@ -1731,8 +1831,15 @@ def calibrate_policy_to_oracle_frontier(
             [],
         )
     )
+    evidence_type = analysis.get(
+        "evidence_type",
+        "generic",
+    )
     topk = 8
     window_len_s = 8.0
+    expand_neighbors = False
+    preserve_order = False
+    include_uniform_anchors = False
 
     if duration_s >= 1200:
         scan_fps = 0.00390625
@@ -1741,10 +1848,16 @@ def calibrate_policy_to_oracle_frontier(
         name_suffix = "oracle_sparse_long"
         if "temporal_sequence" in risk_triggers:
             window_len_s = 16.0
+            topk = 12
+            expand_neighbors = True
+            preserve_order = True
+            include_uniform_anchors = True
         elif "local_detail" in risk_triggers:
             window_len_s = 4.0
+            expand_neighbors = True
         if "dense_visual_detail" in risk_triggers:
             topk = 16
+            expand_neighbors = True
 
     else:
         needs_detail_budget = (
@@ -1770,30 +1883,47 @@ def calibrate_policy_to_oracle_frontier(
             scan_fps = 0.03125
             vlm_budget = 32
             window_len_s = 8.0
+            include_uniform_anchors = True
+            preserve_order = True
             name_suffix = "oracle_counting_budget32"
+        elif "screen_state_change" in risk_triggers:
+            scan_fps = 0.125
+            vlm_budget = 64
+            window_len_s = 4.0
+            topk = 16
+            expand_neighbors = True
+            preserve_order = True
+            name_suffix = "oracle_screen_state_verify64"
         elif "dense_visual_detail" in risk_triggers:
             scan_fps = 0.125
-            vlm_budget = 32
+            vlm_budget = 64
             window_len_s = 4.0
             topk = 16
-            name_suffix = "oracle_dense_detail_budget32"
+            expand_neighbors = True
+            name_suffix = "oracle_dense_detail_verify64"
         elif "local_detail" in risk_triggers:
             scan_fps = 0.03125
-            vlm_budget = 32
+            vlm_budget = 64
             window_len_s = 4.0
             topk = 16
-            name_suffix = "oracle_local_detail_budget32"
+            expand_neighbors = True
+            name_suffix = "oracle_local_detail_verify64"
         elif "temporal_sequence" in risk_triggers:
             scan_fps = 0.03125
             vlm_budget = 32
-            window_len_s = 16.0
-            topk = 8
-            name_suffix = "oracle_sequence_budget32"
+            window_len_s = 12.0
+            topk = 16
+            expand_neighbors = True
+            preserve_order = True
+            include_uniform_anchors = True
+            name_suffix = "oracle_temporal_sweep_budget32"
         elif "multi_region_composition" in risk_triggers:
             scan_fps = 0.03125
             vlm_budget = 32
             window_len_s = 12.0
             topk = 12
+            expand_neighbors = True
+            preserve_order = True
             name_suffix = "oracle_composition_budget32"
         elif "cheap_global_summary" in risk_triggers:
             scan_fps = 0.015625
@@ -1845,6 +1975,10 @@ def calibrate_policy_to_oracle_frontier(
                 vlm_budget,
             ),
         ),
+        evidence_type=evidence_type,
+        expand_neighbors=expand_neighbors,
+        preserve_order=preserve_order,
+        include_uniform_anchors=include_uniform_anchors,
         quality_tier="oracle_frontier",
         rationale=(
             requested.rationale
@@ -2375,6 +2509,16 @@ def budget_to_policy(
         "miss_risk": config.miss_risk,
         "answer_sensitivity": (
             config.answer_sensitivity
+        ),
+        "evidence_type": config.evidence_type,
+        "expand_neighbors": (
+            config.expand_neighbors
+        ),
+        "preserve_order": (
+            config.preserve_order
+        ),
+        "include_uniform_anchors": (
+            config.include_uniform_anchors
         ),
         "quality_tier": (
             config.quality_tier

@@ -639,6 +639,227 @@ def clip_topk_windows(
             candidate_windows_examined,
     }
 
+
+def get_video_duration_s(item):
+    duration_s = item.get("duration_s")
+
+    if duration_s is not None:
+        return float(duration_s)
+
+    duration_s, _, _ = duration_fps_nframes(
+        item["video"]
+    )
+
+    return float(duration_s)
+
+
+def make_neighbor_windows(
+    window,
+    *,
+    duration_s,
+    window_len_s,
+):
+    start, end = window
+    span = max(
+        float(window_len_s),
+        float(end) - float(start),
+    )
+
+    return [
+        [
+            max(0.0, float(start) - span),
+            max(0.0, float(start)),
+        ],
+        [
+            max(0.0, float(start)),
+            min(float(duration_s), float(end)),
+        ],
+        [
+            min(float(duration_s), float(end)),
+            min(float(duration_s), float(end) + span),
+        ],
+    ]
+
+
+def make_uniform_anchor_windows(
+    *,
+    duration_s,
+    window_len_s,
+    count=4,
+):
+    if duration_s <= 0:
+        return []
+
+    if count <= 1:
+        centers = [duration_s / 2.0]
+    else:
+        centers = np.linspace(
+            0.0,
+            duration_s,
+            count,
+        ).tolist()
+
+    half = float(window_len_s) / 2.0
+    windows = []
+
+    for center in centers:
+        start = max(0.0, center - half)
+        end = min(float(duration_s), center + half)
+        if end > start:
+            windows.append([start, end])
+
+    return windows
+
+
+def add_window_if_new(
+    selected,
+    window,
+    *,
+    min_gap_s=0.25,
+):
+    start, end = window
+    if end <= start:
+        return
+
+    key = (
+        round(float(start) / min_gap_s),
+        round(float(end) / min_gap_s),
+    )
+
+    if key in selected["seen"]:
+        return
+
+    selected["seen"].add(key)
+    selected["windows"].append(
+        [float(start), float(end)]
+    )
+
+
+def apply_profiler_window_hints(
+    *,
+    item,
+    top_windows,
+    config,
+):
+    duration_s = get_video_duration_s(item)
+    window_len_s = float(config["window_len_s"])
+    selected = {
+        "seen": set(),
+        "windows": [],
+    }
+
+    for row in top_windows:
+        if config.get("expand_neighbors"):
+            for window in make_neighbor_windows(
+                row["window"],
+                duration_s=duration_s,
+                window_len_s=window_len_s,
+            ):
+                add_window_if_new(
+                    selected,
+                    window,
+                )
+        else:
+            add_window_if_new(
+                selected,
+                row["window"],
+            )
+
+    if config.get("include_uniform_anchors"):
+        for window in make_uniform_anchor_windows(
+            duration_s=duration_s,
+            window_len_s=window_len_s,
+            count=4,
+        ):
+            add_window_if_new(
+                selected,
+                window,
+            )
+
+    selected_windows = selected["windows"]
+
+    if config.get("preserve_order"):
+        selected_windows = sorted(
+            selected_windows,
+            key=lambda w: (w[0], w[1]),
+        )
+
+    max_windows = max(
+        1,
+        min(
+            int(config.get("max_selected_windows", 24)),
+            int(config.get("vlm_budget", 24)),
+        ),
+    )
+
+    return selected_windows[:max_windows]
+
+
+def build_profiler_evidence_context(
+    *,
+    selected_windows,
+    top_windows,
+    config,
+):
+    evidence_type = config.get(
+        "evidence_type",
+        "generic",
+    )
+
+    lines = [
+        "These frames were selected using the profiler policy.",
+        f"Evidence type: {evidence_type}.",
+    ]
+
+    if config.get("preserve_order"):
+        lines.append(
+            "Windows are presented in chronological order; use timing/order when choosing the answer."
+        )
+
+    if config.get("expand_neighbors"):
+        lines.append(
+            "Neighbor windows around retrieved evidence are included to catch first/next/later context."
+        )
+
+    if config.get("include_uniform_anchors"):
+        lines.append(
+            "Uniform timeline anchors are included so broad video context is not lost."
+        )
+
+    if evidence_type in {
+        "localized_object_attribute",
+        "localized_temporal_detail",
+        "screen_state_change",
+    }:
+        lines.append(
+            "Pay close attention to small visible details, objects, clothing, text, and screen state changes."
+        )
+
+    score_by_window = {
+        (
+            round(float(row["window"][0]), 3),
+            round(float(row["window"][1]), 3),
+        ): row.get("score")
+        for row in top_windows
+    }
+
+    for i, window in enumerate(selected_windows):
+        key = (
+            round(float(window[0]), 3),
+            round(float(window[1]), 3),
+        )
+        score = score_by_window.get(key)
+        if score is None:
+            lines.append(
+                f"Selected window {i}: {window[0]:.1f}-{window[1]:.1f}s"
+            )
+        else:
+            lines.append(
+                f"Selected window {i}: {window[0]:.1f}-{window[1]:.1f}s, CLIP score={score:.4f}"
+            )
+
+    return "\n".join(lines)
+
 def sample_frames_from_windows(
     video_path,
     windows,
@@ -779,12 +1000,16 @@ def run_clip_oneshot(item, config):
 
     top_windows = retrieval["top_windows"]
 
-    selected_windows = [x["window"] for x in top_windows]
+    selected_windows = apply_profiler_window_hints(
+        item=item,
+        top_windows=top_windows,
+        config=config,
+    )
 
     print(
         f"[RETRIEVAL] "
         f"Candidate windows={retrieval['candidate_windows_examined']} "
-        f"Selected={len(top_windows)}"
+        f"Selected={len(selected_windows)}"
     )
 
     if len(selected_windows) == 0:
@@ -823,15 +1048,16 @@ def run_clip_oneshot(item, config):
         f"actual_frames={len(frames['frame_indices'])}"
     )
 
-    evidence_hint = "\n".join(
-        f"Selected window {i}: {w[0]:.1f}-{w[1]:.1f}s, CLIP score={top_windows[i]['score']:.4f}"
-        for i, w in enumerate(selected_windows)
+    evidence_hint = build_profiler_evidence_context(
+        selected_windows=selected_windows,
+        top_windows=top_windows,
+        config=config,
     )
 
     prompt = build_answer_prompt(
         item["question"],
         item["choices"],
-        extra_context=f"These frames were selected from the most query-relevant video windows:\n{evidence_hint}",
+        extra_context=evidence_hint,
     )
 
     response = call_vlm_answer(frames, prompt)
@@ -864,7 +1090,7 @@ def run_clip_oneshot(item, config):
                 retrieval["candidate_windows_examined"],
 
             "selected_windows":
-                len(top_windows),
+                len(selected_windows),
 
             "selected_frames":
                 len(frames["frame_indices"]),
@@ -872,6 +1098,7 @@ def run_clip_oneshot(item, config):
 
         "evidence": {
             "clip_top_windows": top_windows,
+            "selected_windows": selected_windows,
             "selected_frame_indices":
                 frames["frame_indices"],
             "selected_timestamps":
@@ -1241,6 +1468,16 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
                 "clip_topk": p["probe_topk"],
                 "window_len_s": p["window_len_s"],
                 "vlm_budget": p["vlm_budget"],
+                "evidence_type": p.get("evidence_type"),
+                "expand_neighbors": bool(
+                    p.get("expand_neighbors")
+                ),
+                "preserve_order": bool(
+                    p.get("preserve_order")
+                ),
+                "include_uniform_anchors": bool(
+                    p.get("include_uniform_anchors")
+                ),
             }
 
             config = clamp_vimio_config_cost_aware(config, item)
@@ -1307,6 +1544,10 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
                 "num_windows": config.get("num_windows"),
                 "query_conditioned": config.get("query_conditioned"),
                 "vlm_budget": config.get("vlm_budget"),
+                "evidence_type": config.get("evidence_type"),
+                "expand_neighbors": config.get("expand_neighbors"),
+                "preserve_order": config.get("preserve_order"),
+                "include_uniform_anchors": config.get("include_uniform_anchors"),
                 "prediction_label": prediction_label,
                 "prediction_text": pred["prediction_text"],
                 "correct": prediction_label == item["answer_label"],
