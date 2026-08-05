@@ -44,6 +44,11 @@ _CLIP_DEVICE = None
 _VR_CACHE = {}
 
 
+def sync_device():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 from decord import VideoReader, cpu
 from decord import gpu
 from decord import bridge
@@ -308,6 +313,30 @@ Be concise.
 
 
 def build_timeline_window_summary_prompt(item, start_s, end_s, evidence_type):
+    if evidence_type == "sequence_ordering":
+        return f"""
+This video segment is from {start_s:.1f}s to {end_s:.1f}s.
+
+Question:
+{item["question"]}
+
+Choices:
+{format_choices(item["choices"])}
+
+Extract only sequence/order evidence from the sampled frames.
+Preserve what appears first, middle, and last inside this segment.
+Use the answer choices as a checklist, but do not choose the final answer.
+
+Return exactly:
+Scene/state: <main visible scene or state>
+Start event: <what is visible first, or "unclear">
+Middle event: <what is visible in the middle, or "unclear">
+End event: <what is visible last, or "unclear">
+Visible transition: <scene/event transition, or "none/unclear">
+Matches choice events: <which choice event phrases this segment supports, or "none">
+Relevant: <yes/no>
+""".strip()
+
     detail_instruction = ""
 
     if evidence_type in {
@@ -342,12 +371,21 @@ def build_timeline_answer_prompt(item, window_summaries, evidence_type):
         for w in window_summaries
     )
 
-    instruction = (
-        "Use the ordered window summaries as the primary evidence. "
-        "For sequence questions, compare the chronological order of events "
-        "against each choice. For screen-state questions, focus on what "
-        "changed on screen and when."
-    )
+    if evidence_type == "sequence_ordering":
+        instruction = (
+            "Use the ordered window summaries as the primary evidence. "
+            "First write a concise chronological event list from the evidence. "
+            "Then check every answer choice against that event list and mark "
+            "which events match, are missing, or are in the wrong order. "
+            "Choose the option whose full sequence best matches the evidence. "
+            "Do not choose a choice just because it mentions one correct event."
+        )
+    else:
+        instruction = (
+            "Use the ordered window summaries as the primary evidence. "
+            "For screen-state questions, focus on what changed on screen "
+            "and when."
+        )
 
     return build_answer_prompt(
         item["question"],
@@ -424,6 +462,18 @@ def parse_mcq_label(response, num_choices=None):
     if text in valid:
         return text
 
+    final_pattern = (
+        r"(?:FINAL\s+ANSWER|ANSWER)\s*[:=]\s*("
+        + "|".join(valid)
+        + r")\b"
+    )
+    m = re.search(final_pattern, text)
+    if m:
+        return m.group(1)
+
+    if "CHOICE CHECKS" in text or "EVIDENCE TIMELINE" in text:
+        return None
+
     pattern = r"\b(" + "|".join(valid) + r")\b"
     m = re.search(pattern, text)
     if m:
@@ -497,22 +547,33 @@ def call_vlm_text(frames, prompt):
     )
 
 
-def call_llm_answer(prompt):
+def call_llm_answer(prompt, max_tokens=32):
     print("[REAL LLM CALL]", flush=True)
 
-    resp = client.chat.completions.create(
-        model=VLM_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-        temperature=0.0,
-        max_tokens=32,
-    )
+    for attempt in range(2):
+        resp = client.chat.completions.create(
+            model=VLM_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            temperature=0.0,
+            max_tokens=max_tokens,
+        )
 
-    return resp.choices[0].message.content
+        content = resp.choices[0].message.content
+
+        if content:
+            return content
+
+        print(
+            f"[EMPTY LLM RESPONSE] retry={attempt + 1}",
+            flush=True,
+        )
+
+    return None
 
 
 def duration_fps_nframes(video_path):
@@ -615,7 +676,7 @@ def clip_topk_windows(
     print("TOKENS:")
     print(text_inputs["input_ids"].shape[1])
 
-    torch.cuda.synchronize()
+    sync_device()
 
     t_text = time.time()
 
@@ -623,7 +684,7 @@ def clip_topk_windows(
         **text_inputs
     )
 
-    torch.cuda.synchronize()
+    sync_device()
 
     LATENCY_STATS["clip_text_s"] = (
         LATENCY_STATS.get("clip_text_s", 0)
@@ -974,26 +1035,26 @@ def sample_frames_from_windows(
             unique_timestamps.append(ts)
             seen.add(idx)
 
-    torch.cuda.synchronize()
+    sync_device()
 
     t_decode = time.time()
 
     batch = vr.get_batch(unique_idxs)
 
-    torch.cuda.synchronize()
+    sync_device()
 
     LATENCY_STATS["answer_decode_s"] = (
         LATENCY_STATS.get("answer_decode_s", 0)
         + (time.time() - t_decode)
     )
 
-    torch.cuda.synchronize()
+    sync_device()
 
     t_copy = time.time()
 
     cpu_batch = batch.cpu().numpy()
 
-    torch.cuda.synchronize()
+    sync_device()
 
     LATENCY_STATS["gpu_cpu_copy_s"] = (
         LATENCY_STATS.get("gpu_cpu_copy_s", 0)
@@ -1351,7 +1412,10 @@ def run_clip_map_answer(item, config):
         window_summaries,
         evidence_type,
     )
-    response = call_llm_answer(answer_prompt)
+    response = call_llm_answer(
+        answer_prompt,
+        max_tokens=32,
+    )
 
     return {
         "prediction_label": parse_mcq_label(
@@ -1413,13 +1477,13 @@ def build_frame_scan_embeddings(
     for start in range(0, len(scan_idxs), 256):
         chunk = scan_idxs[start:start+256]
 
-        torch.cuda.synchronize()
+        sync_device()
 
         t = time.time()
 
         batch = vr.get_batch(chunk)
         t0 = time.time()
-        torch.cuda.synchronize()
+        sync_device()
 
         print(
             "[CHUNK]",
@@ -1433,7 +1497,7 @@ def build_frame_scan_embeddings(
             batch.dtype,
             batch.device,
         )
-        torch.cuda.synchronize()
+        sync_device()
         decode_time += time.time() - t
 
         t_resize = time.time()
@@ -1455,11 +1519,11 @@ def build_frame_scan_embeddings(
         feats = model.get_image_features(
             **inputs
         )
-        torch.cuda.synchronize()
+        sync_device()
         resize_time += time.time() - t_resize
         t = time.time()
 
-        torch.cuda.synchronize()
+        sync_device()
         encode_time += time.time() - t
 
         feats = feats / feats.norm(
