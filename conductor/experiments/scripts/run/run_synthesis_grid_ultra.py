@@ -502,6 +502,228 @@ def build_timeline_answer_prompt(
     )
 
 
+def build_timestamped_sequence_event_prompt(item, start_s, end_s):
+    midpoint_s = (start_s + end_s) / 2.0
+    return f"""
+You are extracting one timestamped event record from a video segment.
+
+Segment:
+{start_s:.1f}s to {end_s:.1f}s
+
+Representative timestamp:
+{midpoint_s:.1f}s
+
+Question:
+{item["question"]}
+
+Choices:
+{format_choices(item["choices"])}
+
+Use the sampled frames only. Focus on visible events, scene changes, objects,
+people, and actions that could help decide the correct temporal sequence.
+Do not choose the final answer.
+
+Return exactly:
+timestamp_s: {midpoint_s:.1f}
+scene: <main visible scene/place/state>
+actors: <visible people or "none/unclear">
+objects: <important visible objects/text/screens/materials>
+event: <one concise visible event at this timestamp>
+transition: <what changed from earlier frames in this segment to later frames, or "none/unclear">
+choice_event_matches: <answer-choice event phrases supported here, or "none">
+confidence: <0.0 to 1.0>
+
+Do not infer events that are not visible. If the frames are ambiguous, say so.
+""".strip()
+
+
+def extract_sequence_event_phrases(text):
+    cleaned = str(text)
+    cleaned = re.sub(
+        r"\b(first|second|third|fourth|fifth|next|then|finally|lastly|afterwards|afterward)\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    parts = re.split(
+        r"\s*(?:;|,?\s+and\s+finally\b|,?\s+and\s+then\b|,|\.\s*)\s*",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    phrases = []
+    seen = set()
+
+    for part in parts:
+        phrase = " ".join(part.strip().split())
+        if len(phrase.split()) < 3:
+            continue
+        key = phrase.lower()
+        if key in seen:
+            continue
+        phrases.append(phrase)
+        seen.add(key)
+
+    return phrases
+
+
+def build_sequence_event_phrase_queries(item):
+    queries = []
+    for idx, choice in enumerate(item.get("choices") or []):
+        label = chr(ord("A") + idx)
+        phrases = extract_sequence_event_phrases(choice)
+        if not phrases:
+            phrases = [str(choice)]
+
+        for phrase in phrases:
+            queries.append(
+                f"{item['question']}\nChoice {label} event: {phrase}"
+            )
+
+    return queries or build_clip_query(
+        item,
+        config={"evidence_type": "sequence_ordering"},
+    )
+
+
+def build_targeted_sequence_event_prompt(item, start_s, end_s):
+    event_phrases = []
+    for idx, choice in enumerate(item.get("choices") or []):
+        label = chr(ord("A") + idx)
+        for phrase in extract_sequence_event_phrases(choice):
+            event_phrases.append(f"{label}: {phrase}")
+
+    phrase_text = "\n".join(event_phrases[:40])
+    midpoint_s = (start_s + end_s) / 2.0
+
+    return f"""
+You are verifying whether this video segment contains any answer-choice sequence events.
+
+Segment:
+{start_s:.1f}s to {end_s:.1f}s
+
+Representative timestamp:
+{midpoint_s:.1f}s
+
+Question:
+{item["question"]}
+
+Answer-choice event checklist:
+{phrase_text}
+
+Use only the sampled frames. Do not answer the question yet.
+
+Return exactly:
+timestamp_s: {midpoint_s:.1f}
+scene: <main visible scene/place/state>
+event: <specific visible event in this segment>
+matched_choice_events: <choice labels and phrases directly supported here, or "none">
+missing_or_unclear: <choice events that might be relevant but are not clearly visible>
+order_note: <whether this appears before/after another relevant event if visible, or "local only">
+confidence: <0.0 to 1.0>
+
+Only mark an event as matched if the visible scene directly supports it.
+""".strip()
+
+
+def build_timestamped_sequence_answer_prompt(item, event_records):
+    timeline_text = "\n\n".join(
+        f"[t={r['timestamp_s']:.1f}s | window {r['start_s']:.1f}-{r['end_s']:.1f}s]\n{r['event_text']}"
+        for r in event_records
+    )
+
+    label_text = ", ".join(
+        chr(ord("A") + i)
+        for i in range(len(item["choices"]))
+    )
+
+    return textwrap.dedent(
+        f"""
+        You are answering a sequence/order question about a video.
+
+        Question:
+        {item["question"]}
+
+        Choices:
+        {format_choices(item["choices"])}
+
+        Timestamped event records, already sorted by time:
+        {timeline_text}
+
+        Task:
+        First build a concise ordered timeline using only the timestamped event
+        records. Then compare every answer choice against that timeline.
+        For each choice, mark:
+        - events supported in the same order
+        - events missing from the records
+        - events contradicted or in the wrong order
+
+        Choose the answer whose complete ordered sequence best matches the
+        timestamped timeline. Do not choose a choice because it matches only one
+        isolated event.
+
+        Return your final answer at the end in exactly this format:
+        Answer: <one label from {label_text}>
+        Confidence: <number between 0.0 and 1.0>
+        """
+    ).strip()
+
+
+def build_choice_sequence_verifier_prompt(
+    item,
+    *,
+    label,
+    choice,
+    events,
+    event_windows,
+):
+    event_lines = "\n".join(
+        f"{idx + 1}. {event}"
+        for idx, event in enumerate(events)
+    )
+    window_lines = "\n".join(
+        f"- {row['window'][0]:.1f}-{row['window'][1]:.1f}s "
+        f"score={row.get('score')}"
+        for row in event_windows
+    )
+
+    return textwrap.dedent(
+        f"""
+        You are verifying one candidate answer for a video sequence question.
+
+        Question:
+        {item["question"]}
+
+        Candidate choice {label}:
+        {choice}
+
+        Claimed ordered events in choice {label}:
+        {event_lines}
+
+        Candidate evidence windows retrieved for this choice:
+        {window_lines}
+
+        The attached frames are sampled from the candidate windows in
+        chronological order. Use only visible evidence from those frames.
+
+        Decide whether choice {label}'s events are visible and whether they
+        occur in the claimed order.
+
+        Return exactly:
+        Choice: {label}
+        matched_events: <number matched>/<number claimed>
+        order_supported: <yes/no/unclear>
+        contradicted_order: <yes/no/unclear>
+        missing_events: <short list or none>
+        score: <number from -5 to 10>
+        rationale: <one concise sentence grounded in the frames>
+
+        Score high only when multiple claimed events are directly visible in
+        the correct order. Penalize missing events and wrong order. Do not give
+        credit for general plausibility.
+        """
+    ).strip()
+
+
 def parse_confidence(response):
     """
     Parse confidence from model response.
@@ -523,6 +745,59 @@ def parse_confidence(response):
             return None
 
     return None
+
+
+def parse_sequence_verifier_score(response, total_events):
+    text = str(response or "")
+    score = None
+
+    m = re.search(
+        r"\bscore\s*[:=]\s*(-?[0-9]+(?:\.[0-9]+)?)",
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        try:
+            score = float(m.group(1))
+        except Exception:
+            score = None
+
+    matched = None
+    m = re.search(
+        r"\bmatched_events\s*[:=]\s*([0-9]+)\s*/\s*([0-9]+)",
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        try:
+            matched = int(m.group(1))
+        except Exception:
+            matched = None
+
+    if score is None:
+        score = float(matched or 0)
+        if re.search(
+            r"\border_supported\s*[:=]\s*yes\b",
+            text,
+            re.IGNORECASE,
+        ):
+            score += 1.0
+        if re.search(
+            r"\bcontradicted_order\s*[:=]\s*yes\b",
+            text,
+            re.IGNORECASE,
+        ):
+            score -= 2.0
+
+    if matched is None:
+        matched = 0
+
+    return {
+        "score": score,
+        "matched_events": matched,
+        "total_events": total_events,
+    }
+
 
 def build_answer_prompt_with_confidence(question, choices, extra_context=None):
     context = ""
@@ -1209,6 +1484,9 @@ def build_clip_query(item, config=None):
     choices = item.get("choices") or []
     evidence_type = None
 
+    if config and config.get("sequence_query_mode") == "question_only":
+        return item["question"].strip()
+
     if config:
         evidence_type = config.get("evidence_type")
 
@@ -1462,6 +1740,47 @@ def choose_timeline_windows(item, config):
     return selected
 
 
+def choose_targeted_sequence_windows(item, config):
+    query = build_sequence_event_phrase_queries(item)
+    retrieval = clip_topk_windows(
+        video_path=item["video"],
+        query=query,
+        k=int(config.get("sequence_event_topk", config.get("clip_topk", 8))),
+        window_len_s=config["window_len_s"],
+        scan_fps=config["scan_fps"],
+    )
+    selected_windows = apply_profiler_window_hints(
+        item=item,
+        top_windows=retrieval["top_windows"],
+        config={
+            **config,
+            "preserve_order": True,
+            "expand_neighbors": config.get("sequence_expand_neighbors", False),
+            "include_uniform_anchors": config.get("include_uniform_anchors", True),
+        },
+    )
+
+    selected_windows = sorted(
+        selected_windows,
+        key=lambda w: (w[0], w[1]),
+    )
+
+    max_windows = min(
+        len(selected_windows),
+        int(config.get("map_max_windows", 12)),
+    )
+
+    return {
+        "top_windows": retrieval["top_windows"],
+        "selected_windows": selected_windows[:max_windows],
+        "candidate_windows_examined": retrieval[
+            "candidate_windows_examined"
+        ],
+        "selection_source": "choice_event_clip",
+        "event_queries": query,
+    }
+
+
 def run_clip_map_answer(item, config):
     LATENCY_STATS.clear()
     evidence_type = config.get(
@@ -1558,6 +1877,275 @@ def run_clip_map_answer(item, config):
             ],
             "selected_windows": len(selected_windows),
             "selected_frames": actual_frames,
+        },
+    }
+
+
+def run_timestamped_sequence_answer(item, config):
+    LATENCY_STATS.clear()
+    if config.get("target_choice_events", True):
+        selection = choose_targeted_sequence_windows(
+            item,
+            config,
+        )
+    else:
+        selection = choose_timeline_windows(
+            item,
+            config,
+        )
+    selected_windows = selection["selected_windows"]
+
+    if not selected_windows:
+        raise RuntimeError("No windows selected")
+
+    frames_per_window = int(
+        config.get(
+            "timestamp_frames_per_window",
+            config.get("map_frames_per_window", 3),
+        )
+    )
+
+    event_records = []
+    actual_frames = 0
+
+    print(
+        f"[TIMESTAMPED_SEQUENCE] "
+        f"source={selection['selection_source']} "
+        f"windows={len(selected_windows)} "
+        f"frames_per_window={frames_per_window}"
+    )
+
+    for widx, (start_s, end_s) in enumerate(selected_windows):
+        frames = sample_uniform_frames(
+            video_path=item["video"],
+            num_frames=frames_per_window,
+            start_s=start_s,
+            end_s=end_s,
+        )
+        actual_frames += len(frames["frame_indices"])
+
+        if config.get("target_choice_events", True):
+            prompt = build_targeted_sequence_event_prompt(
+                item,
+                start_s,
+                end_s,
+            )
+        else:
+            prompt = build_timestamped_sequence_event_prompt(
+                item,
+                start_s,
+                end_s,
+            )
+        event_text = call_vlm_text(
+            frames,
+            prompt,
+        )
+        event_records.append({
+            "window_idx": widx,
+            "start_s": start_s,
+            "end_s": end_s,
+            "timestamp_s": (start_s + end_s) / 2.0,
+            "event_text": event_text,
+        })
+
+    answer_prompt = build_timestamped_sequence_answer_prompt(
+        item,
+        event_records,
+    )
+    response = call_llm_answer(
+        answer_prompt,
+        max_tokens=384,
+    )
+    confidence = parse_confidence(response)
+
+    return {
+        "prediction_label": parse_mcq_label(
+            response,
+            num_choices=len(item["choices"]),
+        ),
+        "prediction_text": response,
+        "prediction_confidence": confidence,
+        "num_vlm_calls": len(selected_windows) + 1,
+        "evidence": {
+            "clip_top_windows": selection["top_windows"],
+            "selected_windows": selected_windows,
+            "timestamped_events": event_records,
+            "selection_source": selection["selection_source"],
+            "event_queries": selection.get("event_queries"),
+        },
+        "retrieval_effort": {
+            "candidate_windows": selection[
+                "candidate_windows_examined"
+            ],
+            "selected_windows": len(selected_windows),
+            "selected_frames": actual_frames,
+        },
+    }
+
+
+def run_choice_sequence_verifier(item, config):
+    LATENCY_STATS.clear()
+    choice_results = []
+    total_candidate_windows = 0
+    total_selected_frames = 0
+    num_vlm_calls = 0
+
+    event_topk = int(
+        config.get(
+            "sequence_choice_topk",
+            min(6, int(config.get("clip_topk", 8))),
+        )
+    )
+    max_events = int(
+        config.get("sequence_choice_max_events", 5)
+    )
+    max_windows = int(
+        config.get("sequence_choice_max_windows", 6)
+    )
+    frames_per_window = int(
+        config.get("sequence_choice_frames_per_window", 2)
+    )
+
+    print(
+        f"[CHOICE_SEQUENCE_VERIFIER] "
+        f"choices={len(item['choices'])} "
+        f"topk={event_topk} "
+        f"max_windows={max_windows} "
+        f"frames_per_window={frames_per_window}"
+    )
+
+    for idx, choice in enumerate(item["choices"]):
+        label = chr(ord("A") + idx)
+        events = extract_sequence_event_phrases(choice)
+        if not events:
+            events = [str(choice)]
+        events = events[:max_events]
+
+        queries = [
+            f"{item['question']}\nChoice {label} event: {event}"
+            for event in events
+        ]
+        retrieval = clip_topk_windows(
+            video_path=item["video"],
+            query=queries,
+            k=event_topk,
+            window_len_s=config["window_len_s"],
+            scan_fps=config["scan_fps"],
+        )
+        total_candidate_windows += retrieval[
+            "candidate_windows_examined"
+        ]
+
+        selected_windows = apply_profiler_window_hints(
+            item=item,
+            top_windows=retrieval["top_windows"],
+            config={
+                **config,
+                "preserve_order": True,
+                "expand_neighbors": False,
+                "include_uniform_anchors": False,
+                "max_selected_windows": max_windows,
+                "vlm_budget": max_windows,
+            },
+        )
+        selected_windows = sorted(
+            selected_windows,
+            key=lambda w: (w[0], w[1]),
+        )[:max_windows]
+
+        if not selected_windows:
+            choice_results.append({
+                "label": label,
+                "choice": choice,
+                "events": events,
+                "score": -5.0,
+                "matched_events": 0,
+                "total_events": len(events),
+                "prediction_text": "No windows selected.",
+                "top_windows": retrieval["top_windows"],
+                "selected_windows": [],
+            })
+            continue
+
+        frames = sample_frames_from_windows(
+            video_path=item["video"],
+            windows=selected_windows,
+            frame_allocations=[
+                frames_per_window
+                for _ in selected_windows
+            ],
+        )
+        total_selected_frames += len(frames["frame_indices"])
+
+        prompt = build_choice_sequence_verifier_prompt(
+            item,
+            label=label,
+            choice=choice,
+            events=events,
+            event_windows=retrieval["top_windows"],
+        )
+        response = call_vlm_text(
+            frames,
+            prompt,
+        )
+        num_vlm_calls += 1
+        parsed = parse_sequence_verifier_score(
+            response,
+            total_events=len(events),
+        )
+
+        choice_results.append({
+            "label": label,
+            "choice": choice,
+            "events": events,
+            "score": parsed["score"],
+            "matched_events": parsed["matched_events"],
+            "total_events": parsed["total_events"],
+            "prediction_text": response,
+            "top_windows": retrieval["top_windows"],
+            "selected_windows": selected_windows,
+            "selected_frame_indices": frames["frame_indices"],
+            "selected_timestamps": frames["timestamps"],
+        })
+
+    best = max(
+        choice_results,
+        key=lambda row: (
+            row["score"],
+            row["matched_events"],
+            -ord(row["label"]),
+        ),
+    )
+    aggregate_text = "\n\n".join(
+        f"Choice {row['label']} score={row['score']} "
+        f"matched={row['matched_events']}/{row['total_events']}\n"
+        f"{row['prediction_text']}"
+        for row in choice_results
+    )
+    aggregate_text += (
+        f"\n\nAnswer: {best['label']}\n"
+        f"Confidence: {min(1.0, max(0.0, best['score'] / 10.0)):.2f}"
+    )
+
+    return {
+        "prediction_label": best["label"],
+        "prediction_text": aggregate_text,
+        "prediction_confidence": min(
+            1.0,
+            max(0.0, best["score"] / 10.0),
+        ),
+        "num_vlm_calls": num_vlm_calls,
+        "evidence": {
+            "choice_sequence_results": choice_results,
+            "selection_source": "choice_sequence_verifier",
+        },
+        "retrieval_effort": {
+            "candidate_windows": total_candidate_windows,
+            "selected_windows": sum(
+                len(row["selected_windows"])
+                for row in choice_results
+            ),
+            "selected_frames": total_selected_frames,
         },
     }
 
@@ -1891,12 +2479,145 @@ def run_single_config(item, config):
     if config["method"] == "clip_map_answer":
         return run_clip_map_answer(item, config)
 
+    if config["method"] == "timestamped_sequence_answer":
+        return run_timestamped_sequence_answer(item, config)
+
+    if config["method"] == "choice_sequence_verifier":
+        return run_choice_sequence_verifier(item, config)
+
     if config["method"] == "global_summary":
         return run_global_summary(item, config)
 
     if config["method"] == "map_summary":
         return run_map_summary(item, config)
     raise ValueError(f"Unknown method: {config['method']}")
+
+
+def apply_sequence_oracle_clip_policy(config, item):
+    duration_s, _, _ = duration_fps_nframes(item["video"])
+    question = str(item.get("question") or "").lower()
+
+    config["method"] = "clip_oneshot"
+    config["skip_cost_clamp"] = True
+    config["sequence_query_mode"] = "question_only"
+    config["answer_with_confidence"] = False
+    config["scan_fps"] = 0.015625
+    config["clip_topk"] = 8
+    config["window_len_s"] = 8.0
+    config["vlm_budget"] = 8
+    config["expand_neighbors"] = False
+    config["preserve_order"] = True
+    config["include_uniform_anchors"] = False
+    config["sequence_policy"] = "oracle_clip_budget8"
+
+    if duration_s >= 1200:
+        config["scan_fps"] = 0.00390625
+        config["clip_topk"] = 8
+        config["vlm_budget"] = 32
+        config["sequence_policy"] = "oracle_sparse_long_budget32"
+
+    if (
+        "what happens next" in question
+        or "trapped" in question
+    ):
+        config["scan_fps"] = 0.015625
+        config["clip_topk"] = 1
+        config["vlm_budget"] = 32
+        config["sequence_policy"] = "oracle_next_event_k1_budget32"
+
+    elif (
+        "from scene to scene" in question
+        or "have in common" in question
+    ):
+        config["scan_fps"] = 0.015625
+        config["clip_topk"] = 8
+        config["vlm_budget"] = 2
+        config["answer_with_confidence"] = True
+        config["sequence_policy"] = "oracle_commonality_budget2"
+
+    return config
+
+
+def apply_oracle_edge_policy(config, item):
+    evidence_type = config.get("evidence_type")
+    question = str(item.get("question") or "").lower()
+
+    if evidence_type == "counting_completeness":
+        config["method"] = "clip_oneshot"
+        config["scan_fps"] = 1.0
+        config["clip_topk"] = 8
+        config["window_len_s"] = 8.0
+        config["vlm_budget"] = 32
+        config["expand_neighbors"] = False
+        config["preserve_order"] = True
+        config["include_uniform_anchors"] = False
+        config["answer_with_confidence"] = False
+        config["skip_cost_clamp"] = True
+        config["edge_policy"] = "oracle_counting_dense_scan"
+        return config
+
+    if (
+        evidence_type == "generic"
+        and (
+            "refuses to pay back" in question
+            or "what happens if" in question
+        )
+    ):
+        config["method"] = "clip_oneshot"
+        config["scan_fps"] = 0.015625
+        config["clip_topk"] = 8
+        config["window_len_s"] = 8.0
+        config["vlm_budget"] = 32
+        config["expand_neighbors"] = False
+        config["preserve_order"] = True
+        config["include_uniform_anchors"] = False
+        config["answer_with_confidence"] = False
+        config["skip_cost_clamp"] = True
+        config["edge_policy"] = "oracle_causal_long_budget32"
+        return config
+
+    if (
+        evidence_type == "generic"
+        and "camera" in question
+        and (
+            "adjust" in question
+            or "interact" in question
+        )
+    ):
+        config["method"] = "clip_oneshot"
+        config["scan_fps"] = 0.015625
+        config["clip_topk"] = 8
+        config["window_len_s"] = 8.0
+        config["vlm_budget"] = 2
+        config["expand_neighbors"] = False
+        config["preserve_order"] = True
+        config["include_uniform_anchors"] = False
+        config["answer_with_confidence"] = False
+        config["skip_cost_clamp"] = True
+        config["edge_policy"] = "oracle_camera_budget2"
+        return config
+
+    if evidence_type == "localized_object_attribute":
+        duration_s = item.get("duration_s")
+        try:
+            duration_s = float(duration_s)
+        except Exception:
+            duration_s = get_video_duration_s(item)
+
+        if duration_s >= 60:
+            config["method"] = "clip_oneshot"
+            config["scan_fps"] = 0.015625
+            config["clip_topk"] = 8
+            config["window_len_s"] = 4.0
+            config["vlm_budget"] = 16
+            config["expand_neighbors"] = False
+            config["preserve_order"] = True
+            config["include_uniform_anchors"] = False
+            config["answer_with_confidence"] = False
+            config["skip_cost_clamp"] = True
+            config["edge_policy"] = "oracle_local_object_budget16"
+
+    return config
 
 
 UNCERTAIN_ANSWER_TERMS = (
@@ -2042,6 +2763,9 @@ def run_single_config_with_evidence_fallback(item, config):
     if not config.get("enable_evidence_fallback"):
         return primary
 
+    if config.get("method") == "choice_sequence_verifier":
+        return primary
+
     if not prediction_needs_evidence_fallback(primary):
         return primary
 
@@ -2166,27 +2890,42 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
                 "include_uniform_anchors": bool(
                     p.get("include_uniform_anchors")
                 ),
+                "use_choice_sequence_verifier": bool(
+                    p.get("use_choice_sequence_verifier")
+                ),
                 "answer_with_confidence": True,
                 "enable_evidence_fallback": True,
             }
 
-            if config["evidence_type"] in {
-                "sequence_ordering",
-                "screen_state_change",
-            }:
-                config["method"] = "clip_map_answer"
+            if config["evidence_type"] == "sequence_ordering":
+                if config.get("use_choice_sequence_verifier"):
+                    config["method"] = "choice_sequence_verifier"
+                else:
+                    config = apply_sequence_oracle_clip_policy(
+                        config,
+                        item,
+                    )
                 config["map_max_windows"] = (
                     12
-                    if config["evidence_type"] == "sequence_ordering"
-                    else
-                    10
                 )
                 config["map_frames_per_window"] = (
                     3
-                    if config["evidence_type"] == "sequence_ordering"
-                    else
-                    4
                 )
+                config["target_choice_events"] = True
+                config["sequence_event_topk"] = config["clip_topk"]
+                config["timestamp_frames_per_window"] = 3
+                config["sequence_choice_topk"] = min(
+                    config["clip_topk"],
+                    6,
+                )
+                config["sequence_choice_max_events"] = 5
+                config["sequence_choice_max_windows"] = 6
+                config["sequence_choice_frames_per_window"] = 2
+
+            elif config["evidence_type"] == "screen_state_change":
+                config["method"] = "clip_map_answer"
+                config["map_max_windows"] = 10
+                config["map_frames_per_window"] = 4
 
             elif config["evidence_type"] == "global_process":
                 config["method"] = "map_summary"
@@ -2195,6 +2934,11 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
                 config["query_conditioned"] = False
                 config["choice_compare_answer"] = True
                 config["structured_evidence_summary"] = True
+
+            config = apply_oracle_edge_policy(
+                config,
+                item,
+            )
 
             config = clamp_vimio_config_cost_aware(config, item)
 
@@ -2328,6 +3072,9 @@ def clamp_vimio_config_cost_aware(config, item):
     selected knobs, not dataset name.
     """
     config = dict(config)
+
+    if config.get("skip_cost_clamp"):
+        return config
 
     duration_s = item.get("duration_s")
     if duration_s is None:
