@@ -133,6 +133,8 @@ class AgentState:
     )
 
     final_answer: str | None = None
+    supported_answer: str | None = None
+    supported_answer_reason: str | None = None
     total_latency_s: float = 0.0
 
     local_search_count: int = 0
@@ -6877,6 +6879,114 @@ class VideoAgent(
                 ),
         )
 
+    def best_uncaptioned_local_evidence(
+        self,
+        state,
+    ):
+        captioned_ranges = [
+            (
+                evidence.start_s,
+                evidence.end_s,
+            )
+            for evidence in state.evidence
+            if evidence.action in {
+                "IMAGE_CAPTION",
+                "VERIFY_DETAIL",
+                "ZOOM_CAPTION",
+            }
+        ]
+
+        candidates = []
+
+        for index, evidence in enumerate(
+            state.evidence
+        ):
+            if evidence.action != "SEARCH_LOCAL":
+                continue
+
+            already_captioned = any(
+                abs(evidence.start_s - start_s) <= 2.0
+                and abs(evidence.end_s - end_s) <= 2.0
+                for start_s, end_s
+                in captioned_ranges
+            )
+
+            if not already_captioned:
+                candidates.append(
+                    (
+                        index,
+                        evidence,
+                    )
+                )
+
+        if not candidates:
+            return None
+
+        return max(
+            candidates,
+            key=lambda item:
+                self.evidence_relevance_score(
+                    item[1]
+                ),
+        )
+
+    def assessment_has_supported_answer(
+        self,
+        assessment,
+        choices,
+    ):
+        answer = normalize_answer(
+            assessment.get(
+                "answer"
+            )
+        )
+
+        if answer not in valid_choice_labels(
+            choices
+        ):
+            return False
+
+        confidence = float(
+            assessment.get(
+                "confidence",
+                0.0,
+            )
+            or 0.0
+        )
+
+        support_evidence_ids = (
+            assessment.get(
+                "support_evidence_ids"
+            )
+            or []
+        )
+
+        support_segment_ids = (
+            assessment.get(
+                "support_segment_ids"
+            )
+            or []
+        )
+
+        missing_information = str(
+            assessment.get(
+                "missing_information",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if confidence < 4.0:
+            return False
+
+        if missing_information:
+            return False
+
+        return bool(
+            support_evidence_ids
+            or support_segment_ids
+        )
+
 
     def resolve_anchor(
         self,
@@ -7417,6 +7527,36 @@ class VideoAgent(
             decision[
                 "evidence_id"
             ] = local_ids[0]
+
+        elif (
+            action == "SEARCH_LOCAL"
+            and local_ids
+        ):
+            best = self.best_uncaptioned_local_evidence(
+                state
+            )
+
+            if best is not None:
+                evidence_id, _ = best
+                action = "IMAGE_CAPTION"
+                decision[
+                    "evidence_id"
+                ] = evidence_id
+                decision.pop(
+                    "start_s",
+                    None,
+                )
+                decision.pop(
+                    "end_s",
+                    None,
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "local evidence already exists; caption the best "
+                    "uncaptioned retrieved window instead of repeating "
+                    "semantic search"
+                )
 
         elif (
             action != "ANSWER"
@@ -9945,6 +10085,40 @@ class VideoAgent(
                     "    confidence threshold reached:",
                     state.answer_confidence,
                 )
+                state.supported_answer = normalize_answer(
+                    assessment.get(
+                        "answer"
+                    )
+                )
+                state.supported_answer_reason = str(
+                    assessment.get(
+                        "reason",
+                        "",
+                    )
+                )
+                break
+
+            if self.assessment_has_supported_answer(
+                assessment,
+                choices,
+            ):
+                state.supported_answer = normalize_answer(
+                    assessment.get(
+                        "answer"
+                    )
+                )
+                state.supported_answer_reason = str(
+                    assessment.get(
+                        "reason",
+                        "",
+                    )
+                )
+                print(
+                    "    supported answer reached:",
+                    state.supported_answer,
+                    "confidence:",
+                    state.answer_confidence,
+                )
                 break
 
             # --------------------------------------------
@@ -10232,28 +10406,49 @@ class VideoAgent(
         # Final answer from accumulated memory/evidence.
         # ====================================================
 
-        answer = (
-            self.controller
-            .answer_from_evidence(
-                state=
-                    state,
+        if state.supported_answer:
+            answer = {
+                "prediction":
+                    state.supported_answer,
 
-                choices=
-                    choices,
+                "reason":
+                    state.supported_answer_reason
+                    or "High-confidence supported answer from assessment.",
+
+                "confidence":
+                    state.answer_confidence,
+
+                "latency_s":
+                    0.0,
+            }
+
+            state.final_answer = (
+                state.supported_answer
             )
-        )
 
-        state.total_latency_s += float(
-            answer[
-                "latency_s"
-            ]
-        )
+        else:
+            answer = (
+                self.controller
+                .answer_from_evidence(
+                    state=
+                        state,
 
-        state.final_answer = (
-            answer[
-                "prediction"
-            ]
-        )
+                    choices=
+                        choices,
+                )
+            )
+
+            state.total_latency_s += float(
+                answer[
+                    "latency_s"
+                ]
+            )
+
+            state.final_answer = (
+                answer[
+                    "prediction"
+                ]
+            )
 
         trajectory.append({
             "round":
