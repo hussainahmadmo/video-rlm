@@ -1,0 +1,128 @@
+[
+  {
+    "name": "budget2",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 8,
+    "window_len_s": 8,
+    "vlm_budget": 2,
+    "num_windows": 0
+  },
+  {
+    "name": "budget8",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 8,
+    "window_len_s": 8,
+    "vlm_budget": 8,
+    "num_windows": 0
+  },
+  {
+    "name": "budget32",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 8,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "num_windows": 0
+  },
+  {
+    "name": "scan0.0039_k8_budget32",
+    "method": "clip_oneshot",
+    "scan_fps": 0.00390625,
+    "clip_topk": 8,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "num_windows": 0
+  },
+  {
+    "name": "scan0.0156_k8_budget32",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 8,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "num_windows": 0
+  },
+  {
+    "name": "scan0.03125_k8_budget32",
+    "method": "clip_oneshot",
+    "scan_fps": 0.03125,
+    "clip_topk": 8,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "num_windows": 0
+  },
+  {
+    "name": "scan0.125_k8_budget32",
+    "method": "clip_oneshot",
+    "scan_fps": 0.125,
+    "clip_topk": 8,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "num_windows": 0
+  },
+  {
+    "name": "w4_k8_budget16",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 8,
+    "window_len_s": 4,
+    "vlm_budget": 16,
+    "num_windows": 0
+  },
+  {
+    "name": "w8_k8_budget16",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 8,
+    "window_len_s": 8,
+    "vlm_budget": 16,
+    "num_windows": 0
+  },
+  {
+    "name": "w16_k8_budget16",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 8,
+    "window_len_s": 16,
+    "vlm_budget": 16,
+    "num_windows": 0
+  },
+  {
+    "name": "k1",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 1,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "num_windows": 0
+  },
+  {
+    "name": "k4",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 4,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "num_windows": 0
+  },
+  {
+    "name": "k16",
+    "method": "clip_oneshot",
+    "scan_fps": 0.015625,
+    "clip_topk": 16,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "num_windows": 0
+  },
+  {
+    "name": "scan05",
+    "method": "clip_oneshot",
+    "scan_fps": 0.5,
+    "clip_topk": 8,
+    "window_len_s": 8,
+    "vlm_budget": 32,
+    "num_windows": 0
+  }
+]
