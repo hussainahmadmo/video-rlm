@@ -602,6 +602,23 @@ def infer_question_skills(
 
     skills = set()
 
+    asks_for_summary = any(
+        phrase in lowered
+        for phrase in (
+            "summarize",
+            "summarization",
+            "brief summary",
+            "brief summarization",
+            "overall process",
+            "overall behavior",
+            "behavior evolve",
+            "main steps",
+            "significant steps",
+            "key moments",
+            "key steps",
+        )
+    )
+
     if is_after_question(
         question
     ):
@@ -631,6 +648,8 @@ def infer_question_skills(
     )
 
     if (
+        not asks_for_summary
+        and (
         explicit_sequence
         or (
             is_sequence_question(
@@ -643,6 +662,7 @@ def infer_question_skills(
                     "TEMPORAL_BEFORE",
                 }
             )
+        )
         )
     ):
         skills.add(
@@ -679,12 +699,37 @@ def infer_question_skills(
             "LOCAL_DETAIL"
         )
 
+    if asks_for_summary and not (
+        skills
+        & {
+            "TEMPORAL_AFTER",
+            "TEMPORAL_BEFORE",
+            "CAUSAL_WHY",
+            "COUNTING",
+            "LOCAL_DETAIL",
+            "RECURRENCE",
+        }
+    ):
+        skills = {
+            "GLOBAL_SUMMARY"
+        }
+
     if not skills:
         skills.add(
             "GLOBAL_SUMMARY"
         )
 
     return skills
+
+
+def is_global_summary_question(
+    question,
+):
+    return infer_question_skills(
+        question
+    ) == {
+        "GLOBAL_SUMMARY"
+    }
 
 
 def truncate_text(
@@ -7940,6 +7985,16 @@ class VideoAgent(
             }
         )
 
+        if is_global_summary_only:
+            return bool(
+                assessment.get(
+                    "support_evidence_ids"
+                )
+                or assessment.get(
+                    "support_segment_ids"
+                )
+            )
+
         if (
             confidence < 5.0
             and text_has_uncertain_support(
@@ -7947,9 +8002,6 @@ class VideoAgent(
             )
         ):
             return False
-
-        if is_global_summary_only:
-            return True
 
         needs_option_support = bool(
             skills
@@ -11512,7 +11564,17 @@ class VideoAgent(
             },
         })
 
+        summary_only = is_global_summary_question(
+            question
+        )
+
         max_steps = self.max_rounds
+
+        if summary_only:
+            max_steps = min(
+                max_steps,
+                2,
+            )
 
         no_progress = 0
         previous_plan = None
@@ -11695,6 +11757,39 @@ class VideoAgent(
                         state,
                 )
             )
+
+            if (
+                summary_only
+                and decision.get(
+                    "action"
+                )
+                not in {
+                    "ANSWER",
+                    "GLOBAL_SCAN",
+                }
+            ):
+                decision = {
+                    "action":
+                        "GLOBAL_SCAN",
+
+                    "tool":
+                        "GLOBAL_SCAN",
+
+                    "query":
+                        (
+                            assessment.get(
+                                "missing_information"
+                            )
+                            or state.question
+                        ),
+
+                    "reason":
+                        (
+                            "broad summary question; inspect "
+                            "chronological context instead of "
+                            "localizing a detail"
+                        ),
+                }
 
             action = decision[
                 "action"
