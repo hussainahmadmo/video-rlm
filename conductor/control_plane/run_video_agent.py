@@ -241,6 +241,27 @@ SEQUENCE_TERMS = (
 )
 
 
+RECURRENCE_TERMS = (
+    "first appeared",
+    "first appear",
+    "appeared first",
+    "appeared afterward",
+    "appears afterward",
+    "appears after",
+    "has appeared",
+    "have appeared",
+    "appeared in",
+    "appeared",
+    "first plant",
+    "first time",
+    "in which scene",
+    "in which of the following scenes",
+    "which character appears afterward",
+    "where has",
+    "where did",
+)
+
+
 def is_fine_detail_question(
     question: str,
 ):
@@ -258,6 +279,16 @@ def is_sequence_question(
     return any(
         term in text
         for term in SEQUENCE_TERMS
+    )
+
+
+def is_recurrence_question(
+    question: str,
+):
+    text = str(question or "").lower()
+    return any(
+        term in text
+        for term in RECURRENCE_TERMS
     )
 
 
@@ -5360,6 +5391,213 @@ Return ONLY JSON:
         }
 
 
+    def answer_sequence_from_timeline(
+        self,
+        *,
+        state: AgentState,
+        choices: list[str],
+    ):
+        valid = valid_choice_labels(
+            choices
+        )
+
+        timeline = []
+
+        for evidence in state.evidence:
+            if evidence.action not in {
+                "GLOBAL_SCAN",
+                "IMAGE_CAPTION",
+                "VERIFY_DETAIL",
+                "ZOOM_CAPTION",
+            }:
+                continue
+
+            timeline.append({
+                "action":
+                    evidence.action,
+
+                "start_s":
+                    evidence.start_s,
+
+                "end_s":
+                    evidence.end_s,
+
+                "observation":
+                    evidence.observation,
+
+                "confidence":
+                    evidence.confidence,
+            })
+
+        timeline.sort(
+            key=lambda item: (
+                float(
+                    item.get(
+                        "start_s",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                float(
+                    item.get(
+                        "end_s",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+            )
+        )
+
+        memory = compact_memory_for_prompt(
+            state,
+            max_segments=int(
+                state.policy.get(
+                    "max_final_memory_segments",
+                    96,
+                )
+                or 96
+            ),
+        )
+
+        prompt = f"""
+        Answer this sequence/order VideoQA question by comparing each
+        option against timestamped timeline evidence.
+
+        Question:
+        {state.question}
+
+        Choices:
+        {format_choices(choices)}
+
+        Timestamped tool evidence:
+        {json.dumps(timeline, ensure_ascii=False)}
+
+        Video memory:
+        {json.dumps(memory, ensure_ascii=False)}
+
+        RULES:
+        1. First extract an ordered list of visible events/scenes from
+           the timestamped evidence and memory.
+        2. For every option, compare event 1, event 2, event 3, etc.
+           against the extracted timeline in chronological order.
+        3. Reject an option if its first event is missing or contradicted
+           when another option's first event is supported.
+        4. Do not choose an option only because it contains familiar
+           objects; the order must match.
+        5. Prefer the option with the strongest ordered match.
+        6. Return exactly one option label.
+
+        Return ONLY JSON:
+
+        {{
+          "prediction": "A",
+          "ordered_events": [],
+          "option_order_support": {{
+            "A": {{
+              "matched_events": [],
+              "contradictions": [],
+              "unknown_events": []
+            }}
+          }},
+          "reason": "brief timestamp-grounded reason",
+          "confidence": "low"
+        }}
+
+        Prediction must be exactly one of:
+        {sorted(valid)}
+        """
+
+        t0 = time.time()
+
+        response = (
+            self.client
+            .chat.completions
+            .create(
+                model=
+                    self.model,
+
+                messages=[{
+                    "role":
+                        "user",
+
+                    "content":
+                        prompt,
+                }],
+
+                temperature=
+                    0,
+            )
+        )
+
+        latency = (
+            time.time()
+            - t0
+        )
+
+        parsed = extract_json(
+            response
+            .choices[0]
+            .message.content
+        )
+
+        if not isinstance(
+            parsed,
+            dict,
+        ):
+            parsed = {
+                "prediction": "",
+                "reason": str(
+                    response
+                    .choices[0]
+                    .message.content
+                ),
+                "confidence": "low",
+            }
+
+        prediction = normalize_answer(
+            parsed.get(
+                "prediction",
+                "",
+            )
+        )
+
+        if prediction not in valid:
+            prediction = ""
+
+        confidence = str(
+            parsed.get(
+                "confidence",
+                "low",
+            )
+        ).lower()
+
+        if confidence not in {
+            "low",
+            "medium",
+            "high",
+        }:
+            confidence = "low"
+
+        return {
+            "prediction":
+                prediction,
+
+            "reason":
+                str(
+                    parsed.get(
+                        "reason",
+                        "",
+                    )
+                ),
+
+            "confidence":
+                confidence,
+
+            "latency_s":
+                latency,
+        }
+
+
 # ============================================================
 # Shared video execution helpers
 # ============================================================
@@ -6959,7 +7197,17 @@ class VideoAgent(
                 "local_detail",
                 "generic_local_mcq",
             }
+            or is_fine_detail_question(
+                state.question
+            )
         )
+
+        needs_recurrence = is_recurrence_question(
+            state.question
+        )
+
+        if needs_recurrence:
+            needs_fine_detail = False
 
         local_ids = [
             index
@@ -6987,6 +7235,9 @@ class VideoAgent(
                 requirement == "global"
                 and relation == "ordering"
             )
+            or is_sequence_question(
+                state.question
+            )
         )
 
         has_sequence_detail = any(
@@ -7003,10 +7254,14 @@ class VideoAgent(
             and local_ids
             and not has_fine_detail
         ):
+            best = self.best_local_evidence(
+                state
+            )
             action = "VERIFY_DETAIL"
-            decision[
-                "evidence_id"
-            ] = local_ids[0]
+            if best is not None:
+                decision[
+                    "evidence_id"
+                ] = best[0]
 
         elif profiler_policy_mode == "hard":
             if (
@@ -7197,6 +7452,33 @@ class VideoAgent(
         return max(
             candidates,
             key=lambda item:
+            self.evidence_relevance_score(
+                item[1]
+            ),
+        )
+
+    def best_local_evidence(
+        self,
+        state,
+    ):
+        candidates = [
+            (
+                index,
+                evidence,
+            )
+            for index, evidence
+            in enumerate(
+                state.evidence
+            )
+            if evidence.action == "SEARCH_LOCAL"
+        ]
+
+        if not candidates:
+            return None
+
+        return max(
+            candidates,
+            key=lambda item:
                 self.evidence_relevance_score(
                     item[1]
                 ),
@@ -7255,11 +7537,26 @@ class VideoAgent(
         if missing_information:
             return False
 
+        needs_recurrence = (
+            state is not None
+            and is_recurrence_question(
+                state.question
+            )
+        )
+
+        needs_sequence = (
+            state is not None
+            and is_sequence_question(
+                state.question
+            )
+        )
+
         needs_fine_detail = (
             state is not None
             and is_fine_detail_question(
                 state.question
             )
+            and not needs_recurrence
         )
 
         if needs_fine_detail:
@@ -7296,6 +7593,75 @@ class VideoAgent(
                     return True
 
             return False
+
+        if needs_recurrence:
+            distinct_windows = set()
+
+            for value in support_evidence_ids:
+                try:
+                    index = int(
+                        value
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+                if not (
+                    0 <= index < len(
+                        state.evidence
+                    )
+                ):
+                    continue
+
+                evidence = state.evidence[
+                    index
+                ]
+
+                if evidence.action not in {
+                    "SEARCH_LOCAL",
+                    "IMAGE_CAPTION",
+                    "VERIFY_DETAIL",
+                    "ZOOM_CAPTION",
+                }:
+                    continue
+
+                distinct_windows.add(
+                    (
+                        round(
+                            float(
+                                evidence.start_s
+                            ),
+                            1,
+                        ),
+                        round(
+                            float(
+                                evidence.end_s
+                            ),
+                            1,
+                        ),
+                    )
+                )
+
+            if len(
+                distinct_windows
+            ) < 2:
+                return False
+
+        if needs_sequence:
+            sequence_evidence = [
+                evidence
+                for evidence in state.evidence
+                if evidence.action in {
+                    "GLOBAL_SCAN",
+                    "IMAGE_CAPTION",
+                    "VERIFY_DETAIL",
+                    "ZOOM_CAPTION",
+                }
+            ]
+
+            if len(
+                sequence_evidence
+            ) < 3:
+                return False
 
         return bool(
             support_evidence_ids
@@ -7493,6 +7859,22 @@ class VideoAgent(
         # ----------------------------------------------------
         # Global
         # ----------------------------------------------------
+
+        if is_recurrence_question(
+            state.question
+        ):
+
+            return {
+                "action":
+                    "SEARCH_LOCAL",
+
+                "query":
+                    state.question,
+
+                "reason":
+                    "Recurrence question requires multiple "
+                    "candidate occurrence windows.",
+            }
 
         if is_sequence_question(
             state.question
@@ -7809,7 +8191,17 @@ class VideoAgent(
                 "local_detail",
                 "generic_local_mcq",
             }
+            or is_fine_detail_question(
+                state.question
+            )
         )
+
+        needs_recurrence = is_recurrence_question(
+            state.question
+        )
+
+        if needs_recurrence:
+            needs_fine_detail = False
 
         local_ids = [
             index
@@ -7837,6 +8229,9 @@ class VideoAgent(
                 requirement == "global"
                 and relation == "ordering"
             )
+            or is_sequence_question(
+                state.question
+            )
         )
 
         has_sequence_detail = any(
@@ -7848,7 +8243,133 @@ class VideoAgent(
             for evidence in state.evidence
         )
 
+        recurrence_caption_count = sum(
+            1
+            for evidence in state.evidence
+            if evidence.action in {
+                "IMAGE_CAPTION",
+                "VERIFY_DETAIL",
+                "ZOOM_CAPTION",
+            }
+        )
+
         if (
+            action == "ANSWER"
+            and needs_recurrence
+            and (
+                not local_ids
+                or recurrence_caption_count < min(
+                    3,
+                    len(
+                        local_ids
+                    ),
+                )
+            )
+        ):
+            action = (
+                "SEARCH_LOCAL"
+                if not local_ids
+                else "IMAGE_CAPTION"
+            )
+            decision[
+                "query"
+            ] = state.question
+            decision[
+                "reason"
+            ] = (
+                "recurrence question cannot answer until multiple "
+                "candidate occurrence windows are inspected"
+            )
+
+        elif (
+            action == "ANSWER"
+            and needs_sequence_detail
+            and len(
+                [
+                    evidence
+                    for evidence in state.evidence
+                    if evidence.action in {
+                        "IMAGE_CAPTION",
+                        "VERIFY_DETAIL",
+                        "ZOOM_CAPTION",
+                        "GLOBAL_SCAN",
+                    }
+                ]
+            ) < 3
+        ):
+            action = "IMAGE_CAPTION"
+            decision[
+                "query"
+            ] = (
+                "caption the next chronological segment and preserve "
+                "event order for sequence comparison"
+            )
+            decision[
+                "reason"
+            ] = (
+                "sequence question needs at least three ordered "
+                "timeline evidence items before answering"
+            )
+
+        if (
+            action != "ANSWER"
+            and needs_recurrence
+            and not local_ids
+        ):
+            action = "SEARCH_LOCAL"
+            decision[
+                "query"
+            ] = state.question
+            decision[
+                "reason"
+            ] = (
+                "recurrence question needs multiple candidate "
+                "occurrence windows"
+            )
+
+        elif (
+            action != "ANSWER"
+            and needs_recurrence
+            and local_ids
+            and recurrence_caption_count < min(
+                3,
+                len(
+                    local_ids
+                ),
+            )
+        ):
+            best = self.best_uncaptioned_local_evidence(
+                state
+            )
+
+            if best is not None:
+                evidence_id, _ = best
+                action = "IMAGE_CAPTION"
+                decision[
+                    "evidence_id"
+                ] = evidence_id
+                decision.pop(
+                    "start_s",
+                    None,
+                )
+                decision.pop(
+                    "end_s",
+                    None,
+                )
+                decision[
+                    "query"
+                ] = (
+                    "caption this candidate occurrence and keep "
+                    "its timestamp for recurrence comparison"
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "recurrence question requires multiple "
+                    "timestamped occurrences before answering"
+                )
+
+        elif (
             action != "ANSWER"
             and needs_sequence_detail
             and not has_sequence_detail
@@ -7916,10 +8437,14 @@ class VideoAgent(
             and local_ids
             and not has_fine_detail
         ):
+            best = self.best_local_evidence(
+                state
+            )
             action = "VERIFY_DETAIL"
-            decision[
-                "evidence_id"
-            ] = local_ids[0]
+            if best is not None:
+                decision[
+                    "evidence_id"
+                ] = best[0]
 
         elif (
             action == "SEARCH_LOCAL"
@@ -10861,16 +11386,31 @@ class VideoAgent(
             )
 
         else:
-            answer = (
-                self.controller
-                .answer_from_evidence(
-                    state=
-                        state,
+            if is_sequence_question(
+                state.question
+            ):
+                answer = (
+                    self.controller
+                    .answer_sequence_from_timeline(
+                        state=
+                            state,
 
-                    choices=
-                        choices,
+                        choices=
+                            choices,
+                    )
                 )
-            )
+
+            else:
+                answer = (
+                    self.controller
+                    .answer_from_evidence(
+                        state=
+                            state,
+
+                        choices=
+                            choices,
+                    )
+                )
 
             state.total_latency_s += float(
                 answer[
