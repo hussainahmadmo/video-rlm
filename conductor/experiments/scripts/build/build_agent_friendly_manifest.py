@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 CHOICE_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm"}
 
 
 def load_jsonl(path):
@@ -234,12 +235,32 @@ def parse_answer_idx(row, choices):
     return None
 
 
-def find_video(video_id, roots):
+def build_video_index(roots):
+    index = {}
+    for root in roots:
+        root = Path(root)
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+                index.setdefault(path.stem, path)
+                index.setdefault(path.name, path)
+    return index
+
+
+def find_video(video_id, roots, video_index=None):
     names = [
         f"{video_id}.mp4",
         f"{video_id}.mkv",
         f"{video_id}.webm",
     ]
+    if video_index is not None:
+        for key in [video_id, *names]:
+            video = video_index.get(key)
+            if video is not None:
+                return video
+        return None
+
     for root in roots:
         root = Path(root)
         for name in names:
@@ -256,11 +277,12 @@ def find_video(video_id, roots):
 def build_nextqa_rows(annotation_csv, video_roots, limit):
     rows = []
     missing = []
+    video_index = build_video_index(video_roots)
     with open(annotation_csv, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             video_id = str(row["video"])
-            video = find_video(video_id, video_roots)
+            video = find_video(video_id, video_roots, video_index)
             if video is None:
                 missing.append(video_id)
                 continue
@@ -313,6 +335,7 @@ def build_intentqa_rows(annotation_path, video_roots, limit):
 
     rows = []
     missing = []
+    video_index = build_video_index(video_roots)
 
     for raw_row in load_annotation_records(annotation_path):
         row = dict(raw_row)
@@ -353,6 +376,7 @@ def build_intentqa_rows(annotation_path, video_roots, limit):
             video = find_video(
                 video_id,
                 video_roots,
+                video_index,
             )
 
         if video is None:
@@ -396,6 +420,7 @@ def build_intentqa_rows(annotation_path, video_roots, limit):
                 f"{video_id}_{len(rows)}",
             )
         )
+        qid = f"{video_id}_{qid}_{len(rows)}"
 
         rows.append({
             "dataset": "IntentQA",
@@ -478,6 +503,9 @@ def main():
             "/dataheart/hussainahmad/video-datasets/IntentQA/videos",
             "/dataheart/hussainahmad/datasets/IntentQA/videos",
             "/dataheart/hussainahmad/datasets/IntentQA",
+            "/dataheart/hussainahmad/video-datasets/NExT-QA",
+            "/dataheart/hussainahmad/datasets/NExT-QA",
+            "/dataheart/hussainahmad/datasets/NExTVideo_subset",
         ],
     )
     parser.add_argument("--intentqa_limit", type=int, default=50)
