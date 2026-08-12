@@ -151,6 +151,23 @@ def get_retrieval_model(device=None):
         device,
     )
 
+def extract_feature_tensor(output):
+    if isinstance(output, torch.Tensor):
+        return output
+
+    for attr in ("pooler_output", "image_embeds", "text_embeds"):
+        value = getattr(output, attr, None)
+        if isinstance(value, torch.Tensor):
+            return value
+
+    last_hidden = getattr(output, "last_hidden_state", None)
+    if isinstance(last_hidden, torch.Tensor):
+        return last_hidden[:, 0]
+
+    raise TypeError(
+        f"Could not extract feature tensor from {type(output).__name__}"
+    )
+
 def append_jsonl(row, path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as f:
@@ -1059,8 +1076,10 @@ def clip_topk_windows(
 
     t_text = time.time()
 
-    text_feat = model.get_text_features(
-        **text_inputs
+    text_feat = extract_feature_tensor(
+        model.get_text_features(
+            **text_inputs
+        )
     )
 
     sync_device()
@@ -2226,8 +2245,10 @@ def build_frame_scan_embeddings(
             for k, v in inputs.items()
         }
 
-        feats = model.get_image_features(
-            **inputs
+        feats = extract_feature_tensor(
+            model.get_image_features(
+                **inputs
+            )
         )
         sync_device()
         resize_time += time.time() - t_resize
