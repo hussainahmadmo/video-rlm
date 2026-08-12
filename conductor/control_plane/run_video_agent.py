@@ -392,7 +392,8 @@ def supported_labels_mentioned_in_text(
     pattern = (
         r"\b(?:aligns with|matches|corresponds to|supports|"
         r"best supports|is consistent with)\s+"
-        r"(?:option|choice)\s+([A-Z])\b"
+        r"(?:(?:the\s+)?(?:answer|option|choice)\s+"
+        r"['\"]?([A-Z])(?:\b|\.)|['\"]([A-Z])\.)"
     )
 
     for match in re.finditer(
@@ -401,10 +402,195 @@ def supported_labels_mentioned_in_text(
         flags=re.IGNORECASE,
     ):
         labels.add(
-            match.group(1).upper()
+            (
+                match.group(1)
+                or match.group(2)
+            ).upper()
         )
 
     return labels
+
+
+UNCERTAIN_SUPPORT_PHRASES = (
+    "no direct evidence",
+    "no explicit evidence",
+    "not directly supported",
+    "does not directly support",
+    "does not provide direct evidence",
+    "does not provide clear evidence",
+    "insufficient evidence",
+    "insufficient visual support",
+    "unclear",
+    "cannot determine",
+    "could be",
+    "might be",
+    "may be",
+    "plausible",
+    "suggests",
+    "inferred",
+    "not enough information",
+)
+
+
+CHOICE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "because",
+    "by",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "he",
+    "her",
+    "him",
+    "his",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "one",
+    "she",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "they",
+    "to",
+    "was",
+    "with",
+}
+
+
+def normalized_word_tokens(
+    text,
+):
+    tokens = []
+
+    for token in re.findall(
+        r"[a-z0-9]+",
+        str(text).lower(),
+    ):
+        if token in CHOICE_STOPWORDS:
+            continue
+
+        for suffix in (
+            "ing",
+            "ed",
+            "es",
+            "s",
+        ):
+            if (
+                len(token) > len(suffix) + 3
+                and token.endswith(suffix)
+            ):
+                token = token[
+                    : -len(suffix)
+                ]
+                break
+
+        tokens.append(
+            token
+        )
+
+    return tokens
+
+
+def token_is_present(
+    token,
+    text_tokens,
+):
+    if token in text_tokens:
+        return True
+
+    prefix = token[:5]
+
+    return any(
+        other.startswith(prefix)
+        or token.startswith(other[:5])
+        for other in text_tokens
+        if len(other) >= 4
+    )
+
+
+def choice_text_supported_by_text(
+    choice,
+    text,
+):
+    choice_tokens = normalized_word_tokens(
+        choice
+    )
+
+    if not choice_tokens:
+        return False
+
+    text_tokens = normalized_word_tokens(
+        text
+    )
+
+    hits = sum(
+        1
+        for token in set(
+            choice_tokens
+        )
+        if token_is_present(
+            token,
+            text_tokens,
+        )
+    )
+
+    required = 1
+    if len(
+        set(choice_tokens)
+    ) >= 3:
+        required = 2
+
+    return hits >= required
+
+
+def text_has_uncertain_support(
+    text,
+):
+    lowered = str(text).lower()
+    return any(
+        phrase in lowered
+        for phrase in UNCERTAIN_SUPPORT_PHRASES
+    )
+
+
+def is_why_question(
+    question,
+):
+    return str(
+        question
+    ).strip().lower().startswith(
+        "why "
+    )
+
+
+def is_after_question(
+    question,
+):
+    lowered = str(
+        question
+    ).lower()
+
+    return (
+        " after " in lowered
+        or lowered.startswith(
+            "after "
+        )
+    )
 
 
 def truncate_text(
@@ -7484,6 +7670,226 @@ class VideoAgent(
                 ),
         )
 
+    def assessment_support_text(
+        self,
+        assessment,
+        state,
+    ):
+        if state is None:
+            return ""
+
+        chunks = []
+
+        for value in assessment.get(
+            "support_evidence_ids",
+            [],
+        ) or []:
+            try:
+                index = int(
+                    value
+                )
+            except (TypeError, ValueError):
+                continue
+
+            if not (
+                0 <= index < len(
+                    state.evidence
+                )
+            ):
+                continue
+
+            evidence = state.evidence[
+                index
+            ]
+            chunks.append(
+                str(
+                    evidence.observation
+                )
+            )
+
+        segment_ids = set()
+        for value in assessment.get(
+            "support_segment_ids",
+            [],
+        ) or []:
+            try:
+                segment_ids.add(
+                    int(
+                        value
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+
+        for segment in (
+            state.memory_bank.get(
+                "segment_captions",
+                [],
+            )
+            or []
+        ):
+            try:
+                segment_id = int(
+                    segment.get(
+                        "segment_id",
+                        -1,
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+
+            if segment_id in segment_ids:
+                chunks.append(
+                    json.dumps(
+                        segment,
+                        ensure_ascii=False,
+                    )
+                )
+
+        return "\n".join(
+            chunks
+        )
+
+    def assessment_has_option_alignment(
+        self,
+        *,
+        assessment,
+        choices,
+        answer,
+        state,
+        confidence,
+    ):
+        answer_index = ord(
+            answer
+        ) - ord("A")
+
+        if not (
+            0 <= answer_index < len(
+                choices
+            )
+        ):
+            return False
+
+        selected_choice = choices[
+            answer_index
+        ]
+
+        reason_text = str(
+            assessment.get(
+                "reason",
+                "",
+            )
+            or ""
+        )
+
+        missing_text = str(
+            assessment.get(
+                "missing_information",
+                "",
+            )
+            or ""
+        )
+
+        combined_text = (
+            reason_text
+            + "\n"
+            + missing_text
+        )
+
+        mentioned_labels = (
+            supported_labels_mentioned_in_text(
+                combined_text
+            )
+            & valid_choice_labels(
+                choices
+            )
+        )
+
+        if (
+            mentioned_labels
+            and answer not in mentioned_labels
+        ):
+            return False
+
+        support_text = self.assessment_support_text(
+            assessment,
+            state,
+        )
+
+        option_supported = choice_text_supported_by_text(
+            selected_choice,
+            reason_text + "\n" + support_text,
+        )
+
+        if confidence < 5.0:
+            if text_has_uncertain_support(
+                combined_text
+            ):
+                return False
+
+            if not option_supported:
+                return False
+
+        if (
+            state is not None
+            and is_why_question(
+                state.question
+            )
+            and not choice_text_supported_by_text(
+                selected_choice,
+                support_text,
+            )
+        ):
+            return False
+
+        if (
+            state is not None
+            and is_after_question(
+                state.question
+            )
+        ):
+            has_after_evidence = False
+
+            for value in assessment.get(
+                "support_evidence_ids",
+                [],
+            ) or []:
+                try:
+                    index = int(
+                        value
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+                if not (
+                    0 <= index < len(
+                        state.evidence
+                    )
+                ):
+                    continue
+
+                if state.evidence[
+                    index
+                ].action in {
+                    "SEARCH_AFTER",
+                    "IMAGE_CAPTION",
+                    "VERIFY_DETAIL",
+                    "ZOOM_CAPTION",
+                }:
+                    has_after_evidence = True
+                    break
+
+            if not has_after_evidence:
+                return False
+
+            if not choice_text_supported_by_text(
+                selected_choice,
+                support_text,
+            ):
+                return False
+
+        return True
+
     def assessment_has_supported_answer(
         self,
         assessment,
@@ -7535,6 +7941,24 @@ class VideoAgent(
             return False
 
         if missing_information:
+            return False
+
+        if not self.assessment_has_option_alignment(
+            assessment=
+                assessment,
+
+            choices=
+                choices,
+
+            answer=
+                answer,
+
+            state=
+                state,
+
+            confidence=
+                confidence,
+        ):
             return False
 
         needs_recurrence = (
