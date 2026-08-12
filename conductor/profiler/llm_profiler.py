@@ -2,29 +2,116 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import re
-from dataclasses import asdict, dataclass, replace
-from typing import Any, Dict, List, Sequence, Tuple
+
+from dataclasses import (
+    asdict,
+    dataclass,
+    replace,
+)
+from typing import (
+    Any,
+    Dict,
+    List,
+    Sequence,
+    Tuple,
+)
+FIRST_OCCURRENCE_QUERY_TERMS = (
+    "first person",
+    "first object",
+    "first item",
+    "first time",
+    "first event",
+    "first action",
+    "first thing",
+)
+
+LAST_OCCURRENCE_QUERY_TERMS = (
+    "last person",
+    "last object",
+    "last item",
+    "last time",
+    "last event",
+    "last action",
+    "last thing",
+)
 
 import requests
 
+@dataclass
+class AdaptiveProfilerResult:
+    source: str
+    router_decision: RouterDecision
+    chosen_config: BudgetConfig
+    execution_policy: Dict[str, Any]
+    llm_result: ProfilerResult | None = None
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source": self.source,
+            "router_decision": asdict(
+                self.router_decision
+            ),
+            "chosen_config": asdict(
+                self.chosen_config
+            ),
+            "execution_policy": (
+                self.execution_policy
+            ),
+            "llm_result": (
+                self.llm_result.to_dict()
+                if self.llm_result is not None
+                else None
+            ),
+        }
+    
 # ============================================================================
 # 1. Profiler prompt
 # ============================================================================
 
 PROFILER_SYSTEM_PROMPT = """
-You are a semantic query profiler for a long-video question-answering system.
+You are a semantic execution profiler for a long-video question-answering
+system.
 
-Your task is NOT to choose exact frame rates, top-k values, or GPU budgets.
-Your task is to infer the structure of evidence needed to answer the question.
+Your job has TWO levels:
 
-Return STRICT JSON ONLY. Do not use markdown or explanatory text outside JSON.
+LEVEL 1:
+Determine whether the query should use a fixed one-pass execution plan
+or a bounded agentic evidence-acquisition plan.
+
+LEVEL 2:
+Describe the structure of video evidence needed to answer it.
+
+You are NOT choosing exact frame rates, top-k values, or GPU budgets.
+Those are compiled later.
+
+Return STRICT JSON ONLY.
+Do not use markdown.
+Do not output explanatory text outside JSON.
 
 Output schema:
 
 {
   "analysis": {
+    "execution_mode":
+      "oneshot" |
+      "agentic",
+
+    "evidence_requirement":
+      "local" |
+      "global" |
+      "count" |
+      "temporal",
+
+    "temporal_relation":
+      "none" |
+      "before" |
+      "after" |
+      "beginning" |
+      "end" |
+      "ordering",
+
     "reasoning_type":
       "local_event" |
       "fine_detail" |
@@ -105,15 +192,9 @@ Output schema:
       "full_frame" |
       "object_crop" |
       "multi_crop" |
-      "ocr_crop" |
-      "face_crop",
 
     "required_modalities": [
-      "visual" |
-      "audio" |
-      "ocr" |
-      "subtitle" |
-      "metadata"
+      "visual"
     ],
 
     "event_density":
@@ -143,41 +224,143 @@ Output schema:
       "expand_coverage" |
       "full_high",
 
-    "rationale": "<one concise explanation>"
+    "rationale":
+      "<one concise explanation>"
   }
 }
 
-Interpretation rules:
+EXECUTION-MODE RULES:
 
-1. Counting and repetition questions generally require full-timeline coverage.
+ONESHOT means the query can be answered using one fixed evidence-acquisition
+program without an open-ended search loop.
+
+Examples:
+
+- locate one object/action/person once and inspect that scene
+- inspect the beginning directly
+- inspect the end directly
+- use a fixed uniform sample when no adaptive search is needed
+
+AGENTIC means the query inherently requires evidence acquisition that depends
+on previously observed evidence.
+
+Typical examples:
+
+- count distinct events across the whole video
+- find an anchor and inspect what happened before or after it
+- reconstruct a workflow across separated parts of a video
+- verify multiple temporal stages
+- resolve ambiguity by refining an already localized interval
+
+IMPORTANT:
+
+A LOCAL query should usually NOT become an open-ended search agent.
+
+If one semantic retrieval pass can locate the scene, classify it as:
+
+execution_mode = "oneshot"
+evidence_requirement = "local"
+
+GLOBAL workflow/summary/sequence questions should use:
+
+execution_mode = "agentic"
+evidence_requirement = "global"
+
+but their agentic behavior should remain inside chronological global
+coverage. They should not repeatedly perform unrelated semantic retrieval.
+
+COUNTING questions should use:
+
+execution_mode = "agentic"
+evidence_requirement = "count"
+
+TEMPORAL before/after questions should use:
+
+execution_mode = "agentic"
+evidence_requirement = "temporal"
+
+Beginning/end questions can usually use fixed direct boundary inspection:
+
+execution_mode = "oneshot"
+evidence_requirement = "temporal"
+
+TEMPORAL RELATION:
+
+Use:
+- "before" for what happened before an anchor
+- "after" for what happened after an anchor
+- "beginning" for first/start/opening questions
+- "end" for last/final/ending questions
+- "ordering" when multiple separated events must be ordered
+- "none" otherwise
+
+OTHER RULES:
+
+1. Counting and repetition require full-timeline coverage.
+
 2. Counting must not use top-k-only selection.
-3. Exact occurrence counting should use:
-   - aggregation_type = "occurrences"
-   - temporal_operation = "frequency"
-4. Counting distinct people or objects should use:
-   - aggregation_type = "distinct_entities"
-   - cross-window identity tracking
-5. Questions asking how many are visible at once should use:
-   - aggregation_type = "simultaneous_max"
-6. Temporal-order and multi-hop questions require multiple separated regions.
-7. Fine-detail, text-reading, label, number, color, and small-object questions
-   require high precision and may require a crop.
-8. Global-summary questions require broad uniform coverage.
-9. State-change questions generally need beginning/end or multiple-state evidence.
-10. Ambiguous or low-confidence questions should use broader coverage and fallback.
-11. Include audio, OCR, subtitles, or metadata only when genuinely required.
-12. profile_confidence must be a number between 0.0 and 1.0.
-13. If answer choices are provided, use them to disambiguate the intended task.
+
+3. Exact occurrence counting:
+   aggregation_type = "occurrences"
+   temporal_operation = "frequency"
+
+4. Counting distinct people or objects:
+   aggregation_type = "distinct_entities"
+   identity_requirement = "cross_window_reidentification"
+
+5. Maximum simultaneously visible entities:
+   aggregation_type = "simultaneous_max"
+
+6. Workflow, summary, sequence, and major-stage questions require chronological
+   global evidence. Do NOT convert these into repeated local searches for
+   incidental objects or tools.
+
+7. Temporal-order and multi-hop questions require multiple separated regions.
+
+8. Fine-detail questions involving pointing, text, labels, clothing,
+   identity, small objects, gaze, or precise interactions require high
+   precision.
+
+9. State-change questions generally require beginning/end or separated states.
+
+10. This experiment is VISUAL ONLY.
+    required_modalities must always be ["visual"].
+    Do not request audio, OCR, subtitles, or metadata.
+
+11. profile_confidence must be between 0.0 and 1.0.
+
+12. Answer choices may help determine what evidence distinguishes the answers,
+    but answer-choice text is not itself visual evidence.
 
 Return JSON only.
 """
-
-
+    
 # ============================================================================
 # 2. Allowed values
 # ============================================================================
 
 ALLOWED_VALUES: Dict[str, set[str]] = {
+    "execution_mode": {
+        "oneshot",
+        "agentic",
+    },
+
+    "evidence_requirement": {
+        "local",
+        "global",
+        "count",
+        "temporal",
+    },
+
+    "temporal_relation": {
+        "none",
+        "before",
+        "after",
+        "beginning",
+        "end",
+        "ordering",
+    },
+
     "reasoning_type": {
         "local_event",
         "fine_detail",
@@ -190,6 +373,7 @@ ALLOWED_VALUES: Dict[str, set[str]] = {
         "multi_hop",
         "ambiguous",
     },
+
     "answer_type": {
         "multiple_choice",
         "short_text",
@@ -198,11 +382,13 @@ ALLOWED_VALUES: Dict[str, set[str]] = {
         "yes_no",
         "summary",
     },
+
     "coverage_requirement": {
         "targeted",
         "multi_region",
         "full_timeline",
     },
+
     "selection_mode": {
         "top_k",
         "all_positive",
@@ -211,11 +397,13 @@ ALLOWED_VALUES: Dict[str, set[str]] = {
         "beginning_end",
         "multi_event",
     },
+
     "temporal_requirement": {
         "local",
         "medium",
         "global",
     },
+
     "temporal_operation": {
         "none",
         "before_after",
@@ -225,21 +413,25 @@ ALLOWED_VALUES: Dict[str, set[str]] = {
         "state_transition",
         "cross_segment_comparison",
     },
+
     "candidate_requirement": {
         "few",
         "medium",
         "many",
     },
+
     "context_requirement": {
         "short",
         "medium",
         "long",
     },
+
     "precision_requirement": {
         "low",
         "medium",
         "high",
     },
+
     "aggregation_type": {
         "none",
         "occurrences",
@@ -248,39 +440,44 @@ ALLOWED_VALUES: Dict[str, set[str]] = {
         "segments",
         "duration",
     },
+
     "identity_requirement": {
         "none",
         "object_tracking",
         "person_tracking",
         "cross_window_reidentification",
     },
+
     "spatial_strategy": {
         "full_frame",
         "object_crop",
         "multi_crop",
-        "ocr_crop",
-        "face_crop",
     },
+
     "event_density": {
         "sparse",
         "medium",
         "dense",
         "unknown",
     },
+
     "ambiguity": {
         "low",
         "medium",
         "high",
     },
+
     "miss_risk": {
         "low",
         "medium",
         "high",
     },
+
     "answer_sensitivity": {
         "approximate",
         "exact",
     },
+
     "fallback_requirement": {
         "none",
         "expand_coverage",
@@ -288,12 +485,9 @@ ALLOWED_VALUES: Dict[str, set[str]] = {
     },
 }
 
+
 ALLOWED_MODALITIES = {
     "visual",
-    "audio",
-    "ocr",
-    "subtitle",
-    "metadata",
 }
 
 
@@ -303,144 +497,620 @@ ALLOWED_MODALITIES = {
 
 @dataclass(frozen=True)
 class ResourceState:
-    """
-    Runtime serving state.
-
-    Replace these placeholders later with real scheduler and GPU measurements.
-    """
-
     free_gpu_mem_gb: float = 999.0
     encoder_queue_len: int = 0
     vlm_queue_len: int = 0
-    load_level: str = "low"  # low | medium | high
+    load_level: str = "low"
+
+
+@dataclass(frozen=True)
+class RouterDecision:
+    policy_name: str
+
+    execution_mode: str
+    evidence_requirement: str
+    temporal_relation: str
+
+    confidence: float
+    reason: str
+    out_of_distribution: bool = False
+
+
+@dataclass(frozen=True)
+class CatalogPolicy:
+    name: str
+
+    probe_fps: float
+    probe_topk: int
+    action_topk: int
+
+    window_len_s: float
+    vlm_budget: int
+
+    expand_neighbors: bool = False
+    preserve_order: bool = False
+    include_uniform_anchors: bool = False
 
 
 @dataclass(frozen=True)
 class BudgetConfig:
     name: str
 
+    # ------------------------------------------------------------
+    # Macro execution decision.
+    # ------------------------------------------------------------
+
+    execution_mode: str
+    evidence_requirement: str
+    temporal_relation: str
+
+    # ------------------------------------------------------------
     # Semantic execution strategy.
+    # ------------------------------------------------------------
+
     reasoning_type: str
     answer_type: str
+
     coverage_mode: str
     selection_mode: str
+
     temporal_operation: str
     aggregation_type: str
+
     identity_requirement: str
     spatial_strategy: str
+
     required_modalities: Tuple[str, ...]
 
-    # Low-fidelity global probe.
+    # ------------------------------------------------------------
+    # Low-fidelity probe.
+    # ------------------------------------------------------------
+
     probe_fps: float
     chunk_len_s: float
     frames_per_chunk: int
 
+    # ------------------------------------------------------------
     # Candidate selection.
+    # ------------------------------------------------------------
+
     probe_topk: int | None
     action_topk: int | None
+
     candidate_threshold: float
     uncertainty_threshold: float
 
+    # ------------------------------------------------------------
     # High-fidelity refinement.
+    # ------------------------------------------------------------
+
     window_len_s: float
     high_frames_per_window: int
     high_spatial_tier: str
 
+    # ------------------------------------------------------------
     # Event consolidation.
+    # ------------------------------------------------------------
+
     merge_gap_s: float
 
+    # ------------------------------------------------------------
     # VLM answering budget.
+    # ------------------------------------------------------------
+
     vlm_budget: int
     quality_tier: str
 
-    # Correctness and fallback behavior.
+    # ------------------------------------------------------------
+    # Correctness / fallback.
+    # ------------------------------------------------------------
+
     fallback_mode: str
     min_temporal_coverage: float
+
     profile_confidence: float
     miss_risk: str
     answer_sensitivity: str
 
-    # Retrieval robustness hints used by lightweight experiment runners.
+    # ------------------------------------------------------------
+    # Execution hints.
+    # ------------------------------------------------------------
+
     evidence_type: str = "generic"
+
     expand_neighbors: bool = False
     preserve_order: bool = False
     include_uniform_anchors: bool = False
 
-    # Existing compatibility fields.
+    # ------------------------------------------------------------
+    # Agent bounds.
+    # ------------------------------------------------------------
+
+    max_steps: int = 1
+    max_local_searches: int = 1
+    max_global_scans: int = 0
+    max_count_scans: int = 0
+    max_temporal_searches: int = 0
+    max_density_refinements: int = 0
+    max_contrastive_checks: int = 0
+
+    # ------------------------------------------------------------
+    # Compatibility.
+    # ------------------------------------------------------------
+
     answer_tier: str = "heavy"
     cheap_answer_tier: str = "none"
-    max_steps: int = 1
+
     rationale: str = ""
 
 
 @dataclass
 class ProfilerResult:
     analysis: Dict[str, Any]
-    candidate_configs: List[BudgetConfig]
+
+    candidate_configs: List[
+        BudgetConfig
+    ]
+
     requested_config: BudgetConfig
     chosen_config: BudgetConfig
+
     execution_policy: Dict[str, Any]
+
     raw_json: Dict[str, Any]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "analysis": self.analysis,
+            "analysis":
+                self.analysis,
+
             "candidate_configs": [
                 asdict(config)
-                for config in self.candidate_configs
+                for config
+                in self.candidate_configs
             ],
-            "requested_config": asdict(
-                self.requested_config
-            ),
-            "chosen_config": asdict(
-                self.chosen_config
-            ),
-            "execution_policy": self.execution_policy,
-            "raw_json": self.raw_json,
+
+            "requested_config":
+                asdict(
+                    self.requested_config
+                ),
+
+            "chosen_config":
+                asdict(
+                    self.chosen_config
+                ),
+
+            "execution_policy":
+                self.execution_policy,
+
+            "raw_json":
+                self.raw_json,
         }
 
 
+
+
 # ============================================================================
-# 4. JSON parsing
+# 4. Policy catalog
 # ============================================================================
 
-def _extract_json(text: str) -> Dict[str, Any]:
-    """
-    Parse strict JSON, while tolerating accidental surrounding text.
-    """
+POLICY_CATALOG: Dict[
+    str,
+    CatalogPolicy,
+] = {
+
+    # ------------------------------------------------------------
+    # Cheap/local fixed path.
+    # ------------------------------------------------------------
+
+    "cheap": CatalogPolicy(
+        name="cheap",
+
+        probe_fps=0.015625,
+
+        probe_topk=4,
+        action_topk=4,
+
+        window_len_s=8.0,
+        vlm_budget=8,
+    ),
+
+    # ------------------------------------------------------------
+    # Slightly stronger local path.
+    # ------------------------------------------------------------
+
+    "detail": CatalogPolicy(
+        name="detail",
+
+        probe_fps=0.05,
+
+        probe_topk=4,
+        action_topk=4,
+
+        window_len_s=8.0,
+        vlm_budget=16,
+
+        expand_neighbors=True,
+    ),
+
+    # ------------------------------------------------------------
+    # Chronological/global path.
+    # ------------------------------------------------------------
+
+    "global": CatalogPolicy(
+        name="global",
+
+        probe_fps=0.015625,
+
+        probe_topk=8,
+        action_topk=8,
+
+        window_len_s=16.0,
+        vlm_budget=16,
+
+        preserve_order=True,
+        include_uniform_anchors=True,
+    ),
+
+    # ------------------------------------------------------------
+    # Sequence path.
+    # ------------------------------------------------------------
+
+    "sequence": CatalogPolicy(
+        name="sequence",
+
+        probe_fps=0.015625,
+
+        probe_topk=8,
+        action_topk=8,
+
+        window_len_s=16.0,
+        vlm_budget=16,
+
+        preserve_order=True,
+        include_uniform_anchors=True,
+    ),
+
+    # ------------------------------------------------------------
+    # Temporal anchor relation.
+    # ------------------------------------------------------------
+
+    "temporal": CatalogPolicy(
+        name="temporal",
+
+        probe_fps=0.05,
+
+        probe_topk=4,
+        action_topk=4,
+
+        window_len_s=16.0,
+        vlm_budget=16,
+
+        preserve_order=True,
+    ),
+
+    # ------------------------------------------------------------
+    # Counting.
+    # ------------------------------------------------------------
+
+    "counting": CatalogPolicy(
+        name="counting",
+
+        probe_fps=0.03125,
+
+        probe_topk=8,
+        action_topk=8,
+
+        window_len_s=8.0,
+        vlm_budget=32,
+
+        preserve_order=True,
+        include_uniform_anchors=True,
+    ),
+
+    # ------------------------------------------------------------
+    # Very long video.
+    # ------------------------------------------------------------
+
+    "long_sparse": CatalogPolicy(
+        name="long_sparse",
+
+        probe_fps=0.00390625,
+
+        probe_topk=8,
+        action_topk=8,
+
+        window_len_s=8.0,
+        vlm_budget=32,
+
+        preserve_order=True,
+        include_uniform_anchors=True,
+    ),
+}
+
+
+# ============================================================================
+# 5. Defaults
+# ============================================================================
+DEFAULT_ANALYSIS: Dict[str, Any] = {
+    # ------------------------------------------------------------
+    # Macro execution decision
+    # ------------------------------------------------------------
+    "execution_mode": "oneshot",
+    "evidence_requirement": "local",
+    "temporal_relation": "none",
+
+    # ------------------------------------------------------------
+    # Semantic question type
+    # ------------------------------------------------------------
+    "reasoning_type": "ambiguous",
+    "answer_type": "multiple_choice",
+
+    # ------------------------------------------------------------
+    # Evidence geometry
+    # ------------------------------------------------------------
+    "coverage_requirement": "targeted",
+    "selection_mode": "top_k",
+    "temporal_requirement": "local",
+    "temporal_operation": "none",
+
+    # ------------------------------------------------------------
+    # Candidate/context requirements
+    # ------------------------------------------------------------
+    "candidate_requirement": "few",
+    "context_requirement": "medium",
+
+    # ------------------------------------------------------------
+    # Visual precision
+    # ------------------------------------------------------------
+    "precision_requirement": "medium",
+    "spatial_strategy": "full_frame",
+
+    # ------------------------------------------------------------
+    # Aggregation / tracking
+    # ------------------------------------------------------------
+    "aggregation_type": "none",
+    "identity_requirement": "none",
+
+    # ------------------------------------------------------------
+    # Visual-only system
+    # ------------------------------------------------------------
+    "required_modalities": ["visual"],
+
+    # ------------------------------------------------------------
+    # Difficulty / uncertainty
+    # ------------------------------------------------------------
+    "event_density": "unknown",
+    "ambiguity": "medium",
+    "profile_confidence": 0.5,
+    "miss_risk": "medium",
+
+    # ------------------------------------------------------------
+    # Correctness / fallback
+    # ------------------------------------------------------------
+    "answer_sensitivity": "exact",
+    "fallback_requirement": "none",
+
+    # ------------------------------------------------------------
+    # Runtime semantic hint
+    # ------------------------------------------------------------
+    "evidence_type": "generic",
+
+    # ------------------------------------------------------------
+    # Human-readable profiler explanation
+    # ------------------------------------------------------------
+    "rationale": "",
+}
+
+# ============================================================================
+# 6. Query text cues
+# ============================================================================
+
+COUNTING_QUERY_TERMS = (
+    "how many",
+    "number of times",
+    "how often",
+    "count",
+    "counting",
+    "total number",
+)
+
+
+GLOBAL_SUMMARY_QUERY_TERMS = (
+    "summarize",
+    "summary",
+    "overall",
+    "overall process",
+    "overall workflow",
+    "workflow",
+    "key sequence",
+    "sequence of events",
+    "major stages",
+    "main stages",
+    "throughout the video",
+    "throughout video",
+    "from beginning to end",
+    "from start to finish",
+    "primary goal",
+    "main goal",
+    "core process",
+)
+
+
+SEQUENCE_QUERY_TERMS = (
+    "sequence of scenes",
+    "sequence of events",
+    "what order",
+    "which order",
+    "order of events",
+    "sequential order",
+    "stages",
+    "what happens next",
+    "scene to scene",
+)
+
+
+BEGINNING_QUERY_TERMS = (
+    "at the beginning",
+    "at the start",
+    "beginning of the video",
+    "start of the video",
+    "initially",
+    "starts with",
+    "starts by",
+    "opening scene",
+    "opening of the video",
+)
+
+
+END_QUERY_TERMS = (
+    "at the end",
+    "end of the video",
+    "ending of the video",
+    "final scene",
+    "finally in the video",
+    "ends with",
+    "ends by",
+)
+
+
+BEFORE_QUERY_TERMS = (
+    "before",
+    "prior to",
+    "preceding",
+)
+
+
+AFTER_QUERY_TERMS = (
+    "what happens after",
+    "what happened after",
+    "what does he do after",
+    "what does she do after",
+    "what occurs after",
+    "after the",
+    "after he",
+    "after she",
+    "after they",
+    "what happens next",
+)
+
+
+FINE_DETAIL_QUERY_TERMS = (
+    "wearing",
+    "color",
+    "colour",
+    "holding",
+    "written",
+    "text",
+    "sign",
+    "logo",
+    "glasses",
+    "pointing",
+    "looking at",
+    "wristwatch",
+    "small object",
+)
+
+
+SCREEN_STATE_QUERY_TERMS = (
+    "screen",
+    "website",
+    "cursor",
+    "display screen",
+    "on the screen",
+    "page",
+    "subtitles",
+)
+
+
+# ============================================================================
+# 7. Helpers
+# ============================================================================
+
+def _query_contains_any(
+    query: str,
+    terms: Sequence[str],
+) -> bool:
+
+    normalized = (
+        query
+        .strip()
+        .lower()
+    )
+
+    for term in terms:
+
+        if term in normalized:
+            return True
+
+    return False
+
+
+def _coerce_enum(
+    analysis: Dict[str, Any],
+    field: str,
+) -> None:
+
+    if analysis.get(
+        field
+    ) not in ALLOWED_VALUES[field]:
+
+        analysis[field] = (
+            DEFAULT_ANALYSIS[field]
+        )
+
+
+def _extract_json(
+    text: str,
+) -> Dict[str, Any]:
 
     text = text.strip()
 
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(
+            text
+        )
+
     except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
 
-        if start < 0 or end <= start:
+        start = text.find(
+            "{"
+        )
+
+        end = text.rfind(
+            "}"
+        )
+
+        if (
+            start < 0
+            or end <= start
+        ):
             raise ValueError(
-                "Could not locate a JSON object in profiler output"
+                "Could not locate JSON object "
+                "in profiler output."
             )
 
-        try:
-            parsed = json.loads(
-                text[start:end + 1]
-            )
-        except json.JSONDecodeError as error:
-            raise ValueError(
-                "Profiler returned malformed JSON"
-            ) from error
+        parsed = json.loads(
+            text[
+                start:
+                end + 1
+            ]
+        )
 
-    if not isinstance(parsed, dict):
+    if not isinstance(
+        parsed,
+        dict,
+    ):
         raise ValueError(
-            "Profiler output must be a JSON object"
+            "Profiler output must "
+            "be a JSON object."
         )
 
     return parsed
 
 
 # ============================================================================
-# 5. LLM call
+# 8. LLM call
 # ============================================================================
 
 def _call_profiler_llm(
@@ -454,52 +1124,69 @@ def _call_profiler_llm(
     api_key: str | None,
     verbose: bool,
 ) -> Dict[str, Any]:
+
     url = (
         base_url.rstrip("/")
         + "/chat/completions"
     )
 
     question_payload = {
-        "video_question": query,
-        "answer_choices": (
-            list(choices)
-            if choices is not None
-            else None
-        ),
+        "video_question":
+            query,
+
+        "answer_choices":
+            (
+                list(choices)
+                if choices is not None
+                else None
+            ),
     }
 
     user_prompt = (
-        "Profile the following video question.\n"
+        "Profile the following VideoQA query.\n"
         + json.dumps(
             question_payload,
             ensure_ascii=False,
             indent=2,
         )
-        + "\nReturn only the JSON object specified "
-        "by the system prompt."
+        + "\nReturn only the JSON object "
+        "specified by the system prompt."
     )
 
     payload = {
-        "model": model,
-        "temperature": temperature,
+        "model":
+            model,
+
+        "temperature":
+            temperature,
+
         "messages": [
             {
-                "role": "system",
-                "content": PROFILER_SYSTEM_PROMPT,
+                "role":
+                    "system",
+
+                "content":
+                    PROFILER_SYSTEM_PROMPT,
             },
             {
-                "role": "user",
-                "content": user_prompt,
+                "role":
+                    "user",
+
+                "content":
+                    user_prompt,
             },
         ],
-        "max_tokens": 1400,
+
+        "max_tokens":
+            1600,
     }
 
     headers = {
-        "Authorization": (
-            f"Bearer {api_key or 'EMPTY'}"
-        ),
-        "Content-Type": "application/json",
+        "Authorization":
+            f"Bearer {api_key or 'EMPTY'}",
+
+        "Content-Type":
+            "application/json",
     }
 
     if verbose:
@@ -507,10 +1194,7 @@ def _call_profiler_llm(
             "\n===== PROFILER REQUEST =====",
             flush=True,
         )
-        print(
-            url,
-            flush=True,
-        )
+
         print(
             json.dumps(
                 payload,
@@ -521,22 +1205,32 @@ def _call_profiler_llm(
         )
 
     try:
+
         response = requests.post(
             url,
             json=payload,
-            timeout=timeout_s,
             headers=headers,
+            timeout=timeout_s,
         )
+
         response.raise_for_status()
+
     except requests.RequestException as error:
+
         response_text = ""
 
         if (
-            getattr(error, "response", None)
+            getattr(
+                error,
+                "response",
+                None,
+            )
             is not None
         ):
             response_text = (
-                error.response.text[:2000]
+                error
+                .response
+                .text[:2000]
             )
 
         raise RuntimeError(
@@ -546,576 +1240,232 @@ def _call_profiler_llm(
         ) from error
 
     try:
-        response_json = response.json()
-        text = response_json[
-            "choices"
-        ][0]["message"]["content"]
+
+        response_json = (
+            response.json()
+        )
+
+        text = (
+            response_json[
+                "choices"
+            ][0][
+                "message"
+            ][
+                "content"
+            ]
+        )
+
     except (
         ValueError,
         KeyError,
         IndexError,
         TypeError,
     ) as error:
+
         raise RuntimeError(
-            "Profiler server returned an unexpected "
-            f"response: {response.text[:2000]}"
+            "Unexpected profiler response: "
+            + response.text[:2000]
         ) from error
 
     if verbose:
+
         print(
             "\n===== RAW PROFILER OUTPUT =====",
             flush=True,
         )
+
         print(
             text,
             flush=True,
         )
-        print(
-            "===== END RAW PROFILER OUTPUT =====\n",
-            flush=True,
-        )
 
-    return _extract_json(text)
+    return _extract_json(
+        text
+    )
 
 
 # ============================================================================
-# 6. Profile validation and coercion
+# 9. Infer temporal relation from surface form
 # ============================================================================
 
-DEFAULT_ANALYSIS: Dict[str, Any] = {
-    "reasoning_type": "ambiguous",
-    "answer_type": "short_text",
-    "coverage_requirement": "multi_region",
-    "selection_mode": "all_positive_and_uncertain",
-    "temporal_requirement": "medium",
-    "temporal_operation": "none",
-    "candidate_requirement": "medium",
-    "context_requirement": "medium",
-    "precision_requirement": "medium",
-    "aggregation_type": "none",
-    "identity_requirement": "none",
-    "spatial_strategy": "full_frame",
-    "required_modalities": ["visual"],
-    "event_density": "unknown",
-    "ambiguity": "medium",
-    "profile_confidence": 0.5,
-    "miss_risk": "medium",
-    "answer_sensitivity": "exact",
-    "fallback_requirement": "expand_coverage",
-    "evidence_type": "generic",
-    "rationale": "",
-}
-
-
-COUNTING_QUERY_TERMS = (
-    "how many",
-    "number of",
-    "count",
-    "times",
-    "total",
-)
-
-TEMPORAL_QUERY_TERMS = (
-    "before",
-    "after",
-    "first",
-    "last",
-    "sequence",
-    "then",
-    "previously",
-    "next",
-)
-
-SEQUENCE_QUERY_TERMS = (
-    "sequence of scenes",
-    "sequences of scenes",
-    "what order",
-    "which order",
-    "order of events",
-    "sequence of events",
-    "sequences of events",
-    "sequential order",
-    "order of the process",
-    "from start to finish",
-    "evolved throughout",
-    "stages",
-    "after the",
-    "first after",
-    "what happens next",
-    "scene to scene",
-)
-
-FINE_DETAIL_QUERY_TERMS = (
-    "wearing",
-    "color",
-    "colour",
-    "holding",
-    "written",
-    "text",
-    "sign",
-    "logo",
-    "glasses",
-    "style",
-    "small",
-)
-
-LOCAL_DETAIL_QUERY_TERMS = (
-    "what style",
-    "what kind",
-    "what action",
-    "what event",
-    "who is the person",
-    "appears first",
-    "object that is falling",
-    "item in this",
-    "first plant",
-    "first piece",
-    "primary tool",
-    "what changes",
-)
-
-DENSE_VISUAL_QUERY_TERMS = (
-    "screen",
-    "website",
-    "cursor",
-    "display",
-    "letters",
-    "subtitles",
-    "mountains",
-    "lake",
-    "stairs",
-    "background",
-)
-
-GLOBAL_SUMMARY_QUERY_TERMS = (
-    "summarize",
-    "overall",
-    "primary objective",
-    "primary goal",
-    "main goal",
-    "core process",
-    "compare",
-    "process that",
-)
-
-SCREEN_STATE_QUERY_TERMS = (
-    "screen",
-    "website",
-    "cursor",
-    "display screen",
-    "on the screen",
-    "what happened on the screen",
-    "screen after",
-    "page",
-)
-
-
-def infer_evidence_type(
-    *,
-    is_counting_query: bool,
-    is_sequence_query: bool,
-    is_temporal_query: bool,
-    is_fine_detail_query: bool,
-    is_local_detail_query: bool,
-    is_dense_visual_query: bool,
-    is_global_summary_query: bool,
-    is_screen_state_query: bool,
-) -> str:
-    if is_counting_query:
-        return "counting_completeness"
-    if is_screen_state_query:
-        return "screen_state_change"
-    if (
-        is_temporal_query
-        and (
-            is_fine_detail_query
-            or is_local_detail_query
-            or is_dense_visual_query
-        )
-    ):
-        return "localized_temporal_detail"
-    if is_sequence_query:
-        return "sequence_ordering"
-    if is_temporal_query:
-        return "first_or_next_event"
-    if (
-        is_fine_detail_query
-        or is_local_detail_query
-        or is_dense_visual_query
-    ):
-        return "localized_object_attribute"
-    if is_global_summary_query:
-        return "global_process"
-    return "generic"
-
-
-def _query_contains_any(
+def infer_temporal_relation(
     query: str,
-    terms: Sequence[str],
-) -> bool:
-    normalized = query.lower()
-    return any(
-        re.search(
-            r"\b" + re.escape(term) + r"\b",
-            normalized,
-        )
-        is not None
-        for term in terms
-    )
-
-
-def _promote_candidate_requirement(
-    current: str,
-    minimum: str,
 ) -> str:
-    rank = {
-        "few": 0,
-        "medium": 1,
-        "many": 2,
-    }
-    return (
-        minimum
-        if rank[current] < rank[minimum]
-        else current
-    )
+
+    if _query_contains_any(
+        query,
+        BEGINNING_QUERY_TERMS,
+    ):
+        return "beginning"
+
+    if _query_contains_any(
+        query,
+        END_QUERY_TERMS,
+    ):
+        return "end"
+
+    if _query_contains_any(
+        query,
+        BEFORE_QUERY_TERMS,
+    ):
+        return "before"
+
+    if _query_contains_any(
+        query,
+        AFTER_QUERY_TERMS,
+    ):
+        return "after"
+
+    if _query_contains_any(
+        query,
+        SEQUENCE_QUERY_TERMS,
+    ):
+        return "ordering"
+
+    return "none"
 
 
-def apply_question_risk_overrides(
+# ============================================================================
+# 10. Deterministic execution routing
+# ============================================================================
+
+def apply_execution_overrides(
     analysis: Dict[str, Any],
     *,
     query: str,
 ) -> Dict[str, Any]:
-    """
-    Add deterministic risk guards for known brittle VideoQA patterns.
 
-    The LLM is good at producing a semantic label, but it is optimistic about
-    miss risk. These text cues are conservative overrides learned from the
-    consistent-eval misses: counting needs completeness, temporal questions
-    need separated evidence, and fine-detail questions need visual precision.
-    """
-
-    is_counting_query = _query_contains_any(
-        query,
-        COUNTING_QUERY_TERMS,
-    )
-    is_temporal_query = _query_contains_any(
-        query,
-        TEMPORAL_QUERY_TERMS,
-    )
-    is_fine_detail_query = _query_contains_any(
-        query,
-        FINE_DETAIL_QUERY_TERMS,
-    )
-    is_sequence_query = _query_contains_any(
-        query,
-        SEQUENCE_QUERY_TERMS,
-    )
-    is_local_detail_query = _query_contains_any(
-        query,
-        LOCAL_DETAIL_QUERY_TERMS,
-    )
-    is_dense_visual_query = _query_contains_any(
-        query,
-        DENSE_VISUAL_QUERY_TERMS,
-    )
-    is_global_summary_query = _query_contains_any(
-        query,
-        GLOBAL_SUMMARY_QUERY_TERMS,
-    )
-    is_screen_state_query = _query_contains_any(
-        query,
-        SCREEN_STATE_QUERY_TERMS,
-    )
-    risk_triggers = set(
-        analysis.get(
-            "_risk_triggers",
-            [],
+    is_first_or_last_occurrence = (
+        _query_contains_any(
+            query,
+            FIRST_OCCURRENCE_QUERY_TERMS,
+        )
+        or _query_contains_any(
+            query,
+            LAST_OCCURRENCE_QUERY_TERMS,
         )
     )
-    evidence_type = infer_evidence_type(
-        is_counting_query=is_counting_query,
-        is_sequence_query=is_sequence_query,
-        is_temporal_query=is_temporal_query,
-        is_fine_detail_query=is_fine_detail_query,
-        is_local_detail_query=is_local_detail_query,
-        is_dense_visual_query=is_dense_visual_query,
-        is_global_summary_query=is_global_summary_query,
-        is_screen_state_query=is_screen_state_query,
+
+        # ------------------------------------------------------------
+    # FIRST / LAST OCCURRENCE
+    #
+    # "first object/person/action" is NOT the same thing as
+    # "at the beginning of the video".
+    #
+    # We must search chronologically for the occurrence.
+    # ------------------------------------------------------------
+
+    if is_first_or_last_occurrence:
+
+        analysis["execution_mode"] = "agentic"
+        analysis["evidence_requirement"] = "temporal"
+        analysis["temporal_relation"] = "ordering"
+
+        analysis["reasoning_type"] = "temporal_order"
+
+        analysis["coverage_requirement"] = "multi_region"
+        analysis["selection_mode"] = "multi_event"
+
+        analysis["temporal_requirement"] = "global"
+        analysis["temporal_operation"] = "ordering"
+
+        analysis["candidate_requirement"] = "medium"
+
+        analysis["miss_risk"] = "high"
+        analysis["fallback_requirement"] = "expand_coverage"
+
+        analysis["evidence_type"] = "first_last_occurrence"
+
+        return analysis
+    
+    is_counting = (
+        analysis[
+            "reasoning_type"
+        ] in {
+            "counting",
+            "repetition",
+        }
+        or _query_contains_any(
+            query,
+            COUNTING_QUERY_TERMS,
+        )
     )
 
-    if (
-        analysis["reasoning_type"]
-        in {"counting", "repetition"}
-        or is_counting_query
-    ):
-        analysis["reasoning_type"] = "counting"
-        analysis["answer_type"] = "count"
+    is_global = (
+        analysis[
+            "reasoning_type"
+        ] == "global_summary"
+        or _query_contains_any(
+            query,
+            GLOBAL_SUMMARY_QUERY_TERMS,
+        )
+    )
+
+    is_sequence = (
+        analysis[
+            "reasoning_type"
+        ] in {
+            "temporal_order",
+            "multi_hop",
+        }
+        or _query_contains_any(
+            query,
+            SEQUENCE_QUERY_TERMS,
+        )
+    )
+
+    relation = (
+        infer_temporal_relation(
+            query
+        )
+    )
+
+    # ------------------------------------------------------------
+    # COUNT
+    # ------------------------------------------------------------
+
+    if is_counting:
+
+        analysis[
+            "execution_mode"
+        ] = "agentic"
+
+        analysis[
+            "evidence_requirement"
+        ] = "count"
+
+        analysis[
+            "temporal_relation"
+        ] = "none"
+
+        analysis[
+            "reasoning_type"
+        ] = "counting"
+
         analysis[
             "coverage_requirement"
         ] = "full_timeline"
+
         analysis[
             "selection_mode"
         ] = "all_positive_and_uncertain"
+
         analysis[
             "temporal_requirement"
         ] = "global"
+
         analysis[
             "temporal_operation"
         ] = "frequency"
+
         analysis[
             "candidate_requirement"
         ] = "many"
-        if analysis["aggregation_type"] == "none":
+
+        if (
             analysis[
                 "aggregation_type"
-            ] = "occurrences"
-        analysis["answer_sensitivity"] = "exact"
-        analysis[
-            "fallback_requirement"
-        ] = "expand_coverage"
-        analysis["miss_risk"] = "high"
-        risk_triggers.add("counting_completeness")
-
-    if is_screen_state_query:
-        analysis["reasoning_type"] = "state_change"
-        analysis["coverage_requirement"] = "multi_region"
-        analysis["selection_mode"] = "multi_event"
-        analysis["temporal_operation"] = "state_transition"
-        analysis["precision_requirement"] = "high"
-        analysis["spatial_strategy"] = "ocr_crop"
-        analysis["fallback_requirement"] = "expand_coverage"
-        analysis["miss_risk"] = "high"
-        if "ocr" not in analysis["required_modalities"]:
-            analysis["required_modalities"].append("ocr")
-        risk_triggers.add("screen_state_change")
-
-    if (
-        analysis["reasoning_type"]
-        in {"temporal_order", "multi_hop", "causal"}
-        or is_temporal_query
-        or is_sequence_query
-    ):
-        if (
-            analysis["reasoning_type"]
-            not in {"counting", "repetition", "state_change"}
-        ):
-            if is_temporal_query or is_sequence_query:
-                analysis[
-                    "reasoning_type"
-                ] = "temporal_order"
-            analysis[
-                "coverage_requirement"
-            ] = "multi_region"
-            analysis["selection_mode"] = "multi_event"
-            if analysis["temporal_operation"] == "none":
-                analysis[
-                    "temporal_operation"
-                ] = "ordering"
-            analysis[
-                "candidate_requirement"
-            ] = _promote_candidate_requirement(
-                analysis["candidate_requirement"],
-                "medium",
-            )
-            analysis[
-                "fallback_requirement"
-            ] = "expand_coverage"
-            analysis["miss_risk"] = "high"
-            if is_sequence_query:
-                analysis["context_requirement"] = "long"
-            risk_triggers.add(
-                "temporal_sequence"
-                if is_sequence_query
-                else "multi_region_composition"
-            )
-
-    if (
-        analysis["reasoning_type"] == "fine_detail"
-        or is_fine_detail_query
-        or is_local_detail_query
-    ):
-        if analysis["reasoning_type"] not in {
-            "counting",
-            "temporal_order",
-            "state_change",
-        }:
-            analysis["reasoning_type"] = "fine_detail"
-        analysis[
-            "precision_requirement"
-        ] = "high"
-        if analysis["spatial_strategy"] == "full_frame":
-            analysis[
-                "spatial_strategy"
-            ] = "object_crop"
-        analysis[
-            "fallback_requirement"
-        ] = "expand_coverage"
-        analysis["miss_risk"] = "high"
-        risk_triggers.add("fine_detail")
-
-        if is_local_detail_query:
-            risk_triggers.add("local_detail")
-
-        if is_dense_visual_query:
-            risk_triggers.add("dense_visual_detail")
-
-    if is_global_summary_query and not risk_triggers:
-        analysis["reasoning_type"] = "global_summary"
-        analysis[
-            "coverage_requirement"
-        ] = "full_timeline"
-        analysis["selection_mode"] = "uniform"
-        analysis[
-            "temporal_requirement"
-        ] = "global"
-        analysis[
-            "context_requirement"
-        ] = "long"
-        analysis["answer_type"] = "summary"
-        risk_triggers.add("cheap_global_summary")
-
-    analysis["evidence_type"] = evidence_type
-    analysis["_risk_triggers"] = sorted(
-        risk_triggers
-    )
-
-    return analysis
-
-
-def _coerce_enum(
-    analysis: Dict[str, Any],
-    field: str,
-) -> None:
-    allowed = ALLOWED_VALUES[field]
-    value = analysis.get(field)
-
-    if value not in allowed:
-        analysis[field] = (
-            DEFAULT_ANALYSIS[field]
-        )
-
-
-def _normalize_modalities(
-    value: Any,
-) -> List[str]:
-    if not isinstance(value, list):
-        return ["visual"]
-
-    result: List[str] = []
-
-    for modality in value:
-        if (
-            isinstance(modality, str)
-            and modality in ALLOWED_MODALITIES
-            and modality not in result
-        ):
-            result.append(modality)
-
-    if not result:
-        result.append("visual")
-
-    return result
-
-
-def coerce_and_validate_analysis(
-    raw_analysis: Dict[str, Any],
-    *,
-    query: str = "",
-) -> Dict[str, Any]:
-    """
-    Normalize the LLM output and enforce hard policy invariants.
-
-    The LLM estimates evidence structure. This function prevents invalid
-    combinations from reaching the execution-policy compiler.
-    """
-
-    has_profile_confidence = (
-        isinstance(raw_analysis, dict)
-        and "profile_confidence" in raw_analysis
-    )
-
-    if not isinstance(raw_analysis, dict):
-        raw_analysis = {}
-
-    analysis = {
-        **DEFAULT_ANALYSIS,
-        **raw_analysis,
-    }
-
-    for field in ALLOWED_VALUES:
-        _coerce_enum(
-            analysis,
-            field,
-        )
-
-    analysis["required_modalities"] = (
-        _normalize_modalities(
-            analysis.get(
-                "required_modalities"
-            )
-        )
-    )
-
-    try:
-        confidence = float(
-            analysis.get(
-                "profile_confidence",
-                0.5,
-            )
-        )
-    except (TypeError, ValueError):
-        confidence = 0.5
-
-    analysis["profile_confidence"] = max(
-        0.0,
-        min(1.0, confidence),
-    )
-
-    rationale = analysis.get(
-        "rationale",
-        "",
-    )
-
-    if not isinstance(rationale, str):
-        rationale = str(rationale)
-
-    analysis["rationale"] = rationale[
-        :1000
-    ]
-
-    reasoning_type = analysis[
-        "reasoning_type"
-    ]
-
-    # ------------------------------------------------------------------
-    # Counting invariants
-    # ------------------------------------------------------------------
-
-    if reasoning_type == "counting":
-        analysis["answer_type"] = "count"
-        analysis[
-            "coverage_requirement"
-        ] = "full_timeline"
-
-        analysis[
-            "temporal_requirement"
-        ] = "global"
-
-        analysis[
-            "temporal_operation"
-        ] = "frequency"
-
-        analysis[
-            "candidate_requirement"
-        ] = "many"
-
-        if analysis["selection_mode"] == "top_k":
-            analysis[
-                "selection_mode"
-            ] = "all_positive_and_uncertain"
-
-        if (
-            analysis["aggregation_type"]
+            ]
             == "none"
         ):
             analysis[
@@ -1126,91 +1476,162 @@ def coerce_and_validate_analysis(
             "answer_sensitivity"
         ] = "exact"
 
-        if (
-            analysis["fallback_requirement"]
-            == "none"
-        ):
-            analysis[
-                "fallback_requirement"
-            ] = "expand_coverage"
+        analysis[
+            "miss_risk"
+        ] = "high"
 
-        analysis["miss_risk"] = (
-            "high"
-            if analysis[
-                "profile_confidence"
-            ] < 0.8
-            else analysis["miss_risk"]
-        )
+        analysis[
+            "fallback_requirement"
+        ] = "expand_coverage"
 
-    # ------------------------------------------------------------------
-    # Repetition invariants
-    # ------------------------------------------------------------------
+        analysis[
+            "evidence_type"
+        ] = "counting_completeness"
 
-    if reasoning_type == "repetition":
+        return analysis
+
+    # ------------------------------------------------------------
+    # Explicit BEFORE / AFTER
+    # ------------------------------------------------------------
+
+    if relation in {
+        "before",
+        "after",
+    }:
+
+        analysis[
+            "execution_mode"
+        ] = "agentic"
+
+        analysis[
+            "evidence_requirement"
+        ] = "temporal"
+
+        analysis[
+            "temporal_relation"
+        ] = relation
+
+        analysis[
+            "reasoning_type"
+        ] = "temporal_order"
+
         analysis[
             "coverage_requirement"
-        ] = "full_timeline"
+        ] = "multi_region"
+
+        analysis[
+            "selection_mode"
+        ] = "multi_event"
 
         analysis[
             "temporal_requirement"
-        ] = "global"
+        ] = "medium"
 
         analysis[
             "temporal_operation"
-        ] = "frequency"
+        ] = "before_after"
 
-        if analysis["selection_mode"] == "top_k":
-            analysis[
-                "selection_mode"
-            ] = "all_positive_and_uncertain"
-
-        if (
-            analysis["fallback_requirement"]
-            == "none"
-        ):
-            analysis[
-                "fallback_requirement"
-            ] = "expand_coverage"
-
-    # ------------------------------------------------------------------
-    # Fine-detail invariants
-    # ------------------------------------------------------------------
-
-    if reasoning_type == "fine_detail":
         analysis[
-            "precision_requirement"
+            "miss_risk"
         ] = "high"
 
-        if (
-            analysis["spatial_strategy"]
-            == "full_frame"
-        ):
-            modalities = set(
-                analysis["required_modalities"]
-            )
+        analysis[
+            "evidence_type"
+        ] = "anchor_temporal_relation"
 
-            if "ocr" in modalities:
-                analysis[
-                    "spatial_strategy"
-                ] = "ocr_crop"
-            else:
-                analysis[
-                    "spatial_strategy"
-                ] = "object_crop"
+        return analysis
 
-        if (
-            analysis["fallback_requirement"]
-            == "none"
-        ):
+    # ------------------------------------------------------------
+    # Beginning/end are fixed direct boundary programs.
+    # ------------------------------------------------------------
+
+    if relation in {
+        "beginning",
+        "end",
+    }:
+
+        analysis[
+            "execution_mode"
+        ] = "oneshot"
+
+        analysis[
+            "evidence_requirement"
+        ] = "temporal"
+
+        analysis[
+            "temporal_relation"
+        ] = relation
+
+        analysis[
+            "coverage_requirement"
+        ] = "targeted"
+
+        analysis[
+            "selection_mode"
+        ] = "beginning_end"
+
+        analysis[
+            "temporal_requirement"
+        ] = "local"
+
+        analysis[
+            "temporal_operation"
+        ] = "ordering"
+
+        analysis[
+            "candidate_requirement"
+        ] = "few"
+
+        analysis[
+            "evidence_type"
+        ] = (
+            "boundary_beginning"
+            if relation
+            == "beginning"
+            else "boundary_end"
+        )
+
+        return analysis
+
+    # ------------------------------------------------------------
+    # GLOBAL / workflow / sequence
+    # ------------------------------------------------------------
+
+    if (
+        is_global
+        or is_sequence
+    ):
+
+        analysis[
+            "execution_mode"
+        ] = "agentic"
+
+        analysis[
+            "evidence_requirement"
+        ] = "global"
+
+        analysis[
+            "temporal_relation"
+        ] = (
+            "ordering"
+            if is_sequence
+            else "none"
+        )
+
+        if is_sequence:
             analysis[
-                "fallback_requirement"
-            ] = "expand_coverage"
+                "reasoning_type"
+            ] = "temporal_order"
 
-    # ------------------------------------------------------------------
-    # Global-summary invariants
-    # ------------------------------------------------------------------
+            analysis[
+                "temporal_operation"
+            ] = "ordering"
 
-    if reasoning_type == "global_summary":
+        else:
+            analysis[
+                "reasoning_type"
+            ] = "global_summary"
+
         analysis[
             "coverage_requirement"
         ] = "full_timeline"
@@ -1228,175 +1649,558 @@ def coerce_and_validate_analysis(
         ] = "long"
 
         analysis[
-            "answer_type"
-        ] = "summary"
-
-    # ------------------------------------------------------------------
-    # Temporal and multi-hop invariants
-    # ------------------------------------------------------------------
-
-    if reasoning_type == "temporal_order":
-        analysis[
-            "coverage_requirement"
-        ] = "multi_region"
+            "candidate_requirement"
+        ] = "many"
 
         analysis[
-            "selection_mode"
-        ] = "multi_event"
+            "evidence_type"
+        ] = (
+            "sequence_ordering"
+            if is_sequence
+            else "global_process"
+        )
 
-        analysis[
-            "temporal_operation"
-        ] = "ordering"
+        return analysis
 
+    # ------------------------------------------------------------
+    # LOCAL
+    #
+    # Important architectural rule:
+    #
+    # LOCAL does not mean open-ended agent search.
+    #
+    # Perform at most one semantic localization pass.
+    # ------------------------------------------------------------
+
+    analysis[
+        "execution_mode"
+    ] = "oneshot"
+
+    analysis[
+        "evidence_requirement"
+    ] = "local"
+
+    analysis[
+        "temporal_relation"
+    ] = "none"
+
+    analysis[
+        "coverage_requirement"
+    ] = "targeted"
+
+    analysis[
+        "selection_mode"
+    ] = "top_k"
+
+    analysis[
+        "temporal_requirement"
+    ] = "local"
+
+    if (
         analysis[
             "candidate_requirement"
-        ] = (
-            "medium"
-            if analysis[
-                "candidate_requirement"
-            ] == "few"
-            else analysis[
-                "candidate_requirement"
-            ]
-        )
-
-    if reasoning_type == "multi_hop":
-        analysis[
-            "coverage_requirement"
-        ] = "multi_region"
-
-        analysis[
-            "selection_mode"
-        ] = "multi_event"
-
-        if (
-            analysis["temporal_operation"]
-            == "none"
-        ):
-            analysis[
-                "temporal_operation"
-            ] = "cross_segment_comparison"
-
-    # ------------------------------------------------------------------
-    # State-change invariants
-    # ------------------------------------------------------------------
-
-    if reasoning_type == "state_change":
-        analysis[
-            "coverage_requirement"
-        ] = "multi_region"
-
-        analysis[
-            "selection_mode"
-        ] = "beginning_end"
-
-        analysis[
-            "temporal_operation"
-        ] = "state_transition"
-
-    # ------------------------------------------------------------------
-    # Ambiguity and low-confidence invariants
-    # ------------------------------------------------------------------
-
-    if (
-        reasoning_type == "ambiguous"
-        or analysis["ambiguity"] == "high"
-        or (
-            has_profile_confidence
-            and analysis["profile_confidence"] < 0.55
-        )
+        ]
+        == "many"
     ):
+        analysis[
+            "candidate_requirement"
+        ] = "medium"
+
+    if _query_contains_any(
+        query,
+        FINE_DETAIL_QUERY_TERMS,
+    ):
+
+        analysis[
+            "reasoning_type"
+        ] = "fine_detail"
+
+        analysis[
+            "precision_requirement"
+        ] = "high"
+
         if (
-            analysis["coverage_requirement"]
-            == "targeted"
+            analysis[
+                "spatial_strategy"
+            ]
+            == "full_frame"
         ):
             analysis[
-                "coverage_requirement"
-            ] = "multi_region"
+                "spatial_strategy"
+            ] = "object_crop"
 
-        if analysis["selection_mode"] == "top_k":
-            analysis[
-                "selection_mode"
-            ] = "all_positive_and_uncertain"
+        analysis[
+            "evidence_type"
+        ] = "localized_visual_detail"
+
+    else:
 
         if (
-            analysis["fallback_requirement"]
-            == "none"
+            analysis[
+                "reasoning_type"
+            ]
+            == "ambiguous"
         ):
             analysis[
-                "fallback_requirement"
-            ] = "expand_coverage"
+                "reasoning_type"
+            ] = "local_event"
 
-        analysis["miss_risk"] = "high"
+        analysis[
+            "evidence_type"
+        ] = "localized_event"
 
-    # Distinct-identity counting requires tracking.
+    return analysis
+
+
+# ============================================================================
+# 11. Validate/coerce LLM analysis
+# ============================================================================
+
+def coerce_and_validate_analysis(
+    raw_analysis: Dict[str, Any],
+    *,
+    query: str = "",
+) -> Dict[str, Any]:
+
+    if not isinstance(
+        raw_analysis,
+        dict,
+    ):
+        raw_analysis = {}
+
+    analysis = {
+        **DEFAULT_ANALYSIS,
+        **raw_analysis,
+    }
+
+    analysis["required_modalities"] = ["visual"]
+
+    for field in ALLOWED_VALUES:
+        _coerce_enum(
+            analysis,
+            field,
+        )
+
+    # Visual-only experiment.
+    # Never allow profiler output to introduce another modality.
+
+    try:
+        confidence = float(
+            analysis.get(
+                "profile_confidence",
+                0.5,
+            )
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        confidence = 0.5
+
+    analysis[
+        "profile_confidence"
+    ] = max(
+        0.0,
+        min(
+            1.0,
+            confidence,
+        ),
+    )
+
+    rationale = analysis.get(
+        "rationale",
+        "",
+    )
+
+    if not isinstance(
+        rationale,
+        str,
+    ):
+        rationale = str(
+            rationale
+        )
+
+    analysis[
+        "rationale"
+    ] = rationale[:1000]
+
+    # ------------------------------------------------------------
+    # Basic semantic invariants.
+    # ------------------------------------------------------------
+
+    reasoning_type = (
+        analysis[
+            "reasoning_type"
+        ]
+    )
+
+    if reasoning_type == "fine_detail":
+        analysis["precision_requirement"] = "high"
+
+        if analysis["spatial_strategy"] == "full_frame":
+            analysis["spatial_strategy"] = "object_crop"
+
     if (
-        analysis["aggregation_type"]
+        analysis[
+            "aggregation_type"
+        ]
         == "distinct_entities"
         and analysis[
             "identity_requirement"
-        ] == "none"
+        ]
+        == "none"
     ):
         analysis[
             "identity_requirement"
-        ] = "cross_window_reidentification"
+        ] = (
+            "cross_window_reidentification"
+        )
 
-    # OCR questions require OCR modality.
-    if (
-        analysis["spatial_strategy"]
-        == "ocr_crop"
-        and "ocr"
-        not in analysis[
-            "required_modalities"
-        ]
-    ):
-        analysis[
-            "required_modalities"
-        ].append("ocr")
+    # ------------------------------------------------------------
+    # Macro routing is applied LAST.
+    #
+    # This prevents semantic labels from overriding the execution
+    # geometry.
+    # ------------------------------------------------------------
 
-    analysis = apply_question_risk_overrides(
-        analysis,
-        query=query,
+    analysis = (
+        apply_execution_overrides(
+            analysis,
+            query=query,
+        )
     )
 
     return analysis
 
 
 # ============================================================================
-# 7. Numeric policy helpers
+# 12. Cheap router
+# ============================================================================
+
+def route_query_cheap(
+    query: str,
+    *,
+    duration_s: float,
+    choices: Sequence[str] | None = None,
+) -> RouterDecision:
+
+    is_first_or_last_occurrence = (
+        _query_contains_any(
+            query,
+            FIRST_OCCURRENCE_QUERY_TERMS,
+        )
+        or _query_contains_any(
+            query,
+            LAST_OCCURRENCE_QUERY_TERMS,
+        )
+    )
+    # ------------------------------------------------------------
+    # First / last occurrence.
+    # ------------------------------------------------------------
+    if is_first_or_last_occurrence:
+        return RouterDecision(
+            policy_name="temporal",
+            execution_mode="agentic",
+            evidence_requirement="temporal",
+            temporal_relation="ordering",
+            confidence=0.94,
+            reason="first_last_occurrence",
+        )
+
+    relation = (
+        infer_temporal_relation(
+            query
+        )
+    )
+
+    is_counting = (
+        _query_contains_any(
+            query,
+            COUNTING_QUERY_TERMS,
+        )
+    )
+
+    is_global = (
+        _query_contains_any(
+            query,
+            GLOBAL_SUMMARY_QUERY_TERMS,
+        )
+    )
+
+    is_sequence = (
+        _query_contains_any(
+            query,
+            SEQUENCE_QUERY_TERMS,
+        )
+    )
+
+    is_detail = (
+        _query_contains_any(
+            query,
+            FINE_DETAIL_QUERY_TERMS,
+        )
+        or _query_contains_any(
+            query,
+            SCREEN_STATE_QUERY_TERMS,
+        )
+    )
+
+    # ------------------------------------------------------------
+    # Count.
+    # ------------------------------------------------------------
+
+    if is_counting:
+
+        return RouterDecision(
+            policy_name=
+                "counting",
+
+            execution_mode=
+                "agentic",
+
+            evidence_requirement=
+                "count",
+
+            temporal_relation=
+                "none",
+
+            confidence=
+                0.98,
+
+            reason=
+                "counting",
+        )
+
+    # ------------------------------------------------------------
+    # Before/after.
+    # ------------------------------------------------------------
+
+    if relation in {
+        "before",
+        "after",
+    }:
+
+        return RouterDecision(
+            policy_name=
+                "temporal",
+
+            execution_mode=
+                "agentic",
+
+            evidence_requirement=
+                "temporal",
+
+            temporal_relation=
+                relation,
+
+            confidence=
+                0.94,
+
+            reason=
+                f"temporal_{relation}",
+        )
+
+    # ------------------------------------------------------------
+    # Beginning/end.
+    # ------------------------------------------------------------
+
+    if relation in {
+        "beginning",
+        "end",
+    }:
+
+        return RouterDecision(
+            policy_name=
+                "detail",
+
+            execution_mode=
+                "oneshot",
+
+            evidence_requirement=
+                "temporal",
+
+            temporal_relation=
+                relation,
+
+            confidence=
+                0.95,
+
+            reason=
+                f"boundary_{relation}",
+        )
+
+    # ------------------------------------------------------------
+    # Global.
+    # ------------------------------------------------------------
+
+    if (
+        is_global
+        or is_sequence
+    ):
+
+        return RouterDecision(
+            policy_name=(
+                "sequence"
+                if is_sequence
+                else "global"
+            ),
+
+            execution_mode=
+                "agentic",
+
+            evidence_requirement=
+                "global",
+
+            temporal_relation=(
+                "ordering"
+                if is_sequence
+                else "none"
+            ),
+
+            confidence=
+                0.94,
+
+            reason=(
+                "sequence"
+                if is_sequence
+                else "global"
+            ),
+        )
+
+    # ------------------------------------------------------------
+    # Very long but localized questions stay local.
+    #
+    # Length alone should NOT turn them into global agent search.
+    # ------------------------------------------------------------
+
+    if is_detail:
+
+        return RouterDecision(
+            policy_name=(
+                "long_sparse"
+                if duration_s >= 1200
+                else "detail"
+            ),
+
+            execution_mode=
+                "oneshot",
+
+            evidence_requirement=
+                "local",
+
+            temporal_relation=
+                "none",
+
+            confidence=
+                0.90,
+
+            reason=
+                "local_detail",
+        )
+
+    # ------------------------------------------------------------
+    # Generic MCQ.
+    # ------------------------------------------------------------
+
+    if choices:
+
+        return RouterDecision(
+            policy_name=(
+                "long_sparse"
+                if duration_s >= 1200
+                else "cheap"
+            ),
+
+            execution_mode=
+                "oneshot",
+
+            evidence_requirement=
+                "local",
+
+            temporal_relation=
+                "none",
+
+            confidence=
+                0.80,
+
+            reason=
+                "generic_local_mcq",
+        )
+
+    # ------------------------------------------------------------
+    # Unknown -> LLM.
+    # ------------------------------------------------------------
+
+    return RouterDecision(
+        policy_name=
+            "cheap",
+
+        execution_mode=
+            "oneshot",
+
+        evidence_requirement=
+            "local",
+
+        temporal_relation=
+            "none",
+
+        confidence=
+            0.40,
+
+        reason=
+            "uncertain",
+
+        out_of_distribution=
+            True,
+    )
+
+
+# ============================================================================
+# 13. Numeric helpers
 # ============================================================================
 
 def choose_topk(
     requirement: str,
 ) -> int:
+
     return {
         "few": 4,
-        "medium": 8,
-        "many": 16,
-    }[requirement]
+        "medium": 6,
+        "many": 8,
+    }[
+        requirement
+    ]
 
 
 def choose_window_length(
+    *,
     context_requirement: str,
-    reasoning_type: str,
+    evidence_requirement: str,
 ) -> float:
+
     base = {
         "short": 4.0,
         "medium": 8.0,
         "long": 16.0,
-    }[context_requirement]
+    }[
+        context_requirement
+    ]
 
-    if reasoning_type == "causal":
-        return max(base, 16.0)
-
-    if reasoning_type in {
-        "temporal_order",
-        "multi_hop",
+    if evidence_requirement in {
+        "temporal",
+        "global",
     }:
-        return max(base, 12.0)
+        return max(
+            base,
+            16.0,
+        )
 
-    if reasoning_type == "counting":
-        return max(base, 8.0)
+    if evidence_requirement == "count":
+        return max(
+            base,
+            8.0,
+        )
 
     return base
 
@@ -1404,111 +2208,80 @@ def choose_window_length(
 def choose_vlm_budget(
     precision_requirement: str,
 ) -> int:
+
     return {
-        "low": 16,
-        "medium": 32,
-        "high": 64,
-    }[precision_requirement]
-
-
-def choose_chunk_scan(
-    *,
-    reasoning_type: str,
-    duration_s: float,
-    event_density: str,
-    miss_risk: str,
-) -> Tuple[float, int]:
-    """
-    Return:
-        chunk_len_s,
-        frames_per_chunk
-
-    Full-timeline tasks preserve coverage by assigning at least one frame
-    to every chunk. The resource adapter may lower frames per chunk, but
-    it should not silently discard chunks.
-    """
-
-    if reasoning_type in {
-        "counting",
-        "repetition",
-    }:
-        if event_density == "dense":
-            chunk_len_s = 4.0
-            frames_per_chunk = 4
-        elif event_density == "sparse":
-            chunk_len_s = 8.0
-            frames_per_chunk = 3
-        else:
-            chunk_len_s = 8.0
-            frames_per_chunk = 3
-
-    elif reasoning_type in {
-        "temporal_order",
-        "multi_hop",
-        "state_change",
-    }:
-        chunk_len_s = 12.0
-        frames_per_chunk = 2
-
-    elif reasoning_type == "global_summary":
-        chunk_len_s = 16.0
-        frames_per_chunk = 2
-
-    elif reasoning_type == "fine_detail":
-        chunk_len_s = 12.0
-        frames_per_chunk = 1
-
-    else:
-        chunk_len_s = 16.0
-        frames_per_chunk = 1
-
-    # Short videos can use denser global probes.
-    if duration_s <= 60:
-        chunk_len_s = min(
-            chunk_len_s,
-            4.0,
-        )
-        frames_per_chunk = max(
-            frames_per_chunk,
-            2,
-        )
-
-    elif duration_s <= 300:
-        chunk_len_s = min(
-            chunk_len_s,
-            8.0,
-        )
-
-    # High miss risk should receive denser temporal evidence.
-    if miss_risk == "high":
-        frames_per_chunk += 1
-
-    return (
-        chunk_len_s,
-        frames_per_chunk,
-    )
+        "low": 8,
+        "medium": 16,
+        "high": 32,
+    }[
+        precision_requirement
+    ]
 
 
 def choose_high_frames_per_window(
     *,
-    reasoning_type: str,
+    evidence_requirement: str,
     precision_requirement: str,
 ) -> int:
-    if reasoning_type == "fine_detail":
-        return 24
 
-    if precision_requirement == "high":
+    if (
+        precision_requirement
+        == "high"
+    ):
         return 16
 
-    if reasoning_type in {
-        "counting",
-        "repetition",
-        "temporal_order",
-        "multi_hop",
+    if evidence_requirement in {
+        "count",
+        "temporal",
     }:
         return 12
 
     return 8
+
+
+def choose_thresholds(
+    *,
+    evidence_requirement: str,
+    miss_risk: str,
+) -> Tuple[
+    float,
+    float,
+]:
+
+    if evidence_requirement == "count":
+
+        candidate = 0.35
+        uncertainty = 0.15
+
+    elif evidence_requirement in {
+        "global",
+        "temporal",
+    }:
+
+        candidate = 0.40
+        uncertainty = 0.20
+
+    else:
+
+        candidate = 0.45
+        uncertainty = 0.25
+
+    if miss_risk == "high":
+
+        candidate -= 0.05
+        uncertainty -= 0.05
+
+    return (
+        max(
+            0.0,
+            candidate,
+        ),
+
+        max(
+            0.0,
+            uncertainty,
+        ),
+    )
 
 
 def choose_spatial_tier(
@@ -1516,75 +2289,26 @@ def choose_spatial_tier(
     precision_requirement: str,
     spatial_strategy: str,
 ) -> str:
-    if spatial_strategy in {
-        "ocr_crop",
-        "face_crop",
-        "object_crop",
-        "multi_crop",
-    }:
-        return "high_crop"
 
     return {
         "low": "low",
         "medium": "medium",
         "high": "high",
-    }[precision_requirement]
-
-
-def choose_thresholds(
-    *,
-    reasoning_type: str,
-    miss_risk: str,
-) -> Tuple[float, float]:
-    """
-    Return:
-        candidate_threshold,
-        uncertainty_threshold
-
-    Lower thresholds retain more candidates and improve recall.
-    """
-
-    if reasoning_type in {
-        "counting",
-        "repetition",
-    }:
-        candidate = 0.35
-        uncertainty = 0.15
-
-    elif reasoning_type in {
-        "temporal_order",
-        "multi_hop",
-        "causal",
-    }:
-        candidate = 0.40
-        uncertainty = 0.20
-
-    else:
-        candidate = 0.45
-        uncertainty = 0.25
-
-    if miss_risk == "high":
-        candidate -= 0.05
-        uncertainty -= 0.05
-
-    return (
-        max(0.0, candidate),
-        max(0.0, uncertainty),
-    )
+    }[
+        precision_requirement
+    ]
 
 
 def choose_merge_gap(
-    reasoning_type: str,
+    evidence_requirement: str,
 ) -> float:
-    if reasoning_type in {
-        "counting",
-        "repetition",
-    }:
+
+    if evidence_requirement == "count":
         return 2.0
 
-    if reasoning_type in {
-        "temporal_order",
-        "multi_hop",
+    if evidence_requirement in {
+        "temporal",
+        "global",
     }:
         return 1.0
 
@@ -1592,7 +2316,118 @@ def choose_merge_gap(
 
 
 # ============================================================================
-# 8. Compile semantic profile into requested numeric configuration
+# 14. Agent bounds
+# ============================================================================
+
+def choose_agent_bounds(
+    *,
+    execution_mode: str,
+    evidence_requirement: str,
+    temporal_relation: str,
+) -> Dict[str, int]:
+
+    # ------------------------------------------------------------
+    # Fixed / bounded one-shot programs.
+    # ------------------------------------------------------------
+
+    if execution_mode == "oneshot":
+
+        if evidence_requirement == "local":
+            return {
+                "max_steps": 2,
+                "max_local_searches": 1,
+                "max_global_scans": 0,
+                "max_count_scans": 0,
+                "max_temporal_searches": 0,
+                "max_density_refinements": 1,
+                "max_contrastive_checks": 1,
+            }
+
+        if (
+            evidence_requirement == "temporal"
+            and temporal_relation in {
+                "beginning",
+                "end",
+            }
+        ):
+            return {
+                "max_steps": 2,
+                "max_local_searches": 0,
+                "max_global_scans": 0,
+                "max_count_scans": 0,
+                "max_temporal_searches": 0,
+                "max_density_refinements": 1,
+                "max_contrastive_checks": 1,
+            }
+
+        return {
+            "max_steps": 1,
+            "max_local_searches": 0,
+            "max_global_scans": 0,
+            "max_count_scans": 0,
+            "max_temporal_searches": 0,
+            "max_density_refinements": 0,
+            "max_contrastive_checks": 0,
+        }
+
+    # ------------------------------------------------------------
+    # Global chronological execution.
+    # ------------------------------------------------------------
+
+    if evidence_requirement == "global":
+        return {
+            "max_steps": 2,
+            "max_local_searches": 0,
+            "max_global_scans": 2,
+            "max_count_scans": 0,
+            "max_temporal_searches": 0,
+            "max_density_refinements": 1,
+            "max_contrastive_checks": 0,
+        }
+
+    # ------------------------------------------------------------
+    # Counting.
+    # ------------------------------------------------------------
+
+    if evidence_requirement == "count":
+        return {
+            "max_steps": 4,
+            "max_local_searches": 0,
+            "max_global_scans": 0,
+            "max_count_scans": 1,
+            "max_temporal_searches": 2,
+            "max_density_refinements": 2,
+            "max_contrastive_checks": 0,
+        }
+
+    # ------------------------------------------------------------
+    # Temporal relationship / first-last occurrence.
+    # ------------------------------------------------------------
+
+    if evidence_requirement == "temporal":
+        return {
+            "max_steps": 3,
+            "max_local_searches": 1,
+            "max_global_scans": 0,
+            "max_count_scans": 0,
+            "max_temporal_searches": 1,
+            "max_density_refinements": 1,
+            "max_contrastive_checks": 1,
+        }
+
+    return {
+        "max_steps": 2,
+        "max_local_searches": 1,
+        "max_global_scans": 0,
+        "max_count_scans": 0,
+        "max_temporal_searches": 0,
+        "max_density_refinements": 1,
+        "max_contrastive_checks": 1,
+    }
+
+
+# ============================================================================
+# 15. Compile profile -> requested config
 # ============================================================================
 
 def compile_execution_policy(
@@ -1600,622 +2435,963 @@ def compile_execution_policy(
     analysis: Dict[str, Any],
     duration_s: float,
 ) -> BudgetConfig:
+
     if duration_s <= 0:
         raise ValueError(
             "duration_s must be positive"
         )
 
-    reasoning_type = analysis[
-        "reasoning_type"
-    ]
-
-    coverage_mode = analysis[
-        "coverage_requirement"
-    ]
-
-    selection_mode = analysis[
-        "selection_mode"
-    ]
-
-    chunk_len_s, frames_per_chunk = (
-        choose_chunk_scan(
-            reasoning_type=reasoning_type,
-            duration_s=duration_s,
-            event_density=analysis[
-                "event_density"
-            ],
-            miss_risk=analysis[
-                "miss_risk"
-            ],
-        )
-    )
-
-    probe_fps = (
-        frames_per_chunk
-        / chunk_len_s
-    )
-
-    if selection_mode == "top_k":
-        topk: int | None = choose_topk(
-            analysis[
-                "candidate_requirement"
-            ]
-        )
-    else:
-        topk = None
-
-    window_len_s = choose_window_length(
+    execution_mode = (
         analysis[
-            "context_requirement"
-        ],
-        reasoning_type,
-    )
-
-    if reasoning_type in {
-        "counting",
-        "repetition",
-    }:
-        window_len_s = max(
-            window_len_s,
-            chunk_len_s,
-        )
-
-    vlm_budget = choose_vlm_budget(
-        analysis[
-            "precision_requirement"
+            "execution_mode"
         ]
     )
 
-    if reasoning_type == "fine_detail":
-        vlm_budget = max(
-            vlm_budget,
-            64,
+    requirement = (
+        analysis[
+            "evidence_requirement"
+        ]
+    )
+
+    relation = (
+        analysis[
+            "temporal_relation"
+        ]
+    )
+
+    # ------------------------------------------------------------
+    # Scan defaults.
+    # ------------------------------------------------------------
+
+    if requirement == "count":
+
+        probe_fps = 0.03125
+        chunk_len_s = (
+            1.0
+            / probe_fps
+        )
+        frames_per_chunk = 1
+
+    elif requirement == "global":
+
+        probe_fps = (
+            0.015625
+            if duration_s < 1200
+            else 0.00390625
         )
 
-    if reasoning_type in {
-        "counting",
-        "repetition",
-        "global_summary",
-    }:
-        vlm_budget = max(
-            vlm_budget,
-            32,
+        chunk_len_s = (
+            1.0
+            / probe_fps
         )
+
+        frames_per_chunk = 1
+
+    elif requirement == "temporal":
+
+        probe_fps = 0.05
+        chunk_len_s = 20.0
+        frames_per_chunk = 1
+
+    else:
+
+        probe_fps = (
+            0.05
+            if duration_s < 1200
+            else 0.00390625
+        )
+
+        chunk_len_s = (
+            1.0
+            / probe_fps
+        )
+
+        frames_per_chunk = 1
+
+    # ------------------------------------------------------------
+    # Top-k.
+    # ------------------------------------------------------------
+
+    if (
+        analysis[
+            "selection_mode"
+        ]
+        == "top_k"
+    ):
+
+        topk: int | None = (
+            choose_topk(
+                analysis[
+                    "candidate_requirement"
+                ]
+            )
+        )
+
+    else:
+
+        topk = None
+
+    # ------------------------------------------------------------
+    # Window.
+    # ------------------------------------------------------------
+
+    window_len_s = (
+        choose_window_length(
+            context_requirement=
+                analysis[
+                    "context_requirement"
+                ],
+
+            evidence_requirement=
+                requirement,
+        )
+    )
+
+    # ------------------------------------------------------------
+    # Budgets.
+    # ------------------------------------------------------------
+
+    vlm_budget = (
+        choose_vlm_budget(
+            analysis[
+                "precision_requirement"
+            ]
+        )
+    )
+
+    if requirement == "count":
+        vlm_budget = max(
+            32,
+            vlm_budget,
+        )
+
+    if requirement == "global":
+        vlm_budget = max(
+            16,
+            vlm_budget,
+        )
+
+    high_frames = (
+        choose_high_frames_per_window(
+            evidence_requirement=
+                requirement,
+
+            precision_requirement=
+                analysis[
+                    "precision_requirement"
+                ],
+        )
+    )
 
     candidate_threshold, uncertainty_threshold = (
         choose_thresholds(
-            reasoning_type=reasoning_type,
-            miss_risk=analysis[
+            evidence_requirement=
+                requirement,
+
+            miss_risk=
+                analysis[
+                    "miss_risk"
+                ],
+        )
+    )
+
+    bounds = (
+        choose_agent_bounds(
+            execution_mode=
+                execution_mode,
+
+            evidence_requirement=
+                requirement,
+
+            temporal_relation=
+                relation,
+        )
+    )
+
+    return BudgetConfig(
+        name=(
+            f"dynamic_"
+            f"{execution_mode}_"
+            f"{requirement}"
+        ),
+
+        execution_mode=
+            execution_mode,
+
+        evidence_requirement=
+            requirement,
+
+        temporal_relation=
+            relation,
+
+        reasoning_type=
+            analysis[
+                "reasoning_type"
+            ],
+
+        answer_type=
+            analysis[
+                "answer_type"
+            ],
+
+        coverage_mode=
+            analysis[
+                "coverage_requirement"
+            ],
+
+        selection_mode=
+            analysis[
+                "selection_mode"
+            ],
+
+        temporal_operation=
+            analysis[
+                "temporal_operation"
+            ],
+
+        aggregation_type=
+            analysis[
+                "aggregation_type"
+            ],
+
+        identity_requirement=
+            analysis[
+                "identity_requirement"
+            ],
+
+        spatial_strategy=
+            analysis[
+                "spatial_strategy"
+            ],
+
+        required_modalities=
+            tuple(
+                analysis[
+                    "required_modalities"
+                ]
+            ),
+
+        probe_fps=
+            probe_fps,
+
+        chunk_len_s=
+            chunk_len_s,
+
+        frames_per_chunk=
+            frames_per_chunk,
+
+        probe_topk=
+            topk,
+
+        action_topk=
+            topk,
+
+        candidate_threshold=
+            candidate_threshold,
+
+        uncertainty_threshold=
+            uncertainty_threshold,
+
+        window_len_s=
+            window_len_s,
+
+        high_frames_per_window=
+            high_frames,
+
+        high_spatial_tier=
+            choose_spatial_tier(
+                precision_requirement=
+                    analysis[
+                        "precision_requirement"
+                    ],
+
+                spatial_strategy=
+                    analysis[
+                        "spatial_strategy"
+                    ],
+            ),
+
+        merge_gap_s=
+            choose_merge_gap(
+                requirement
+            ),
+
+        vlm_budget=
+            vlm_budget,
+
+        quality_tier=
+            "requested",
+
+        fallback_mode=
+            analysis[
+                "fallback_requirement"
+            ],
+
+        min_temporal_coverage=(
+            1.0
+            if requirement
+            in {
+                "global",
+                "count",
+            }
+            else 0.0
+        ),
+
+        profile_confidence=
+            analysis[
+                "profile_confidence"
+            ],
+
+        miss_risk=
+            analysis[
                 "miss_risk"
             ],
-        )
-    )
 
-    high_frames_per_window = (
-        choose_high_frames_per_window(
-            reasoning_type=reasoning_type,
-            precision_requirement=analysis[
-                "precision_requirement"
-            ],
-        )
-    )
-
-    high_spatial_tier = choose_spatial_tier(
-        precision_requirement=analysis[
-            "precision_requirement"
-        ],
-        spatial_strategy=analysis[
-            "spatial_strategy"
-        ],
-    )
-
-    min_temporal_coverage = (
-        1.0
-        if coverage_mode == "full_timeline"
-        else 0.0
-    )
-
-    requested = BudgetConfig(
-        name=f"dynamic_{reasoning_type}",
-        reasoning_type=reasoning_type,
-        answer_type=analysis[
-            "answer_type"
-        ],
-        coverage_mode=coverage_mode,
-        selection_mode=selection_mode,
-        temporal_operation=analysis[
-            "temporal_operation"
-        ],
-        aggregation_type=analysis[
-            "aggregation_type"
-        ],
-        identity_requirement=analysis[
-            "identity_requirement"
-        ],
-        spatial_strategy=analysis[
-            "spatial_strategy"
-        ],
-        required_modalities=tuple(
+        answer_sensitivity=
             analysis[
-                "required_modalities"
+                "answer_sensitivity"
+            ],
+
+        evidence_type=
+            analysis.get(
+                "evidence_type",
+                "generic",
+            ),
+
+        expand_neighbors=(
+            requirement
+            == "local"
+            and analysis[
+                "precision_requirement"
             ]
+            == "high"
         ),
-        probe_fps=probe_fps,
-        chunk_len_s=chunk_len_s,
-        frames_per_chunk=(
-            frames_per_chunk
-        ),
-        probe_topk=topk,
-        action_topk=topk,
-        candidate_threshold=(
-            candidate_threshold
-        ),
-        uncertainty_threshold=(
-            uncertainty_threshold
-        ),
-        window_len_s=window_len_s,
-        high_frames_per_window=(
-            high_frames_per_window
-        ),
-        high_spatial_tier=(
-            high_spatial_tier
-        ),
-        merge_gap_s=choose_merge_gap(
-            reasoning_type
-        ),
-        vlm_budget=vlm_budget,
-        quality_tier="requested",
-        fallback_mode=analysis[
-            "fallback_requirement"
-        ],
-        min_temporal_coverage=(
-            min_temporal_coverage
-        ),
-        profile_confidence=analysis[
-            "profile_confidence"
-        ],
-        miss_risk=analysis[
-            "miss_risk"
-        ],
-        answer_sensitivity=analysis[
-            "answer_sensitivity"
-        ],
-        evidence_type=analysis.get(
-            "evidence_type",
-            "generic",
-        ),
-        max_steps=(
-            2
-            if analysis[
-                "fallback_requirement"
-            ] != "none"
-            else 1
-        ),
-        rationale=analysis.get(
-            "rationale",
-            "",
-        ),
-    )
 
-    return calibrate_policy_to_oracle_frontier(
-        requested,
-        analysis=analysis,
-        duration_s=duration_s,
+        preserve_order=(
+            requirement
+            in {
+                "global",
+                "count",
+                "temporal",
+            }
+        ),
+
+        include_uniform_anchors=(
+            requirement
+            in {
+                "global",
+                "count",
+            }
+        ),
+
+        **bounds,
+
+        rationale=
+            analysis.get(
+                "rationale",
+                "",
+            ),
     )
 
 
-def calibrate_policy_to_oracle_frontier(
-    requested: BudgetConfig,
+# ============================================================================
+# 16. Cheap-router config
+# ============================================================================
+
+def catalog_policy_to_budget_config(
     *,
-    analysis: Dict[str, Any],
-    duration_s: float,
+    decision: RouterDecision,
 ) -> BudgetConfig:
-    """
-    Snap dynamic profiler knobs toward the measured fixed-config frontier.
 
-    The consistent oracle audit selects cheap budget2/budget8 policies for
-    most short and medium questions, and a sparse scan0.0039_k8_budget32
-    policy for very long VRBench-style videos. This keeps semantic profiling
-    intact while making numeric knobs match that empirical frontier.
-    """
-
-    high_risk = (
-        requested.miss_risk == "high"
-        or analysis[
-            "fallback_requirement"
-        ] == "full_high"
+    catalog = (
+        POLICY_CATALOG[
+            decision.policy_name
+        ]
     )
-    risk_triggers = set(
-        analysis.get(
-            "_risk_triggers",
-            [],
+
+    bounds = (
+        choose_agent_bounds(
+            execution_mode=
+                decision.execution_mode,
+
+            evidence_requirement=
+                decision.evidence_requirement,
+
+            temporal_relation=
+                decision.temporal_relation,
         )
     )
-    evidence_type = analysis.get(
-        "evidence_type",
-        "generic",
-    )
-    topk = 8
-    window_len_s = 8.0
-    expand_neighbors = False
-    preserve_order = False
-    include_uniform_anchors = False
 
-    if duration_s >= 1200:
-        scan_fps = 0.00390625
-        chunk_len_s = 1.0 / scan_fps
-        vlm_budget = 32
-        name_suffix = "oracle_sparse_long"
-        if "temporal_sequence" in risk_triggers:
-            window_len_s = 16.0
-            topk = 12
-            expand_neighbors = True
-            preserve_order = True
-            include_uniform_anchors = True
-        elif "local_detail" in risk_triggers:
-            window_len_s = 4.0
-            expand_neighbors = True
-        if "dense_visual_detail" in risk_triggers:
-            topk = 16
-            expand_neighbors = True
+    requirement = (
+        decision.evidence_requirement
+    )
+
+    if requirement == "count":
+
+        reasoning_type = "counting"
+        coverage_mode = "full_timeline"
+        selection_mode = "all_positive_and_uncertain"
+        temporal_operation = "frequency"
+        aggregation_type = "occurrences"
+
+    elif requirement == "global":
+
+        reasoning_type = "global_summary"
+        coverage_mode = "full_timeline"
+        selection_mode = "uniform"
+        temporal_operation = (
+            "ordering"
+            if decision.temporal_relation
+            == "ordering"
+            else "none"
+        )
+        aggregation_type = "segments"
+
+    elif requirement == "temporal":
+
+        reasoning_type = "temporal_order"
+        coverage_mode = (
+            "targeted"
+            if decision.temporal_relation
+            in {
+                "beginning",
+                "end",
+            }
+            else "multi_region"
+        )
+        selection_mode = (
+            "beginning_end"
+            if decision.temporal_relation
+            in {
+                "beginning",
+                "end",
+            }
+            else "multi_event"
+        )
+        temporal_operation = (
+            "before_after"
+            if decision.temporal_relation
+            in {
+                "before",
+                "after",
+            }
+            else "ordering"
+        )
+        aggregation_type = "segments"
 
     else:
-        needs_detail_budget = (
-            analysis[
-                "precision_requirement"
-            ] == "high"
-            or requested.reasoning_type
-            in {
-                "fine_detail",
-                "counting",
-                "repetition",
-            }
-            or requested.spatial_strategy
-            in {
-                "ocr_crop",
-                "face_crop",
-                "object_crop",
-                "multi_crop",
-            }
-        )
 
-        if "counting_completeness" in risk_triggers:
-            scan_fps = 0.03125
-            vlm_budget = 32
-            window_len_s = 8.0
-            include_uniform_anchors = True
-            preserve_order = True
-            name_suffix = "oracle_counting_budget32"
-        elif "screen_state_change" in risk_triggers:
-            scan_fps = 0.125
-            vlm_budget = 64
-            window_len_s = 4.0
-            topk = 16
-            expand_neighbors = True
-            preserve_order = True
-            name_suffix = "oracle_screen_state_verify64"
-        elif "dense_visual_detail" in risk_triggers:
-            scan_fps = 0.125
-            vlm_budget = 64
-            window_len_s = 4.0
-            topk = 16
-            expand_neighbors = True
-            name_suffix = "oracle_dense_detail_verify64"
-        elif "local_detail" in risk_triggers:
-            scan_fps = 0.03125
-            vlm_budget = 64
-            window_len_s = 4.0
-            topk = 16
-            expand_neighbors = True
-            name_suffix = "oracle_local_detail_verify64"
-        elif "temporal_sequence" in risk_triggers:
-            scan_fps = 0.03125
-            vlm_budget = 32
-            window_len_s = 12.0
-            topk = 16
-            expand_neighbors = True
-            preserve_order = True
-            include_uniform_anchors = True
-            name_suffix = "oracle_temporal_sweep_budget32"
-        elif "multi_region_composition" in risk_triggers:
-            scan_fps = 0.03125
-            vlm_budget = 32
-            window_len_s = 12.0
-            topk = 12
-            expand_neighbors = True
-            preserve_order = True
-            name_suffix = "oracle_composition_budget32"
-        elif "cheap_global_summary" in risk_triggers:
-            scan_fps = 0.015625
-            vlm_budget = 8
-            window_len_s = 16.0
-            topk = 8
-            name_suffix = "oracle_global_budget8"
-        elif high_risk:
-            scan_fps = 0.03125
-            vlm_budget = 32
-            name_suffix = "oracle_risk_budget32"
-        elif needs_detail_budget:
-            scan_fps = 0.015625
-            vlm_budget = 16
-            name_suffix = "oracle_budget16"
-        elif (
-            requested.coverage_mode
-            == "targeted"
-            or requested.miss_risk == "low"
-        ):
-            scan_fps = 0.015625
-            vlm_budget = 2
-            name_suffix = "oracle_budget2"
-        else:
-            scan_fps = 0.015625
-            vlm_budget = 8
-            name_suffix = "oracle_budget8"
+        reasoning_type = "local_event"
+        coverage_mode = "targeted"
+        selection_mode = "top_k"
+        temporal_operation = "none"
+        aggregation_type = "none"
 
-        chunk_len_s = 1.0 / scan_fps
-
-    return replace(
-        requested,
+    return BudgetConfig(
         name=(
-            requested.name
-            + "_"
-            + name_suffix
+            f"router_"
+            f"{catalog.name}"
         ),
-        probe_fps=scan_fps,
-        chunk_len_s=chunk_len_s,
-        frames_per_chunk=1,
-        probe_topk=topk,
-        action_topk=topk,
-        window_len_s=window_len_s,
-        vlm_budget=vlm_budget,
-        high_frames_per_window=min(
-            requested.high_frames_per_window,
-            max(
-                2,
-                vlm_budget,
+
+        execution_mode=
+            decision.execution_mode,
+
+        evidence_requirement=
+            requirement,
+
+        temporal_relation=
+            decision.temporal_relation,
+
+        reasoning_type=
+            reasoning_type,
+
+        answer_type=
+            "multiple_choice",
+
+        coverage_mode=
+            coverage_mode,
+
+        selection_mode=
+            selection_mode,
+
+        temporal_operation=
+            temporal_operation,
+
+        aggregation_type=
+            aggregation_type,
+
+        identity_requirement=
+            "none",
+
+        spatial_strategy=
+            "full_frame",
+
+        required_modalities=
+            ("visual",),
+
+        probe_fps=
+            catalog.probe_fps,
+
+        chunk_len_s=(
+            1.0
+            / catalog.probe_fps
+        ),
+
+        frames_per_chunk=
+            1,
+
+        probe_topk=(
+            catalog.probe_topk
+            if selection_mode
+            == "top_k"
+            else None
+        ),
+
+        action_topk=(
+            catalog.action_topk
+            if selection_mode
+            == "top_k"
+            else None
+        ),
+
+        candidate_threshold=
+            0.4,
+
+        uncertainty_threshold=
+            0.2,
+
+        window_len_s=
+            catalog.window_len_s,
+
+        high_frames_per_window=
+            min(
+                16,
+                max(
+                    8,
+                    catalog.vlm_budget,
+                ),
             ),
+
+        high_spatial_tier=
+            "medium",
+
+        merge_gap_s=
+            choose_merge_gap(
+                requirement
+            ),
+
+        vlm_budget=
+            catalog.vlm_budget,
+
+        quality_tier=
+            "router",
+
+        fallback_mode=(
+            "expand_coverage"
+            if decision.execution_mode
+            == "agentic"
+            else "none"
         ),
-        evidence_type=evidence_type,
-        expand_neighbors=expand_neighbors,
-        preserve_order=preserve_order,
-        include_uniform_anchors=include_uniform_anchors,
-        quality_tier="oracle_frontier",
-        rationale=(
-            requested.rationale
-            + " Calibrated to the measured fixed-config oracle frontier."
-        ).strip(),
+
+        min_temporal_coverage=(
+            1.0
+            if requirement
+            in {
+                "global",
+                "count",
+            }
+            else 0.0
+        ),
+
+        profile_confidence=
+            decision.confidence,
+
+        miss_risk=
+            "medium",
+
+        answer_sensitivity=
+            "exact",
+
+        evidence_type=
+            decision.reason,
+
+        expand_neighbors=
+            catalog.expand_neighbors,
+
+        preserve_order=
+            catalog.preserve_order,
+
+        include_uniform_anchors=
+            catalog.include_uniform_anchors,
+
+        **bounds,
+
+        rationale=
+            decision.reason,
+    )
+
+
+def budget_config_from_router(
+    decision: RouterDecision,
+) -> BudgetConfig:
+
+    return (
+        catalog_policy_to_budget_config(
+            decision=decision,
+        )
     )
 
 
 # ============================================================================
-# 9. Resource adaptation
+# 17. Resource adaptation
 # ============================================================================
-
-def _halve_optional_topk(
-    value: int | None,
-    *,
-    minimum: int,
-) -> int | None:
-    if value is None:
-        return None
-
-    return max(
-        minimum,
-        value // 2,
-    )
-
-
-def _reduce_budget_without_increase(
-    value: int,
-    *,
-    divisor: int,
-    minimum: int,
-) -> int:
-    return min(
-        value,
-        max(
-            minimum,
-            value // divisor,
-        ),
-    )
-
 
 def adapt_budget_for_resources(
     requested: BudgetConfig,
     resource_state: ResourceState,
 ) -> BudgetConfig:
-    """
-    Reduce cost without violating evidence-coverage invariants.
 
-    Full-timeline tasks degrade spatial/per-chunk fidelity before temporal
-    coverage. This is important for counting and repetition.
-    """
+    load = (
+        resource_state.load_level
+    )
 
-    load_level = resource_state.load_level
-
-    if load_level not in {
+    if load not in {
         "low",
         "medium",
         "high",
     }:
         raise ValueError(
-            "resource_state.load_level must be "
-            "'low', 'medium', or 'high'"
+            "load_level must be "
+            "low, medium, or high"
         )
 
-    if load_level == "low":
+    if load == "low":
+
         return replace(
             requested,
-            quality_tier="resource_low",
+            quality_tier=
+                "resource_low",
         )
 
-    full_timeline_task = (
-        requested.coverage_mode
-        == "full_timeline"
-    )
+    # ------------------------------------------------------------
+    # Preserve control flow.
+    #
+    # Resource pressure must NOT turn GLOBAL into LOCAL, COUNT into
+    # TOP-K, etc.
+    # ------------------------------------------------------------
 
-    if full_timeline_task:
-        if load_level == "medium":
-            new_frames_per_chunk = max(
-                2,
-                requested.frames_per_chunk - 1,
-            )
+    if load == "medium":
 
-            return replace(
-                requested,
-                name=(
-                    requested.name
-                    + "_resource_medium"
-                ),
-                frames_per_chunk=(
-                    new_frames_per_chunk
-                ),
-                probe_fps=(
-                    new_frames_per_chunk
-                    / requested.chunk_len_s
-                ),
-                high_frames_per_window=max(
+        return replace(
+            requested,
+
+            high_frames_per_window=
+                max(
                     6,
-                    requested.high_frames_per_window
+                    requested
+                    .high_frames_per_window
                     // 2,
                 ),
-                vlm_budget=(
-                    _reduce_budget_without_increase(
-                        requested.vlm_budget,
-                        divisor=2,
-                        minimum=16,
-                    )
+
+            vlm_budget=
+                max(
+                    8,
+                    requested.vlm_budget
+                    // 2,
                 ),
-                quality_tier=(
-                    "resource_medium"
-                ),
-            )
 
-        # High-load full-timeline policy:
-        # retain every chunk, but inspect fewer frames per chunk.
-        return replace(
-            requested,
-            name=(
-                requested.name
-                + "_resource_high"
-            ),
-            frames_per_chunk=1,
-            probe_fps=(
-                1.0
-                / requested.chunk_len_s
-            ),
-            high_frames_per_window=max(
-                4,
-                requested.high_frames_per_window
-                // 3,
-            ),
-            vlm_budget=(
-                _reduce_budget_without_increase(
-                    requested.vlm_budget,
-                    divisor=4,
-                    minimum=8,
-                )
-            ),
-            fallback_mode=(
-                "expand_coverage"
-                if requested.fallback_mode
-                == "none"
-                else requested.fallback_mode
-            ),
-            quality_tier="resource_high",
+            quality_tier=
+                "resource_medium",
         )
-
-    # Targeted and multi-region requests can reduce top-k under load.
-    if load_level == "medium":
-        return replace(
-            requested,
-            name=(
-                requested.name
-                + "_resource_medium"
-            ),
-            probe_topk=(
-                _halve_optional_topk(
-                    requested.probe_topk,
-                    minimum=4,
-                )
-            ),
-            action_topk=(
-                _halve_optional_topk(
-                    requested.action_topk,
-                    minimum=4,
-                )
-            ),
-            high_frames_per_window=max(
-                6,
-                requested.high_frames_per_window
-                // 2,
-            ),
-            vlm_budget=(
-                _reduce_budget_without_increase(
-                    requested.vlm_budget,
-                    divisor=2,
-                    minimum=16,
-                )
-            ),
-            quality_tier=(
-                "resource_medium"
-            ),
-        )
-
-    new_frames_per_chunk = max(
-        1,
-        requested.frames_per_chunk - 1,
-    )
 
     return replace(
         requested,
-        name=(
-            requested.name
-            + "_resource_high"
-        ),
-        frames_per_chunk=(
-            new_frames_per_chunk
-        ),
-        probe_fps=(
-            new_frames_per_chunk
-            / requested.chunk_len_s
-        ),
-        probe_topk=(
-            _halve_optional_topk(
-                requested.probe_topk,
-                minimum=2,
-            )
-        ),
-        action_topk=(
-            _halve_optional_topk(
-                requested.action_topk,
-                minimum=2,
-            )
-        ),
-        high_frames_per_window=max(
-            4,
-            requested.high_frames_per_window
-            // 3,
-        ),
-        vlm_budget=(
-            _reduce_budget_without_increase(
-                requested.vlm_budget,
-                divisor=4,
-                minimum=8,
-            )
-        ),
-        fallback_mode=(
-            "expand_coverage"
-            if requested.fallback_mode
-            == "none"
-            else requested.fallback_mode
-        ),
-        quality_tier="resource_high",
+
+        high_frames_per_window=
+            max(
+                4,
+                requested
+                .high_frames_per_window
+                // 3,
+            ),
+
+        vlm_budget=
+            max(
+                8,
+                requested.vlm_budget
+                // 4,
+            ),
+
+        quality_tier=
+            "resource_high",
     )
 
 
 # ============================================================================
-# 10. Cost estimation and candidate selection
+# 18. Allowed actions
+# ============================================================================
+
+def allowed_actions_for_config(
+    config: BudgetConfig,
+) -> List[str]:
+
+    if config.execution_mode == "oneshot":
+
+        if (
+            config.evidence_requirement
+            == "local"
+        ):
+
+            return [
+                "SEARCH_LOCAL",
+                "INCREASE_DENSITY",
+                "COMPARE_CHOICES",
+                "ANSWER",
+            ]
+
+        if (
+            config.evidence_requirement
+            == "temporal"
+        ):
+
+            return [
+                "INCREASE_DENSITY",
+                "COMPARE_CHOICES",
+                "ANSWER",
+            ]
+
+        return [
+            "ANSWER",
+        ]
+
+    if (
+        config.evidence_requirement
+        == "global"
+    ):
+
+        return [
+            "GLOBAL_SCAN",
+            "INCREASE_DENSITY",
+            "ANSWER",
+        ]
+
+    if (
+        config.evidence_requirement
+        == "count"
+    ):
+
+        return [
+            "COUNT_EVENTS",
+            "INCREASE_DENSITY",
+            "SEARCH_BEFORE",
+            "SEARCH_AFTER",
+            "ANSWER",
+        ]
+
+    if (
+        config.evidence_requirement
+        == "temporal"
+    ):
+
+        return [
+            "SEARCH_LOCAL",
+            "SEARCH_BEFORE",
+            "SEARCH_AFTER",
+            "INCREASE_DENSITY",
+            "COMPARE_CHOICES",
+            "ANSWER",
+        ]
+
+    return [
+        "SEARCH_LOCAL",
+        "INCREASE_DENSITY",
+        "ANSWER",
+    ]
+
+
+# ============================================================================
+# 19. Config -> runtime policy
+# ============================================================================
+
+def budget_to_policy(
+    config: BudgetConfig,
+) -> Dict[str, Any]:
+
+    return {
+        # ============================================================
+        # MACRO CONTROL PLANE
+        # ============================================================
+
+        "execution_mode":
+            config.execution_mode,
+
+        "evidence_requirement":
+            config.evidence_requirement,
+
+        "temporal_relation":
+            config.temporal_relation,
+
+        "allowed_actions":
+            allowed_actions_for_config(
+                config
+            ),
+
+        # ============================================================
+        # HARD BOUNDS
+        # ============================================================
+
+        "max_steps":
+            config.max_steps,
+
+        "max_local_searches":
+            config.max_local_searches,
+
+        "max_global_scans":
+            config.max_global_scans,
+
+        "max_count_scans":
+            config.max_count_scans,
+
+        "max_temporal_searches":
+            config.max_temporal_searches,
+
+        "max_density_refinements":
+            config.max_density_refinements,
+
+        "max_contrastive_checks":
+            config.max_contrastive_checks,
+
+        # ============================================================
+        # SEMANTIC PROFILE
+        # ============================================================
+
+        "reasoning_type":
+            config.reasoning_type,
+
+        "answer_type":
+            config.answer_type,
+
+        "coverage_mode":
+            config.coverage_mode,
+
+        "selection_mode":
+            config.selection_mode,
+
+        "temporal_operation":
+            config.temporal_operation,
+
+        "aggregation_type":
+            config.aggregation_type,
+
+        "identity_requirement":
+            config.identity_requirement,
+
+        "spatial_strategy":
+            config.spatial_strategy,
+
+        "required_modalities":
+            list(
+                config.required_modalities
+            ),
+
+        # ============================================================
+        # RETRIEVAL
+        # ============================================================
+
+        "probe_fps":
+            config.probe_fps,
+
+        "chunk_len_s":
+            config.chunk_len_s,
+
+        "frames_per_chunk":
+            config.frames_per_chunk,
+
+        "probe_topk":
+            config.probe_topk,
+
+        "action_topk":
+            config.action_topk,
+
+        "candidate_threshold":
+            config.candidate_threshold,
+
+        "uncertainty_threshold":
+            config.uncertainty_threshold,
+
+        # ============================================================
+        # REFINEMENT
+        # ============================================================
+
+        "window_len_s":
+            config.window_len_s,
+
+        "high_frames_per_window":
+            config.high_frames_per_window,
+
+        "high_spatial_tier":
+            config.high_spatial_tier,
+
+        "merge_gap_s":
+            config.merge_gap_s,
+
+        # ============================================================
+        # ANSWER
+        # ============================================================
+
+        "answer_max_images_total":
+            config.vlm_budget,
+
+        "answer_max_frames_per_window":
+            config.high_frames_per_window,
+
+        "answer_tier":
+            config.answer_tier,
+
+        "cheap_answer_tier":
+            config.cheap_answer_tier,
+
+        # ============================================================
+        # ROBUSTNESS
+        # ============================================================
+
+        "fallback_mode":
+            config.fallback_mode,
+
+        "min_temporal_coverage":
+            config.min_temporal_coverage,
+
+        "profile_confidence":
+            config.profile_confidence,
+
+        "miss_risk":
+            config.miss_risk,
+
+        "answer_sensitivity":
+            config.answer_sensitivity,
+
+        "evidence_type":
+            config.evidence_type,
+
+        "expand_neighbors":
+            config.expand_neighbors,
+
+        "preserve_order":
+            config.preserve_order,
+
+        "include_uniform_anchors":
+            config.include_uniform_anchors,
+
+        "quality_tier":
+            config.quality_tier,
+
+        "rationale":
+            config.rationale,
+    }
+
+
+# ============================================================================
+# 20. Cost estimate
 # ============================================================================
 
 def estimate_config_cost(
@@ -2223,312 +3399,65 @@ def estimate_config_cost(
     *,
     duration_s: float,
 ) -> float:
-    """
-    Approximate execution cost in normalized work units.
-
-    This is intentionally simple. Replace its constants with fitted latency
-    or token-cost models once you have profiler traces.
-    """
 
     if duration_s <= 0:
         raise ValueError(
             "duration_s must be positive"
         )
 
-    chunk_count = math.ceil(
+    probe_frames = max(
+        1.0,
         duration_s
-        / config.chunk_len_s
+        * config.probe_fps,
     )
 
-    if config.coverage_mode == "full_timeline":
-        low_frames = (
-            chunk_count
-            * config.frames_per_chunk
-        )
-    else:
-        low_frames = min(
-            duration_s
-            * config.probe_fps,
-            chunk_count
-            * config.frames_per_chunk,
-        )
+    if config.execution_mode == "oneshot":
 
-    if config.action_topk is not None:
-        estimated_high_windows = (
+        high_windows = (
             config.action_topk
+            or 1
         )
 
-    elif config.selection_mode == "uniform":
-        estimated_high_windows = (
-            chunk_count
+    elif (
+        config.evidence_requirement
+        == "global"
+    ):
+
+        high_windows = (
+            config.max_global_scans
         )
 
-    elif config.selection_mode in {
-        "all_positive",
-        "all_positive_and_uncertain",
-    }:
-        # Placeholder candidate-rate estimate.
-        estimated_high_windows = max(
+    elif (
+        config.evidence_requirement
+        == "count"
+    ):
+
+        high_windows = max(
             1,
-            math.ceil(0.25 * chunk_count),
-        )
-
-    elif config.selection_mode == "beginning_end":
-        estimated_high_windows = 2
-
-    elif config.selection_mode == "multi_event":
-        estimated_high_windows = min(
-            8,
-            chunk_count,
+            config.max_density_refinements,
         )
 
     else:
-        estimated_high_windows = min(
-            4,
-            chunk_count,
+
+        high_windows = max(
+            1,
+            config.max_temporal_searches,
         )
 
     high_frames = (
-        estimated_high_windows
+        high_windows
         * config.high_frames_per_window
     )
 
-    modality_multiplier = 1.0
-
-    if "audio" in config.required_modalities:
-        modality_multiplier += 0.20
-
-    if "ocr" in config.required_modalities:
-        modality_multiplier += 0.25
-
-    if config.spatial_strategy != "full_frame":
-        modality_multiplier += 0.20
-
-    answer_multiplier = max(
-        0.25,
-        config.vlm_budget / 32.0,
-    )
-
     return float(
-        modality_multiplier
-        * (
-            low_frames
-            + 4.0 * high_frames
-            + 16.0 * answer_multiplier
-        )
+        probe_frames
+        + 4.0 * high_frames
+        + config.vlm_budget
     )
-
-
-def _cost_budget_for_resource_state(
-    resource_state: ResourceState,
-) -> float:
-    """
-    Temporary normalized cost ceiling.
-
-    Tune these values from actual measurements.
-    """
-
-    base = {
-        "low": 100_000.0,
-        "medium": 50_000.0,
-        "high": 20_000.0,
-    }.get(resource_state.load_level)
-
-    if base is None:
-        raise ValueError(
-            "Invalid resource load level"
-        )
-
-    memory_factor = max(
-        0.25,
-        min(
-            2.0,
-            resource_state.free_gpu_mem_gb
-            / 24.0,
-        ),
-    )
-
-    queue_penalty = (
-        1.0
-        + 0.05
-        * resource_state.encoder_queue_len
-        + 0.05
-        * resource_state.vlm_queue_len
-    )
-
-    return (
-        base
-        * memory_factor
-        / queue_penalty
-    )
-
-
-def choose_config_for_current_resources(
-    candidates: List[BudgetConfig],
-    *,
-    resource_state: ResourceState,
-    duration_s: float,
-) -> BudgetConfig:
-    """
-    Choose the richest candidate that fits the current normalized budget.
-    """
-
-    if not candidates:
-        raise ValueError(
-            "No candidate workflow configurations provided"
-        )
-
-    budget = _cost_budget_for_resource_state(
-        resource_state
-    )
-
-    scored = [
-        (
-            estimate_config_cost(
-                config,
-                duration_s=duration_s,
-            ),
-            config,
-        )
-        for config in candidates
-    ]
-
-    fitting = [
-        item
-        for item in scored
-        if item[0] <= budget
-    ]
-
-    if fitting:
-        # Highest-cost candidate that still fits.
-        return max(
-            fitting,
-            key=lambda item: item[0],
-        )[1]
-
-    # Nothing fits: choose the least costly safe candidate.
-    return min(
-        scored,
-        key=lambda item: item[0],
-    )[1]
 
 
 # ============================================================================
-# 11. Convert configuration into an orchestrator policy
-# ============================================================================
-
-def budget_to_policy(
-    config: BudgetConfig,
-) -> Dict[str, Any]:
-    return {
-        # Semantic execution strategy.
-        "reasoning_type": (
-            config.reasoning_type
-        ),
-        "answer_type": (
-            config.answer_type
-        ),
-        "coverage_mode": (
-            config.coverage_mode
-        ),
-        "selection_mode": (
-            config.selection_mode
-        ),
-        "temporal_operation": (
-            config.temporal_operation
-        ),
-        "aggregation_type": (
-            config.aggregation_type
-        ),
-        "identity_requirement": (
-            config.identity_requirement
-        ),
-        "spatial_strategy": (
-            config.spatial_strategy
-        ),
-        "required_modalities": list(
-            config.required_modalities
-        ),
-
-        # Low-fidelity scan.
-        "probe_fps": config.probe_fps,
-        "chunk_len_s": config.chunk_len_s,
-        "frames_per_chunk": (
-            config.frames_per_chunk
-        ),
-
-        # Candidate selection.
-        "probe_topk": config.probe_topk,
-        "action_topk": (
-            config.action_topk
-        ),
-        "candidate_threshold": (
-            config.candidate_threshold
-        ),
-        "uncertainty_threshold": (
-            config.uncertainty_threshold
-        ),
-
-        # High-fidelity refinement.
-        "window_len_s": (
-            config.window_len_s
-        ),
-        "high_frames_per_window": (
-            config.high_frames_per_window
-        ),
-        "high_spatial_tier": (
-            config.high_spatial_tier
-        ),
-
-        # Event aggregation.
-        "merge_gap_s": config.merge_gap_s,
-
-        # Answer-stage compatibility fields.
-        "answer_max_images_total": (
-            config.vlm_budget
-        ),
-        "answer_max_frames_per_window": (
-            config.high_frames_per_window
-        ),
-        "answer_tier": config.answer_tier,
-        "cheap_answer_tier": (
-            config.cheap_answer_tier
-        ),
-        "max_steps": config.max_steps,
-
-        # Correctness and fallback.
-        "fallback_mode": (
-            config.fallback_mode
-        ),
-        "min_temporal_coverage": (
-            config.min_temporal_coverage
-        ),
-        "profile_confidence": (
-            config.profile_confidence
-        ),
-        "miss_risk": config.miss_risk,
-        "answer_sensitivity": (
-            config.answer_sensitivity
-        ),
-        "evidence_type": config.evidence_type,
-        "expand_neighbors": (
-            config.expand_neighbors
-        ),
-        "preserve_order": (
-            config.preserve_order
-        ),
-        "include_uniform_anchors": (
-            config.include_uniform_anchors
-        ),
-        "quality_tier": (
-            config.quality_tier
-        ),
-        "rationale": config.rationale,
-    }
-
-
-# ============================================================================
-# 12. Main entry point
+# 21. LLM profiling
 # ============================================================================
 
 def profile_query_llm(
@@ -2544,19 +3473,6 @@ def profile_query_llm(
     resource_state: ResourceState | None = None,
     verbose: bool = True,
 ) -> ProfilerResult:
-    """
-    Profile a VideoQA query and compile a resource-aware execution plan.
-
-    Flow:
-
-        question
-        -> semantic evidence profile
-        -> validated/coerced profile
-        -> requested BudgetConfig
-        -> safe resource-adapted candidates
-        -> selected BudgetConfig
-        -> executable orchestrator policy
-    """
 
     if not query.strip():
         raise ValueError(
@@ -2569,121 +3485,119 @@ def profile_query_llm(
         )
 
     if resource_state is None:
-        resource_state = ResourceState()
-
-    raw_json = _call_profiler_llm(
-        query=query,
-        choices=choices,
-        base_url=base_url,
-        model=model,
-        temperature=temperature,
-        timeout_s=timeout_s,
-        api_key=api_key,
-        verbose=verbose,
-    )
-
-    raw_analysis = raw_json.get(
-        "analysis",
-        {},
-    )
-
-    analysis = coerce_and_validate_analysis(
-        raw_analysis,
-        query=query,
-    )
-
-    requested_config = compile_execution_policy(
-        analysis=analysis,
-        duration_s=duration_s,
-    )
-
-    low_load_config = adapt_budget_for_resources(
-        requested_config,
-        ResourceState(
-            free_gpu_mem_gb=max(
-                resource_state.free_gpu_mem_gb,
-                24.0,
-            ),
-            load_level="low",
-        ),
-    )
-
-    medium_load_config = adapt_budget_for_resources(
-        requested_config,
-        ResourceState(
-            free_gpu_mem_gb=(
-                resource_state.free_gpu_mem_gb
-            ),
-            encoder_queue_len=(
-                resource_state.encoder_queue_len
-            ),
-            vlm_queue_len=(
-                resource_state.vlm_queue_len
-            ),
-            load_level="medium",
-        ),
-    )
-
-    high_load_config = adapt_budget_for_resources(
-        requested_config,
-        ResourceState(
-            free_gpu_mem_gb=(
-                resource_state.free_gpu_mem_gb
-            ),
-            encoder_queue_len=(
-                resource_state.encoder_queue_len
-            ),
-            vlm_queue_len=(
-                resource_state.vlm_queue_len
-            ),
-            load_level="high",
-        ),
-    )
-
-    candidate_configs = [
-        low_load_config,
-        medium_load_config,
-        high_load_config,
-    ]
-
-    # Remove exact duplicate configurations.
-    unique_candidates: List[
-        BudgetConfig
-    ] = []
-
-    seen: set[str] = set()
-
-    for config in candidate_configs:
-        serialized = json.dumps(
-            asdict(config),
-            sort_keys=True,
+        resource_state = (
+            ResourceState()
         )
 
-        if serialized not in seen:
-            unique_candidates.append(
-                config
-            )
-            seen.add(serialized)
-
-    candidate_configs = unique_candidates
-
-    # Since candidates already correspond to load tiers, directly adapting
-    # to the current load gives predictable behavior. The best-fit selector
-    # remains available for future scheduler-driven selection.
-    chosen_config = adapt_budget_for_resources(
-        requested_config,
-        resource_state,
+    raw_json = (
+        _call_profiler_llm(
+            query=query,
+            choices=choices,
+            base_url=base_url,
+            model=model,
+            temperature=temperature,
+            timeout_s=timeout_s,
+            api_key=api_key,
+            verbose=verbose,
+        )
     )
 
-    policy = budget_to_policy(
-        chosen_config
+    analysis = (
+        coerce_and_validate_analysis(
+            raw_json.get(
+                "analysis",
+                {},
+            ),
+            query=query,
+        )
+    )
+
+    requested = (
+        compile_execution_policy(
+            analysis=analysis,
+            duration_s=duration_s,
+        )
+    )
+
+    low = (
+        adapt_budget_for_resources(
+            requested,
+            ResourceState(
+                load_level="low",
+            ),
+        )
+    )
+
+    medium = (
+        adapt_budget_for_resources(
+            requested,
+            ResourceState(
+                free_gpu_mem_gb=
+                    resource_state
+                    .free_gpu_mem_gb,
+
+                encoder_queue_len=
+                    resource_state
+                    .encoder_queue_len,
+
+                vlm_queue_len=
+                    resource_state
+                    .vlm_queue_len,
+
+                load_level=
+                    "medium",
+            ),
+        )
+    )
+
+    high = (
+        adapt_budget_for_resources(
+            requested,
+            ResourceState(
+                free_gpu_mem_gb=
+                    resource_state
+                    .free_gpu_mem_gb,
+
+                encoder_queue_len=
+                    resource_state
+                    .encoder_queue_len,
+
+                vlm_queue_len=
+                    resource_state
+                    .vlm_queue_len,
+
+                load_level=
+                    "high",
+            ),
+        )
+    )
+
+    candidates = [
+        low,
+        medium,
+        high,
+    ]
+
+    chosen = (
+        adapt_budget_for_resources(
+            requested,
+            resource_state,
+        )
+    )
+
+    policy = (
+        budget_to_policy(
+            chosen
+        )
     )
 
     if verbose:
+
         print(
-            "\n===== VALIDATED PROFILER ANALYSIS =====",
+            "\n===== VALIDATED ANALYSIS =====",
             flush=True,
         )
+
         print(
             json.dumps(
                 analysis,
@@ -2694,92 +3608,218 @@ def profile_query_llm(
         )
 
         print(
-            "\n===== REQUESTED CONFIG =====",
-            flush=True,
-        )
-        print(
-            json.dumps(
-                asdict(requested_config),
-                indent=2,
-            ),
+            "\n===== EXECUTION POLICY =====",
             flush=True,
         )
 
-        print(
-            "\n===== CANDIDATE CONFIGS =====",
-            flush=True,
-        )
-        print(
-            json.dumps(
-                [
-                    {
-                        **asdict(config),
-                        "estimated_cost": (
-                            estimate_config_cost(
-                                config,
-                                duration_s=duration_s,
-                            )
-                        ),
-                    }
-                    for config in candidate_configs
-                ],
-                indent=2,
-            ),
-            flush=True,
-        )
-
-        print(
-            "\n===== RESOURCE STATE =====",
-            flush=True,
-        )
-        print(
-            json.dumps(
-                asdict(resource_state),
-                indent=2,
-            ),
-            flush=True,
-        )
-
-        print(
-            "\n===== CHOSEN CONFIG =====",
-            flush=True,
-        )
-        print(
-            json.dumps(
-                asdict(chosen_config),
-                indent=2,
-            ),
-            flush=True,
-        )
-
-        print(
-            "\n===== COMPILED EXECUTION POLICY =====",
-            flush=True,
-        )
         print(
             json.dumps(
                 policy,
                 indent=2,
+                ensure_ascii=False,
             ),
             flush=True,
         )
 
     return ProfilerResult(
-        analysis=analysis,
-        candidate_configs=(
-            candidate_configs
-        ),
-        requested_config=(
-            requested_config
-        ),
-        chosen_config=chosen_config,
-        execution_policy=policy,
-        raw_json=raw_json,
+        analysis=
+            analysis,
+
+        candidate_configs=
+            candidates,
+
+        requested_config=
+            requested,
+
+        chosen_config=
+            chosen,
+
+        execution_policy=
+            policy,
+
+        raw_json=
+            raw_json,
     )
 
 
 # ============================================================================
-# 13. Backward-compatible wrapper
+# 22. Adaptive cheap-router + LLM path
+# ============================================================================
+
+def profile_query_adaptive(
+    query: str,
+    *,
+    duration_s: float,
+    choices: Sequence[str] | None = None,
+
+    confidence_threshold: float = 0.75,
+    exploration_rate: float = 0.02,
+    random_seed: int | None = None,
+
+    base_url: str = "http://localhost:8000/v1",
+    model: str = "gpt-4o-mini",
+    temperature: float = 0.0,
+    timeout_s: float = 30.0,
+    api_key: str | None = None,
+
+    resource_state: ResourceState | None = None,
+    verbose: bool = True,
+) -> AdaptiveProfilerResult:
+
+    if resource_state is None:
+        resource_state = (
+            ResourceState()
+        )
+
+    router = (
+        route_query_cheap(
+            query,
+            duration_s=duration_s,
+            choices=choices,
+        )
+    )
+
+    rng = random.Random(
+        random_seed
+    )
+
+    low_confidence = (
+        router.confidence
+        < confidence_threshold
+    )
+
+    exploration = (
+        rng.random()
+        < exploration_rate
+    )
+
+    use_llm = (
+        router.out_of_distribution
+        or low_confidence
+        or exploration
+    )
+
+    # ------------------------------------------------------------
+    # FAST PATH
+    # ------------------------------------------------------------
+
+    if not use_llm:
+
+        requested = (
+            budget_config_from_router(
+                router
+            )
+        )
+
+        chosen = (
+            adapt_budget_for_resources(
+                requested,
+                resource_state,
+            )
+        )
+
+        policy = (
+            budget_to_policy(
+                chosen
+            )
+        )
+
+        if verbose:
+
+            print(
+                "\n===== ROUTER FAST PATH =====",
+                flush=True,
+            )
+
+            print(
+                json.dumps(
+                    {
+                        "router":
+                            asdict(
+                                router
+                            ),
+
+                        "execution_policy":
+                            policy,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+        return AdaptiveProfilerResult(
+            source=
+                "router",
+
+            router_decision=
+                router,
+
+            chosen_config=
+                chosen,
+
+            execution_policy=
+                policy,
+        )
+
+    # ------------------------------------------------------------
+    # LLM EXPERT PATH
+    # ------------------------------------------------------------
+
+    if verbose:
+
+        print(
+            "\n===== LLM PROFILER ESCALATION =====",
+            flush=True,
+        )
+
+        print(
+            json.dumps(
+                asdict(
+                    router
+                ),
+                indent=2,
+            ),
+            flush=True,
+        )
+
+    llm_result = (
+        profile_query_llm(
+            query=query,
+            duration_s=duration_s,
+            choices=choices,
+            base_url=base_url,
+            model=model,
+            temperature=temperature,
+            timeout_s=timeout_s,
+            api_key=api_key,
+            resource_state=resource_state,
+            verbose=verbose,
+        )
+    )
+
+    return AdaptiveProfilerResult(
+        source=
+            "llm",
+
+        router_decision=
+            router,
+
+        chosen_config=
+            llm_result
+            .chosen_config,
+
+        execution_policy=
+            llm_result
+            .execution_policy,
+
+        llm_result=
+            llm_result,
+    )
+
+
+# ============================================================================
+# 23. Backward-compatible wrapper
 # ============================================================================
 
 def profile_query_llm_legacy(
@@ -2792,22 +3832,22 @@ def profile_query_llm_legacy(
     temperature: float = 0.0,
     timeout_s: float = 30.0,
     api_key: str | None = None,
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Compatibility wrapper for callers expecting:
+) -> Tuple[
+    Dict[str, Any],
+    Dict[str, Any],
+]:
 
-        policy, analysis = profile_query_llm_legacy(...)
-    """
-
-    result = profile_query_llm(
-        query=query,
-        duration_s=duration_s,
-        choices=choices,
-        base_url=base_url,
-        model=model,
-        temperature=temperature,
-        timeout_s=timeout_s,
-        api_key=api_key,
+    result = (
+        profile_query_llm(
+            query=query,
+            duration_s=duration_s,
+            choices=choices,
+            base_url=base_url,
+            model=model,
+            temperature=temperature,
+            timeout_s=timeout_s,
+            api_key=api_key,
+        )
     )
 
     return (
@@ -2817,46 +3857,85 @@ def profile_query_llm_legacy(
 
 
 # ============================================================================
-# 14. Optional standalone test
+# 24. Standalone test
 # ============================================================================
 
 if __name__ == "__main__":
-    example_question = (
-        "How many times does the man enter the room?"
-    )
 
-    example_choices = [
-        "One time",
-        "Two times",
-        "Three times",
-        "Four times",
+    examples = [
+
+        (
+            "What is the man doing with the box?",
+            900.0,
+        ),
+
+        (
+            "How many times does the man enter the room?",
+            900.0,
+        ),
+
+        (
+            "What happens after the man opens the door?",
+            900.0,
+        ),
+
+        (
+            "What happens at the beginning of the video?",
+            900.0,
+        ),
+
+        (
+            "Describe the key sequence of events in the video "
+            "and summarize the overall workflow.",
+            180.0,
+        ),
     ]
 
-    result = profile_query_llm(
-        query=example_question,
-        choices=example_choices,
-        duration_s=3600.0,
-        base_url="http://localhost:8000/v1",
-        model="gpt-4o-mini",
-        resource_state=ResourceState(
-            free_gpu_mem_gb=24.0,
-            encoder_queue_len=0,
-            vlm_queue_len=0,
-            load_level="low",
-        ),
-        verbose=True,
-    )
+    for question, duration in examples:
 
-    print(
-        "\n===== FINAL RESULT =====",
-        flush=True,
-    )
+        print(
+            "\n"
+            + "=" * 80
+        )
 
-    print(
-        json.dumps(
-            result.to_dict(),
-            indent=2,
-            ensure_ascii=False,
-        ),
-        flush=True,
-    )
+        print(
+            "QUESTION:",
+            question,
+        )
+
+        decision = (
+            route_query_cheap(
+                question,
+                duration_s=duration,
+                choices=[
+                    "A",
+                    "B",
+                    "C",
+                    "D",
+                ],
+            )
+        )
+
+        print(
+            json.dumps(
+                asdict(
+                    decision
+                ),
+                indent=2,
+            )
+        )
+
+        config = (
+            budget_config_from_router(
+                decision
+            )
+        )
+
+        print(
+            json.dumps(
+                budget_to_policy(
+                    config
+                ),
+                indent=2,
+            )
+        )

@@ -311,3 +311,31 @@ Retrieval-only systems can miss evidence, especially on counting questions or qu
 - Which questions are evidence-limited versus composition-limited?
 - When do low-fidelity drafters fail, and how should the verifier recover?
 
+## Core insight - if we need more accuracy only VideoAgent type of papers work but they dont talk about end to end latency for 
+differet queries once those summaries are created.
+
+- once the summaries are created during the runtime I can control the policies. for different type of queries(the summary is important because retreival can not show gains and more
+retrieval will never solve the accuracy problem.)
+
+- problem with the approach of we can use agents to 
+first create the summa
+
+- the retreiver can use these summaries to control 
+
+
+- using summaries and then doing an agentic search on such videos gives us gains in accuracy but tool use to get the accuracy gains from these summaries
+is expensive.
+
+
+(we assume that video agents already do this and gains come from such systems), but there is another problem that 
+
+- background 
+- - captioning and use tools agent loop.
+    in each iteration the captioning model generatees and an input prompt for
+    a window.
+
+- We identify that agentic visual systems have coupled stages with very different execution properties: video captioning is reusable, batchable, and GPU-parallel, while agentic tool use is query-specific, latency-sensitive, and often sequential.
+
+- We present VIMIO, a disaggregated execution system for long-video agentic QA. VIMIO separates video-level caption-memory construction from query-level agentic reasoning/tool use, allowing each stage to be scheduled, scaled, cached, and optimized independent
+
+- VIMIO batches and parallelizes caption generation across GPUs to reduce time-to-memory-ready, then reuses the resulting caption cache across many questions and retrieval sweeps. Query-level agentic workers consume this cached memory and invoke tools only when additional evidence is needed.
