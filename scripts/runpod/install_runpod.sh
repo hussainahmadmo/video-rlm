@@ -5,6 +5,8 @@ ENV_NAME="${ENV_NAME:-vllm-mm}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
 INSTALL_VLLM="${INSTALL_VLLM:-1}"
 INSTALL_YOLO="${INSTALL_YOLO:-0}"
+INSTALL_ZSH="${INSTALL_ZSH:-1}"
+INSTALL_ZSH_AUTOCOMPLETE="${INSTALL_ZSH_AUTOCOMPLETE:-1}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 REQ_FILE="${REPO_ROOT}/scripts/runpod/requirements-runpod.txt"
@@ -29,7 +31,8 @@ if command -v apt-get >/dev/null 2>&1; then
       libxext6 \
       libxrender1 \
       ninja-build \
-      pkg-config
+      pkg-config \
+      zsh
     git lfs install || true
   else
     echo "[runpod] non-root user; skipping apt package install"
@@ -87,6 +90,25 @@ else
   echo "[runpod] skipping YOLO deps because INSTALL_YOLO=${INSTALL_YOLO}"
 fi
 
+if [ "${INSTALL_ZSH}" = "1" ]; then
+  echo "[runpod] installing zsh setup"
+  mkdir -p "${HOME}/.zsh"
+  if [ -f "${HOME}/.zshrc" ] && ! grep -q "VIMIO / video-rlm RunPod zsh setup" "${HOME}/.zshrc"; then
+    cp "${HOME}/.zshrc" "${HOME}/.zshrc.before-vimio"
+  fi
+  cp "${REPO_ROOT}/scripts/runpod/runpod.zshrc" "${HOME}/.zshrc"
+
+  if [ "${INSTALL_ZSH_AUTOCOMPLETE}" = "1" ]; then
+    if [ ! -d "${HOME}/.zsh/zsh-autocomplete" ]; then
+      git clone --depth 1 https://github.com/marlonrichert/zsh-autocomplete.git "${HOME}/.zsh/zsh-autocomplete" || {
+        echo "[runpod] zsh-autocomplete clone failed; continuing without it"
+      }
+    fi
+  fi
+else
+  echo "[runpod] skipping zsh setup because INSTALL_ZSH=${INSTALL_ZSH}"
+fi
+
 python - <<'PY'
 import importlib.util
 required = [
@@ -111,6 +133,13 @@ To use this environment later:
   source "\$(conda info --base)/etc/profile.d/conda.sh"
   conda activate ${ENV_NAME}
   cd ${REPO_ROOT}
+
+To use zsh:
+  zsh
+
+To add secrets without committing them:
+  printf 'export HF_TOKEN=...\nexport WANDB_API_KEY=...\n' > ~/.vimio_secrets
+  chmod 600 ~/.vimio_secrets
 
 Verify caption caches:
   find conductor/experiments/self_improving/data/video_agent_caption_cache* -type f | wc -l

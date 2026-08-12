@@ -22,7 +22,25 @@ Useful toggles:
 ```bash
 INSTALL_VLLM=0 bash scripts/runpod/install_runpod.sh
 INSTALL_YOLO=1 bash scripts/runpod/install_runpod.sh
+INSTALL_ZSH=0 bash scripts/runpod/install_runpod.sh
+INSTALL_ZSH_AUTOCOMPLETE=0 bash scripts/runpod/install_runpod.sh
 ENV_NAME=vimio PYTHON_VERSION=3.10 bash scripts/runpod/install_runpod.sh
+```
+
+The installer also copies `scripts/runpod/runpod.zshrc` to `~/.zshrc` and backs up an existing file as `~/.zshrc.before-vimio`. It keeps the useful local shell setup but intentionally does not include secrets. Put tokens in `~/.vimio_secrets`:
+
+```bash
+cat > ~/.vimio_secrets <<'EOF'
+export HF_TOKEN=...
+export WANDB_API_KEY=...
+EOF
+chmod 600 ~/.vimio_secrets
+```
+
+Then start zsh:
+
+```bash
+zsh
 ```
 
 After install:
