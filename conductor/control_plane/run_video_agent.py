@@ -593,6 +593,100 @@ def is_after_question(
     )
 
 
+def infer_question_skills(
+    question,
+):
+    lowered = str(
+        question
+    ).lower()
+
+    skills = set()
+
+    if is_after_question(
+        question
+    ):
+        skills.add(
+            "TEMPORAL_AFTER"
+        )
+
+    if (
+        " before " in lowered
+        or lowered.startswith(
+            "before "
+        )
+        or " prior to " in lowered
+    ):
+        skills.add(
+            "TEMPORAL_BEFORE"
+        )
+
+    explicit_sequence = (
+        "sequence" in lowered
+        or "order" in lowered
+        or "first" in lowered
+        and (
+            "then" in lowered
+            or "finally" in lowered
+        )
+    )
+
+    if (
+        explicit_sequence
+        or (
+            is_sequence_question(
+                question
+            )
+            and not (
+                skills
+                & {
+                    "TEMPORAL_AFTER",
+                    "TEMPORAL_BEFORE",
+                }
+            )
+        )
+    ):
+        skills.add(
+            "SEQUENCE_ORDER"
+        )
+
+    if is_recurrence_question(
+        question
+    ):
+        skills.add(
+            "RECURRENCE"
+        )
+
+    if is_why_question(
+        question
+    ):
+        skills.add(
+            "CAUSAL_WHY"
+        )
+
+    if (
+        "how many" in lowered
+        or "count" in lowered
+        or "number of" in lowered
+    ):
+        skills.add(
+            "COUNTING"
+        )
+
+    if is_fine_detail_question(
+        question
+    ):
+        skills.add(
+            "LOCAL_DETAIL"
+        )
+
+    if not skills:
+        skills.add(
+            "GLOBAL_SUMMARY"
+        )
+
+    return skills
+
+
 def truncate_text(
     value,
     *,
@@ -7816,39 +7910,93 @@ class VideoAgent(
             state,
         )
 
+        skills = (
+            infer_question_skills(
+                state.question
+            )
+            if state is not None
+            else {
+                "GLOBAL_SUMMARY"
+            }
+        )
+
         option_supported = choice_text_supported_by_text(
             selected_choice,
             reason_text + "\n" + support_text,
         )
 
-        if confidence < 5.0:
-            if text_has_uncertain_support(
-                combined_text
-            ):
-                return False
-
-            if not option_supported:
-                return False
-
-        if (
-            state is not None
-            and is_why_question(
-                state.question
-            )
-            and not choice_text_supported_by_text(
+        support_option_supported = (
+            choice_text_supported_by_text(
                 selected_choice,
                 support_text,
+            )
+            if support_text
+            else False
+        )
+
+        is_global_summary_only = (
+            skills == {
+                "GLOBAL_SUMMARY"
+            }
+        )
+
+        if (
+            confidence < 5.0
+            and text_has_uncertain_support(
+                combined_text
+            )
+        ):
+            return False
+
+        if is_global_summary_only:
+            return True
+
+        needs_option_support = bool(
+            skills
+            & {
+                "LOCAL_DETAIL",
+                "SEQUENCE_ORDER",
+                "RECURRENCE",
+                "COUNTING",
+                "TEMPORAL_BEFORE",
+            }
+        )
+
+        if (
+            needs_option_support
+            and confidence < 5.0
+            and not option_supported
+        ):
+            return False
+
+        if (
+            "CAUSAL_WHY" in skills
+            and not (
+                support_option_supported
+                or (
+                    confidence >= 5.0
+                    and option_supported
+                )
             )
         ):
             return False
 
         if (
-            state is not None
-            and is_after_question(
-                state.question
-            )
+            "TEMPORAL_AFTER" in skills
+            or "TEMPORAL_BEFORE" in skills
         ):
-            has_after_evidence = False
+            temporal_actions = {
+                "IMAGE_CAPTION",
+                "VERIFY_DETAIL",
+                "ZOOM_CAPTION",
+            }
+
+            if "TEMPORAL_AFTER" in skills:
+                temporal_actions.add(
+                    "SEARCH_AFTER"
+                )
+
+            has_temporal_evidence = False
 
             for value in assessment.get(
                 "support_evidence_ids",
@@ -7870,21 +8018,24 @@ class VideoAgent(
 
                 if state.evidence[
                     index
-                ].action in {
-                    "SEARCH_AFTER",
-                    "IMAGE_CAPTION",
-                    "VERIFY_DETAIL",
-                    "ZOOM_CAPTION",
-                }:
-                    has_after_evidence = True
+                ].action in temporal_actions:
+                    has_temporal_evidence = True
                     break
 
-            if not has_after_evidence:
+            if not has_temporal_evidence:
                 return False
 
-            if not choice_text_supported_by_text(
-                selected_choice,
-                support_text,
+            if text_has_uncertain_support(
+                combined_text
+            ):
+                return False
+
+            if not (
+                support_option_supported
+                or (
+                    confidence >= 5.0
+                    and option_supported
+                )
             ):
                 return False
 
@@ -7961,25 +8112,27 @@ class VideoAgent(
         ):
             return False
 
-        needs_recurrence = (
-            state is not None
-            and is_recurrence_question(
+        skills = (
+            infer_question_skills(
                 state.question
             )
+            if state is not None
+            else set()
+        )
+
+        needs_recurrence = (
+            state is not None
+            and "RECURRENCE" in skills
         )
 
         needs_sequence = (
             state is not None
-            and is_sequence_question(
-                state.question
-            )
+            and "SEQUENCE_ORDER" in skills
         )
 
         needs_fine_detail = (
             state is not None
-            and is_fine_detail_question(
-                state.question
-            )
+            and "LOCAL_DETAIL" in skills
             and not needs_recurrence
         )
 
