@@ -205,6 +205,62 @@ def format_choices(
     )
 
 
+FINE_DETAIL_TERMS = (
+    "wearing",
+    "holding",
+    "hand",
+    "gesture",
+    "screen",
+    "subtitle",
+    "appeared",
+    "changed",
+    "change occurs",
+    "color",
+    "colour",
+    "object",
+    "doing with",
+    "what is he doing",
+    "what is she doing",
+    "what happened",
+    "what was done",
+)
+
+
+SEQUENCE_TERMS = (
+    "sequence",
+    "order",
+    "ordered",
+    "before",
+    "after",
+    "then",
+    "following events",
+    "following scenes",
+    "workflow",
+    "steps",
+    "stages",
+)
+
+
+def is_fine_detail_question(
+    question: str,
+):
+    text = str(question or "").lower()
+    return any(
+        term in text
+        for term in FINE_DETAIL_TERMS
+    )
+
+
+def is_sequence_question(
+    question: str,
+):
+    text = str(question or "").lower()
+    return any(
+        term in text
+        for term in SEQUENCE_TERMS
+    )
+
+
 def neutral_profiler_result(
     *,
     execution_mode="agentic",
@@ -3001,6 +3057,9 @@ class VideoAgentController:
                 "local_detail",
                 "generic_local_mcq",
             }
+            or is_fine_detail_question(
+                state.question
+            )
         )
 
         needs_sequence_detail = (
@@ -3008,6 +3067,9 @@ class VideoAgentController:
             or (
                 requirement == "global"
                 and relation == "ordering"
+            )
+            or is_sequence_question(
+                state.question
             )
         )
 
@@ -3445,6 +3507,9 @@ Return ONLY JSON:
                 "local_detail",
                 "generic_local_mcq",
             }
+            or is_fine_detail_question(
+                state.question
+            )
         )
 
         needs_sequence_detail = (
@@ -3452,6 +3517,9 @@ Return ONLY JSON:
             or (
                 requirement == "global"
                 and relation == "ordering"
+            )
+            or is_sequence_question(
+                state.question
             )
         )
 
@@ -3700,6 +3768,39 @@ Return ONLY JSON:
             parsed[
                 "missing_information"
             ] = discriminator_query
+
+        if (
+            needs_fine_detail
+            and confidence < 5.0
+        ):
+            parsed[
+                "sufficient"
+            ] = False
+
+            parsed[
+                "confidence"
+            ] = min(
+                float(
+                    parsed.get(
+                        "confidence",
+                        0.0,
+                    )
+                ),
+                4.0,
+            )
+
+            confidence = float(
+                parsed[
+                    "confidence"
+                ]
+            )
+
+            if not parsed.get(
+                "missing_information"
+            ):
+                parsed[
+                    "missing_information"
+                ] = discriminator_query
 
         if (
             needs_sequence_detail
@@ -4137,6 +4238,20 @@ Return ONLY JSON:
                 "local_detail",
                 "generic_local_mcq",
             }
+            or is_fine_detail_question(
+                state.question
+            )
+        )
+
+        needs_sequence_detail = (
+            evidence_type == "sequence"
+            or (
+                requirement == "global"
+                and relation == "ordering"
+            )
+            or is_sequence_question(
+                state.question
+            )
         )
 
         local_ids = [
@@ -5082,6 +5197,163 @@ Return ONLY JSON:
 
             "confidence":
                 confidence,
+
+            "latency_s":
+                latency,
+        }
+
+
+    def remap_answer_to_choice(
+        self,
+        *,
+        state: AgentState,
+        choices: list[str],
+        prediction: str,
+        reason: str,
+    ):
+        valid = valid_choice_labels(
+            choices
+        )
+
+        prediction = normalize_answer(
+            prediction
+        )
+
+        history = compact_evidence_payload(
+            state.evidence,
+        )
+
+        memory = compact_memory_for_prompt(
+            state,
+            max_segments=int(
+                state.policy.get(
+                    "max_final_memory_segments",
+                    96,
+                )
+                or 96
+            ),
+        )
+
+        prompt = f"""
+        Verify the final multiple-choice label. The evidence/reason may
+        describe the right visual answer while using the wrong option letter.
+
+        Question:
+        {state.question}
+
+        Choices:
+        {format_choices(choices)}
+
+        Current prediction:
+        {prediction}
+
+        Current reason:
+        {reason}
+
+        Evidence:
+        {json.dumps(history, ensure_ascii=False)}
+
+        Video memory:
+        {json.dumps(memory, ensure_ascii=False)}
+
+        RULES:
+        1. Use the evidence and video memory as the factual source.
+        2. Compare the visual answer described by the evidence/reason
+           against the exact text of every option.
+        3. Return the option letter whose text best matches the supported
+           visual facts.
+        4. If the current prediction already matches the option text, keep it.
+        5. Do not choose an option only because the question setup repeats.
+
+        Return ONLY JSON:
+
+        {{
+          "prediction": "A",
+          "reason": "brief explanation of the option-text match"
+        }}
+
+        Prediction must be exactly one of:
+        {sorted(valid)}
+        """
+
+        t0 = time.time()
+
+        response = (
+            self.client
+            .chat.completions
+            .create(
+                model=
+                    self.model,
+
+                messages=[{
+                    "role":
+                        "user",
+
+                    "content":
+                        prompt,
+                }],
+
+                temperature=
+                    0,
+            )
+        )
+
+        latency = (
+            time.time()
+            - t0
+        )
+
+        parsed = extract_json(
+            response
+            .choices[0]
+            .message.content
+        )
+
+        if not isinstance(
+            parsed,
+            dict,
+        ):
+            return {
+                "prediction":
+                    prediction
+                    if prediction in valid
+                    else "",
+
+                "reason":
+                    reason,
+
+                "latency_s":
+                    latency,
+            }
+
+        remapped = normalize_answer(
+            parsed.get(
+                "prediction",
+                "",
+            )
+        )
+
+        if remapped not in valid:
+            remapped = (
+                prediction
+                if prediction in valid
+                else ""
+            )
+
+        remap_reason = str(
+            parsed.get(
+                "reason",
+                "",
+            )
+            or reason
+        )
+
+        return {
+            "prediction":
+                remapped,
+
+            "reason":
+                remap_reason,
 
             "latency_s":
                 latency,
@@ -6934,6 +7206,7 @@ class VideoAgent(
         self,
         assessment,
         choices,
+        state=None,
     ):
         answer = normalize_answer(
             assessment.get(
@@ -6980,6 +7253,48 @@ class VideoAgent(
             return False
 
         if missing_information:
+            return False
+
+        needs_fine_detail = (
+            state is not None
+            and is_fine_detail_question(
+                state.question
+            )
+        )
+
+        if needs_fine_detail:
+            if confidence < 5.0:
+                return False
+
+            fine_actions = {
+                "IMAGE_CAPTION",
+                "VERIFY_DETAIL",
+                "ZOOM_CAPTION",
+            }
+
+            for value in support_evidence_ids:
+                try:
+                    index = int(
+                        value
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+                if not (
+                    0 <= index < len(
+                        state.evidence
+                    )
+                ):
+                    continue
+
+                if (
+                    state.evidence[
+                        index
+                    ].action
+                    in fine_actions
+                ):
+                    return True
+
             return False
 
         return bool(
@@ -7178,6 +7493,22 @@ class VideoAgent(
         # ----------------------------------------------------
         # Global
         # ----------------------------------------------------
+
+        if is_sequence_question(
+            state.question
+        ):
+
+            return {
+                "action":
+                    "IMAGE_CAPTION",
+
+                "query":
+                    "caption chronological segment for ordered timeline",
+
+                "reason":
+                    "Lexical sequence question requires ordered "
+                    "timeline evidence.",
+            }
 
         if requirement == "global":
 
@@ -7518,6 +7849,68 @@ class VideoAgent(
         )
 
         if (
+            action != "ANSWER"
+            and needs_sequence_detail
+            and not has_sequence_detail
+        ):
+            action = "IMAGE_CAPTION"
+            decision.pop(
+                "evidence_id",
+                None,
+            )
+            decision.pop(
+                "start_s",
+                None,
+            )
+            decision.pop(
+                "end_s",
+                None,
+            )
+            decision[
+                "query"
+            ] = (
+                "caption the next chronological segment and preserve "
+                "the order of visible events for sequence comparison"
+            )
+            decision[
+                "reason"
+            ] = (
+                "sequence question needs ordered timeline evidence "
+                "before local semantic search"
+            )
+
+        elif (
+            action == "SEARCH_LOCAL"
+            and needs_sequence_detail
+            and has_sequence_detail
+        ):
+            action = "IMAGE_CAPTION"
+            decision.pop(
+                "evidence_id",
+                None,
+            )
+            decision.pop(
+                "start_s",
+                None,
+            )
+            decision.pop(
+                "end_s",
+                None,
+            )
+            decision[
+                "query"
+            ] = (
+                "caption another distinct chronological segment to "
+                "verify event order against the choices"
+            )
+            decision[
+                "reason"
+            ] = (
+                "continue building chronological timeline instead "
+                "of repeating semantic local search"
+            )
+
+        elif (
             action != "ANSWER"
             and needs_fine_detail
             and local_ids
@@ -8889,6 +9282,9 @@ class VideoAgent(
                 or state.policy.get(
                     "evidence_type"
                 ) == "sequence"
+                or is_sequence_question(
+                    state.question
+                )
             )
         ):
             start_s, end_s = (
@@ -10080,6 +10476,10 @@ class VideoAgent(
 
             if assessment.get(
                 "sufficient"
+            ) and self.assessment_has_supported_answer(
+                assessment,
+                choices,
+                state=state,
             ):
                 print(
                     "    confidence threshold reached:",
@@ -10101,6 +10501,7 @@ class VideoAgent(
             if self.assessment_has_supported_answer(
                 assessment,
                 choices,
+                state=state,
             ):
                 state.supported_answer = normalize_answer(
                     assessment.get(
@@ -10407,23 +10808,56 @@ class VideoAgent(
         # ====================================================
 
         if state.supported_answer:
+            remap = (
+                self.controller
+                .remap_answer_to_choice(
+                    state=
+                        state,
+
+                    choices=
+                        choices,
+
+                    prediction=
+                        state.supported_answer,
+
+                    reason=
+                        state.supported_answer_reason
+                        or "",
+                )
+            )
+
+            state.total_latency_s += float(
+                remap[
+                    "latency_s"
+                ]
+            )
+
             answer = {
                 "prediction":
-                    state.supported_answer,
+                    remap[
+                        "prediction"
+                    ],
 
                 "reason":
-                    state.supported_answer_reason
+                    remap[
+                        "reason"
+                    ]
+                    or state.supported_answer_reason
                     or "High-confidence supported answer from assessment.",
 
                 "confidence":
                     state.answer_confidence,
 
                 "latency_s":
-                    0.0,
+                    remap[
+                        "latency_s"
+                    ],
             }
 
             state.final_answer = (
-                state.supported_answer
+                answer[
+                    "prediction"
+                ]
             )
 
         else:
@@ -10447,6 +10881,60 @@ class VideoAgent(
             state.final_answer = (
                 answer[
                     "prediction"
+                ]
+            )
+
+            remap = (
+                self.controller
+                .remap_answer_to_choice(
+                    state=
+                        state,
+
+                    choices=
+                        choices,
+
+                    prediction=
+                        state.final_answer,
+
+                    reason=
+                        answer[
+                            "reason"
+                        ],
+                )
+            )
+
+            state.total_latency_s += float(
+                remap[
+                    "latency_s"
+                ]
+            )
+
+            state.final_answer = (
+                remap[
+                    "prediction"
+                ]
+            )
+
+            answer[
+                "prediction"
+            ] = state.final_answer
+
+            answer[
+                "reason"
+            ] = (
+                remap[
+                    "reason"
+                ]
+                or answer[
+                    "reason"
+                ]
+            )
+
+            answer[
+                "latency_s"
+            ] += float(
+                remap[
+                    "latency_s"
                 ]
             )
 
