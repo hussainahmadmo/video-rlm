@@ -732,6 +732,40 @@ def is_global_summary_question(
     }
 
 
+def is_workflow_summary_question(
+    question,
+):
+    lowered = str(
+        question
+        or ""
+    ).lower()
+
+    return any(
+        phrase in lowered
+        for phrase in (
+            "overall process",
+            "primary objective",
+            "primary elements",
+            "essential components",
+            "workflow",
+            "core techniques",
+            "recurring action",
+            "repeats",
+            "patterns",
+            "turning points",
+            "critical moments",
+            "critical steps",
+            "key sequence",
+            "main stages",
+            "three main stages",
+            "primary tool",
+            "tool used repeatedly",
+            "overarching theme",
+            "overall purpose",
+        )
+    )
+
+
 def derive_causal_action_query(
     question,
 ):
@@ -5340,11 +5374,48 @@ Return ONLY JSON:
             event from the question, then use earlier evidence to decide
             what happened before it.
 
+            20. For GLOBAL_SUMMARY workflow/process questions, build a
+            workflow_table before choosing:
+            - chronological_stages: broad stages in video order
+            - repeated_tools_or_objects: tools/materials/actions observed
+              in more than one timestamp or stage
+            - primary_objective: the best-supported overall task
+            - critical_or_turning_points: steps that change the state of
+              the object/task or reveal the goal
+            Then compare every option against this table. Prefer an option
+            that matches the overall workflow even if another option shares
+            one local action.
+
+            21. For TEMPORAL_AFTER questions, build a post_anchor_timeline:
+            - anchor_event and its approximate time/range
+            - later_event_1, later_event_2, later_event_3 if available
+            - which option each later event supports
+            Choose the option supported by the relevant later event, not
+            merely the first caption that mentions the same actor/object.
+
+            22. For CAUSAL_WHY questions, build a causal_table:
+            - observed_action
+            - preceding_context
+            - concurrent_context
+            - consequence_or_outcome
+            - cause_supported_by_context
+            Choose the option explaining WHY the action happened. Do not
+            choose an option that only restates WHAT happened.
+
             Return ONLY JSON:
 
             {{
             "prediction":
                 "",
+
+            "workflow_table":
+                {{}},
+
+            "post_anchor_timeline":
+                [],
+
+            "causal_table":
+                {{}},
 
             "option_support":
                 {{
@@ -5686,6 +5757,17 @@ Return ONLY JSON:
            the anchor event, not the anchor event itself.
         8. When two choices are near-synonyms, choose the more specific one
            entailed by the evidence.
+        9. For GLOBAL_SUMMARY workflow/process questions, first compare the
+           option text against the whole-video workflow: chronological stages,
+           repeated tools/actions/materials, primary objective, and critical
+           steps. Do not remap to an option that matches only one local moment
+           while contradicting the broader workflow.
+        10. For TEMPORAL_AFTER, create an ordered post-anchor event list from
+            the evidence and map the option to the later event requested by
+            the question.
+        11. For CAUSAL_WHY, separate observed action, preceding context,
+            concurrent context, and outcome. Map to the option that explains
+            the cause, not the option that merely describes the visible action.
 
         Return ONLY JSON:
 
@@ -7644,6 +7726,10 @@ class VideoAgent(
             anchor_id = self.best_anchor_evidence_id(
                 state
             )
+            after_count = self.temporal_context_count(
+                state,
+                action="SEARCH_AFTER",
+            )
 
             if not local_ids and anchor_id is None:
                 action = "SEARCH_LOCAL"
@@ -7684,6 +7770,31 @@ class VideoAgent(
                 ] = (
                     "temporal-after question requires post-anchor "
                     "evidence, not another caption of the trigger"
+                )
+
+            elif after_count < 2:
+                anchor_id = (
+                    anchor_id
+                    if anchor_id is not None
+                    else local_ids[0]
+                )
+                action = "SEARCH_AFTER"
+                decision[
+                    "evidence_id"
+                ] = anchor_id
+                decision[
+                    "query"
+                ] = (
+                    "Inspect another window strictly after the anchor "
+                    "event. Build an ordered post-anchor event list "
+                    "and include the next two visible actions if present."
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "temporal-after question needs multiple post-anchor "
+                    "events so the final answer does not stop at the "
+                    "wrong later action"
                 )
 
         elif "CAUSAL_WHY" in skills:
@@ -8054,6 +8165,18 @@ class VideoAgent(
             for evidence in state.evidence
         )
 
+    def temporal_context_count(
+        self,
+        state,
+        *,
+        action,
+    ):
+        return sum(
+            1
+            for evidence in state.evidence
+            if evidence.action == action
+        )
+
     def has_causal_context(
         self,
         state,
@@ -8249,6 +8372,24 @@ class VideoAgent(
         )
 
         if is_global_summary_only:
+            if is_workflow_summary_question(
+                state.question
+            ):
+                return (
+                    confidence >= 4.0
+                    and bool(
+                        assessment.get(
+                            "support_evidence_ids"
+                        )
+                        or assessment.get(
+                            "support_segment_ids"
+                        )
+                    )
+                    and not text_has_uncertain_support(
+                        combined_text
+                    )
+                )
+
             return bool(
                 assessment.get(
                     "support_evidence_ids"
@@ -8292,6 +8433,14 @@ class VideoAgent(
                     confidence >= 5.0
                     and option_supported
                 )
+            )
+        ):
+            return False
+
+        if (
+            "CAUSAL_WHY" in skills
+            and not self.has_causal_context(
+                state
             )
         ):
             return False
@@ -8362,6 +8511,16 @@ class VideoAgent(
                 break
 
             if not has_temporal_evidence:
+                return False
+
+            if (
+                "TEMPORAL_AFTER" in skills
+                and self.temporal_context_count(
+                    state,
+                    action="SEARCH_AFTER",
+                )
+                < 2
+            ):
                 return False
 
             if text_has_uncertain_support(
@@ -11855,12 +12014,21 @@ class VideoAgent(
             question
         )
 
+        workflow_summary = (
+            summary_only
+            and is_workflow_summary_question(
+                question
+            )
+        )
+
         max_steps = self.max_rounds
 
         if summary_only:
             max_steps = min(
                 max_steps,
-                2,
+                3
+                if workflow_summary
+                else 2,
             )
 
         no_progress = 0
@@ -12072,9 +12240,18 @@ class VideoAgent(
 
                     "reason":
                         (
-                            "broad summary question; inspect "
-                            "chronological context instead of "
-                            "localizing a detail"
+                            (
+                                "workflow summary question; collect "
+                                "chronological stages, repeated tools, "
+                                "and recurring actions instead of "
+                                "localizing a single detail"
+                            )
+                            if workflow_summary
+                            else (
+                                "broad summary question; inspect "
+                                "chronological context instead of "
+                                "localizing a detail"
+                            )
                         ),
                 }
 
