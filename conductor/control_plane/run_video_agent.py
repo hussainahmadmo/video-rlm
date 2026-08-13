@@ -63,6 +63,7 @@ VALID_ACTIONS = {
     "ZOOM_CAPTION",
     "OBJECT_DETECTION",
     "OBJECT_TRACKING",
+    "OPTION_VERIFY",
     "ANSWER",
 }
 
@@ -79,6 +80,7 @@ PLAN_ACTIONS = {
     "ZOOM_CAPTION",
     "OBJECT_DETECTION",
     "OBJECT_TRACKING",
+    "OPTION_VERIFY",
 }
 
 
@@ -147,6 +149,7 @@ class AgentState:
     zoom_caption_count: int = 0
     detection_count: int = 0
     tracking_count: int = 0
+    option_verify_count: int = 0
 
     active_evidence_id: int | None = None
 
@@ -699,6 +702,13 @@ def infer_question_skills(
             "LOCAL_DETAIL"
         )
 
+    if is_object_interaction_question(
+        question
+    ):
+        skills.add(
+            "OBJECT_INTERACTION"
+        )
+
     if asks_for_summary and not (
         skills
         & {
@@ -720,6 +730,127 @@ def infer_question_skills(
         )
 
     return skills
+
+
+def is_object_interaction_question(
+    question,
+):
+    lowered = str(
+        question
+        or ""
+    ).lower()
+
+    object_terms = (
+        "object",
+        "laptop",
+        "paper",
+        "notebook",
+        "blanket",
+        "broom",
+        "towel",
+        "food",
+        "table",
+        "bed",
+        "cup",
+        "glass",
+        "bottle",
+        "sofa",
+        "couch",
+        "chair",
+        "door",
+        "book",
+        "phone",
+        "bag",
+        "box",
+        "clothes",
+        "shoe",
+        "tool",
+    )
+
+    interaction_terms = (
+        "take",
+        "took",
+        "taken",
+        "put down",
+        "pick up",
+        "picked up",
+        "hold",
+        "held",
+        "throw",
+        "threw",
+        "wash",
+        "washed",
+        "tidied",
+        "clean",
+        "move",
+        "moved",
+        "with the",
+        "to the",
+    )
+
+    return (
+        any(
+            term in lowered
+            for term in object_terms
+        )
+        and any(
+            term in lowered
+            for term in interaction_terms
+        )
+    )
+
+
+def is_temporal_object_interaction_question(
+    question,
+):
+    lowered = str(
+        question
+        or ""
+    ).lower()
+
+    return (
+        is_object_interaction_question(
+            question
+        )
+        and (
+            " before " in lowered
+            or lowered.startswith(
+                "before "
+            )
+            or " after " in lowered
+            or lowered.startswith(
+                "after "
+            )
+            or " next " in lowered
+            or "would" in lowered
+            or "sequence" in lowered
+        )
+    )
+
+
+def is_option_verifier_question(
+    question,
+    choices,
+):
+    if not choices or len(
+        choices
+    ) < 2:
+        return False
+
+    skills = infer_question_skills(
+        question
+    )
+
+    return bool(
+        skills
+        & {
+            "OBJECT_INTERACTION",
+            "TEMPORAL_AFTER",
+            "TEMPORAL_BEFORE",
+            "SEQUENCE_ORDER",
+            "LOCAL_DETAIL",
+        }
+    )
 
 
 def is_global_summary_question(
@@ -1382,6 +1513,9 @@ def action_counts(
 
         "OBJECT_TRACKING":
             state.tracking_count,
+
+        "OPTION_VERIFY":
+            state.option_verify_count,
     }
 
 
@@ -1585,6 +1719,7 @@ class UltralyticsObjectTools:
         device: str,
         conf: float = 0.25,
         max_detections: int = 20,
+        classes: list[str] | None = None,
     ):
         try:
             from ultralytics import YOLO
@@ -1598,6 +1733,14 @@ class UltralyticsObjectTools:
         self.device = device
         self.conf = float(conf)
         self.max_detections = int(max_detections)
+        self.classes = [
+            str(item).strip()
+            for item in (
+                classes
+                or []
+            )
+            if str(item).strip()
+        ]
 
         print(
             "Loading object detector:",
@@ -1609,6 +1752,32 @@ class UltralyticsObjectTools:
         self.model = YOLO(
             model_name
         )
+
+        if self.classes:
+            if hasattr(
+                self.model,
+                "set_classes",
+            ):
+                try:
+                    self.model.set_classes(
+                        self.classes
+                    )
+                    print(
+                        "Object detector classes:",
+                        ", ".join(
+                            self.classes
+                        ),
+                    )
+                except Exception as exc:
+                    print(
+                        "Warning: detector does not accept custom "
+                        f"classes ({exc}); using model defaults."
+                    )
+            else:
+                print(
+                    "Warning: detector has no set_classes method; "
+                    "using model defaults."
+                )
 
 
     def _target_terms(
@@ -5228,6 +5397,196 @@ Return ONLY JSON:
         )
 
 
+    def verify_options_from_evidence(
+        self,
+        *,
+        state: AgentState,
+        choices: list[str],
+    ):
+        valid = valid_choice_labels(
+            choices
+        )
+
+        history = compact_evidence_payload(
+            state.evidence,
+        )
+
+        memory = compact_memory_for_prompt(
+            state,
+            max_segments=int(
+                state.policy.get(
+                    "max_final_memory_segments",
+                    96,
+                )
+                or 96
+            ),
+        )
+
+        skills = sorted(
+            infer_question_skills(
+                state.question
+            )
+        )
+
+        prompt = f"""
+You are an option verifier for multiple-choice VideoQA.
+
+Your job is NOT to retrieve more evidence. Your job is to evaluate
+whether each answer option is visually supported by the provided
+video memory and evidence.
+
+Question:
+{state.question}
+
+Inferred question skills:
+{skills}
+
+Choices:
+{format_choices(choices)}
+
+Evidence:
+{json.dumps(history, ensure_ascii=False)}
+
+Video memory:
+{json.dumps(memory, ensure_ascii=False)}
+
+For each option:
+1. Convert the question + option into a concrete visual claim.
+2. Mark the option as one of:
+   - "supported": the claim is directly visible or entailed by
+     timestamped evidence/memory.
+   - "contradicted": evidence supports a different incompatible claim.
+   - "unknown": current evidence does not establish the claim.
+3. For object-action questions, verify the RELATION, not just object
+   presence. Seeing a towel is not enough for "the person washed the
+   towel"; the washing relation must be visible.
+4. For temporal questions, verify order. Seeing both events is not
+   enough; before/after/next must be supported by timestamps or
+   chronological captions.
+5. Do not use the answer choices as evidence. Choices are hypotheses.
+6. Prefer "unknown" over guessing when evidence is insufficient.
+7. Choose a prediction only if one option has stronger direct support
+   than the others. If all are unknown, choose the best-supported
+   option but set confidence_score <= 0.35.
+
+Return ONLY JSON:
+
+{{
+  "prediction": "A",
+  "confidence_score": 0.75,
+  "option_verifications": {{
+    "A": {{
+      "claim": "concrete visual claim",
+      "status": "supported",
+      "supporting_evidence_ids": [0],
+      "supporting_segments": [1],
+      "reason": "brief reason"
+    }}
+  }},
+  "reason": "brief evidence-grounded comparison"
+}}
+
+Prediction must be one of:
+{sorted(valid)}
+"""
+
+        t0 = time.time()
+
+        response = (
+            self.client
+            .chat.completions
+            .create(
+                model=
+                    self.model,
+
+                messages=[{
+                    "role":
+                        "user",
+
+                    "content":
+                        prompt,
+                }],
+
+                temperature=
+                    0,
+            )
+        )
+
+        latency = (
+            time.time()
+            - t0
+        )
+
+        parsed = extract_json(
+            response
+            .choices[0]
+            .message.content
+        )
+
+        if not isinstance(
+            parsed,
+            dict,
+        ):
+            parsed = {
+                "prediction": "",
+                "confidence_score": 0.0,
+                "option_verifications": {},
+                "reason": str(
+                    response
+                    .choices[0]
+                    .message.content
+                ),
+            }
+
+        prediction = normalize_answer(
+            parsed.get(
+                "prediction",
+                "",
+            )
+        )
+
+        if prediction not in valid:
+            prediction = ""
+
+        score = confidence_to_score(
+            parsed.get(
+                "confidence_score",
+                parsed.get(
+                    "confidence",
+                    0.0,
+                ),
+            )
+        )
+
+        if score is None:
+            score = 0.0
+
+        return {
+            "prediction":
+                prediction,
+
+            "confidence_score":
+                score,
+
+            "option_verifications":
+                parsed.get(
+                    "option_verifications",
+                    {},
+                ),
+
+            "reason":
+                str(
+                    parsed.get(
+                        "reason",
+                        "",
+                    )
+                ),
+
+            "latency_s":
+                latency,
+        }
+
+
     def answer_from_evidence(
         self,
         *,
@@ -7677,6 +8036,16 @@ class VideoAgent(
             or "LOCAL_DETAIL" in skills
         )
 
+        needs_object_interaction = (
+            "OBJECT_INTERACTION" in skills
+        )
+
+        needs_temporal_object_interaction = (
+            is_temporal_object_interaction_question(
+                state.question
+            )
+        )
+
         needs_recurrence = (
             "RECURRENCE" in skills
         )
@@ -7701,6 +8070,33 @@ class VideoAgent(
                 "OBJECT_DETECTION",
                 "OBJECT_TRACKING",
             }
+            for evidence in state.evidence
+        )
+
+        has_object_detection = any(
+            evidence.action == "OBJECT_DETECTION"
+            for evidence in state.evidence
+        )
+
+        has_useful_object_detection = any(
+            evidence.action == "OBJECT_DETECTION"
+            and int(
+                evidence.metadata.get(
+                    "num_detections",
+                    0,
+                )
+                or 0
+            ) > 0
+            for evidence in state.evidence
+        )
+
+        has_object_tracking = any(
+            evidence.action == "OBJECT_TRACKING"
+            for evidence in state.evidence
+        )
+
+        has_zoom_caption = any(
+            evidence.action == "ZOOM_CAPTION"
             for evidence in state.evidence
         )
 
@@ -7858,6 +8254,106 @@ class VideoAgent(
                 ] = (
                     "causal why question still needs explicit "
                     "action-plus-context evidence"
+                )
+
+        if (
+            action not in {
+                "SEARCH_BEFORE",
+                "SEARCH_AFTER",
+            }
+            and needs_object_interaction
+        ):
+            if not local_ids:
+                action = "SEARCH_LOCAL"
+                decision[
+                    "query"
+                ] = state.question
+                decision[
+                    "reason"
+                ] = (
+                    "object interaction question: first localize "
+                    "the person-object event"
+                )
+
+            elif not has_object_detection:
+                best = self.best_local_evidence(
+                    state
+                )
+                action = "OBJECT_DETECTION"
+                if best is not None:
+                    decision[
+                        "evidence_id"
+                    ] = best[0]
+                decision[
+                    "target"
+                ] = state.question
+                decision[
+                    "query"
+                ] = (
+                    "detect the relevant object and person-object "
+                    "interaction in the localized window"
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "STAR-style object interaction questions need "
+                    "object grounding before answering"
+                )
+
+            elif (
+                not has_useful_object_detection
+                and not has_zoom_caption
+            ):
+                best = self.best_local_evidence(
+                    state
+                )
+                action = "ZOOM_CAPTION"
+                if best is not None:
+                    decision[
+                        "evidence_id"
+                    ] = best[0]
+                decision[
+                    "target"
+                ] = state.question
+                decision[
+                    "query"
+                ] = (
+                    "zoom-caption the localized person-object event "
+                    "because detector did not ground the object"
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "object detector missed or cannot represent this "
+                    "object class; use visual zoom caption fallback"
+                )
+
+            elif (
+                needs_temporal_object_interaction
+                and not has_object_tracking
+            ):
+                best = self.best_local_evidence(
+                    state
+                )
+                action = "OBJECT_TRACKING"
+                if best is not None:
+                    decision[
+                        "evidence_id"
+                    ] = best[0]
+                decision[
+                    "target"
+                ] = state.question
+                decision[
+                    "query"
+                ] = (
+                    "track the relevant object around the localized "
+                    "event to verify before/after order"
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "temporal object interaction question needs "
+                    "object motion/order evidence"
                 )
 
         if (
@@ -9232,6 +9728,20 @@ class VideoAgent(
             )
         )
 
+        skills = infer_question_skills(
+            state.question
+        )
+
+        needs_object_interaction = (
+            "OBJECT_INTERACTION" in skills
+        )
+
+        needs_temporal_object_interaction = (
+            is_temporal_object_interaction_question(
+                state.question
+            )
+        )
+
         needs_recurrence = is_recurrence_question(
             state.question
         )
@@ -9256,6 +9766,33 @@ class VideoAgent(
                 "OBJECT_DETECTION",
                 "OBJECT_TRACKING",
             }
+            for evidence in state.evidence
+        )
+
+        has_object_detection = any(
+            evidence.action == "OBJECT_DETECTION"
+            for evidence in state.evidence
+        )
+
+        has_useful_object_detection = any(
+            evidence.action == "OBJECT_DETECTION"
+            and int(
+                evidence.metadata.get(
+                    "num_detections",
+                    0,
+                )
+                or 0
+            ) > 0
+            for evidence in state.evidence
+        )
+
+        has_object_tracking = any(
+            evidence.action == "OBJECT_TRACKING"
+            for evidence in state.evidence
+        )
+
+        has_zoom_caption = any(
+            evidence.action == "ZOOM_CAPTION"
             for evidence in state.evidence
         )
 
@@ -9290,6 +9827,113 @@ class VideoAgent(
         )
 
         if (
+            action == "ANSWER"
+            and needs_object_interaction
+            and (
+                not local_ids
+                or not has_object_detection
+                or (
+                    has_object_detection
+                    and not has_useful_object_detection
+                    and not has_zoom_caption
+                )
+                or (
+                    needs_temporal_object_interaction
+                    and not has_object_tracking
+                )
+            )
+        ):
+            if not local_ids:
+                action = "SEARCH_LOCAL"
+                decision[
+                    "query"
+                ] = state.question
+                decision[
+                    "reason"
+                ] = (
+                    "object interaction question cannot answer "
+                    "until the event is localized"
+                )
+
+            elif not has_object_detection:
+                best = self.best_local_evidence(
+                    state
+                )
+                action = "OBJECT_DETECTION"
+                if best is not None:
+                    decision[
+                        "evidence_id"
+                    ] = best[0]
+                decision[
+                    "target"
+                ] = state.question
+                decision[
+                    "query"
+                ] = (
+                    "detect the relevant object and person-object "
+                    "interaction before answering"
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "object interaction answer needs object-grounded "
+                    "evidence"
+                )
+
+            elif (
+                not has_useful_object_detection
+                and not has_zoom_caption
+            ):
+                best = self.best_local_evidence(
+                    state
+                )
+                action = "ZOOM_CAPTION"
+                if best is not None:
+                    decision[
+                        "evidence_id"
+                    ] = best[0]
+                decision[
+                    "target"
+                ] = state.question
+                decision[
+                    "query"
+                ] = (
+                    "zoom-caption the localized person-object event "
+                    "because detector did not ground the object"
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "object detector missed or cannot represent this "
+                    "object class; use visual zoom caption fallback"
+                )
+
+            else:
+                best = self.best_local_evidence(
+                    state
+                )
+                action = "OBJECT_TRACKING"
+                if best is not None:
+                    decision[
+                        "evidence_id"
+                    ] = best[0]
+                decision[
+                    "target"
+                ] = state.question
+                decision[
+                    "query"
+                ] = (
+                    "track the relevant object around the localized "
+                    "event to verify temporal order"
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "temporal object interaction answer needs "
+                    "tracking/order evidence"
+                )
+
+        elif (
             action == "ANSWER"
             and needs_recurrence
             and (
@@ -9345,9 +9989,106 @@ class VideoAgent(
             ] = (
                 "sequence question needs at least three ordered "
                 "timeline evidence items before answering"
-            )
+                )
 
         if (
+            action != "ANSWER"
+            and needs_object_interaction
+        ):
+            if not local_ids:
+                action = "SEARCH_LOCAL"
+                decision[
+                    "query"
+                ] = state.question
+                decision[
+                    "reason"
+                ] = (
+                    "object interaction question needs a localized "
+                    "person-object event"
+                )
+
+            elif not has_object_detection:
+                best = self.best_local_evidence(
+                    state
+                )
+                action = "OBJECT_DETECTION"
+                if best is not None:
+                    decision[
+                        "evidence_id"
+                    ] = best[0]
+                decision[
+                    "target"
+                ] = state.question
+                decision[
+                    "query"
+                ] = (
+                    "detect the relevant object and interaction in "
+                    "the localized window"
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "object interaction question needs object "
+                    "grounding before more captioning"
+                )
+
+            elif (
+                not has_useful_object_detection
+                and not has_zoom_caption
+            ):
+                best = self.best_local_evidence(
+                    state
+                )
+                action = "ZOOM_CAPTION"
+                if best is not None:
+                    decision[
+                        "evidence_id"
+                    ] = best[0]
+                decision[
+                    "target"
+                ] = state.question
+                decision[
+                    "query"
+                ] = (
+                    "zoom-caption the localized person-object event "
+                    "because detector did not ground the object"
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "object detector missed or cannot represent this "
+                    "object class; use visual zoom caption fallback"
+                )
+
+            elif (
+                needs_temporal_object_interaction
+                and not has_object_tracking
+            ):
+                best = self.best_local_evidence(
+                    state
+                )
+                action = "OBJECT_TRACKING"
+                if best is not None:
+                    decision[
+                        "evidence_id"
+                    ] = best[0]
+                decision[
+                    "target"
+                ] = state.question
+                decision[
+                    "query"
+                ] = (
+                    "track the relevant object around the localized "
+                    "event to verify before/after order"
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "temporal object interaction question needs "
+                    "object motion/order evidence"
+                )
+
+        elif (
             action != "ANSWER"
             and needs_recurrence
             and not local_ids
@@ -11901,6 +12642,160 @@ class VideoAgent(
 
         return decision
 
+
+    def has_option_verification(
+        self,
+        state,
+    ):
+        return any(
+            evidence.action == "OPTION_VERIFY"
+            for evidence in state.evidence
+        )
+
+
+    def execute_option_verification(
+        self,
+        *,
+        state,
+        choices,
+    ):
+        state.option_verify_count += 1
+
+        result = (
+            self.controller
+            .verify_options_from_evidence(
+                state=
+                    state,
+
+                choices=
+                    choices,
+            )
+        )
+
+        score = confidence_to_score(
+            result.get(
+                "confidence_score"
+            )
+        )
+
+        if score is None:
+            score = 0.0
+
+        observation = json.dumps(
+            {
+                "prediction":
+                    result.get(
+                        "prediction",
+                        "",
+                    ),
+
+                "option_verifications":
+                    result.get(
+                        "option_verifications",
+                        {},
+                    ),
+
+                "reason":
+                    result.get(
+                        "reason",
+                        "",
+                    ),
+            },
+            ensure_ascii=False,
+        )
+
+        evidence = Evidence(
+            action=
+                "OPTION_VERIFY",
+
+            query=
+                state.question,
+
+            start_s=
+                0.0,
+
+            end_s=
+                state.duration_s,
+
+            timestamps=
+                [],
+
+            observation=
+                observation,
+
+            confidence=
+                "high"
+                if score >= 0.75
+                else "medium"
+                if score >= 0.45
+                else "low",
+
+            latency_s=
+                float(
+                    result.get(
+                        "latency_s",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+
+            confidence_score=
+                score,
+
+            uncertainty=
+                score_to_uncertainty(
+                    score
+                ),
+
+            tool_name=
+                "OPTION_VERIFY",
+
+            metadata={
+                "prediction":
+                    result.get(
+                        "prediction",
+                        "",
+                    ),
+
+                "option_verifications":
+                    result.get(
+                        "option_verifications",
+                        {},
+                    ),
+            },
+        )
+
+        state.evidence.append(
+            evidence
+        )
+
+        state.total_latency_s += (
+            evidence.latency_s
+        )
+
+        prediction = normalize_answer(
+            result.get(
+                "prediction",
+                "",
+            )
+        )
+
+        if (
+            prediction in valid_choice_labels(
+                choices
+            )
+            and score >= 0.70
+        ):
+            state.supported_answer = prediction
+            state.supported_answer_reason = str(
+                result.get(
+                    "reason",
+                    "",
+                )
+            )
+
+        return evidence
+
     # ========================================================
     # Main agentic loop
     # ========================================================
@@ -11982,6 +12877,11 @@ class VideoAgent(
             )
         )
 
+        needs_option_verifier = is_option_verifier_question(
+            question,
+            choices,
+        )
+
         max_steps = self.max_rounds
 
         if summary_only:
@@ -12060,6 +12960,11 @@ class VideoAgent(
                 assessment,
                 choices,
                 state=state,
+            ) and (
+                not needs_option_verifier
+                or self.has_option_verification(
+                    state
+                )
             ):
                 print(
                     "    confidence threshold reached:",
@@ -12082,6 +12987,11 @@ class VideoAgent(
                 assessment,
                 choices,
                 state=state,
+            ) and (
+                not needs_option_verifier
+                or self.has_option_verification(
+                    state
+                )
             ):
                 state.supported_answer = normalize_answer(
                     assessment.get(
@@ -12241,6 +13151,111 @@ class VideoAgent(
                 f"  round={round_index + 1} "
                 f"action={action}"
             )
+
+            if (
+                action in {
+                    "ANSWER",
+                    "OPTION_VERIFY",
+                }
+                and needs_option_verifier
+                and not self.has_option_verification(
+                    state
+                )
+            ):
+                evidence_before = len(
+                    state.evidence
+                )
+
+                evidence = self.execute_option_verification(
+                    state=
+                        state,
+
+                    choices=
+                        choices,
+                )
+
+                self.record_new_evidence(
+                    state=
+                        state,
+
+                    start_index=
+                        evidence_before,
+
+                    plan={
+                        "action":
+                            "OPTION_VERIFY",
+
+                        "tool":
+                            "OPTION_VERIFY",
+
+                        "query":
+                            state.question,
+
+                        "reason":
+                            "verify each answer option as a visual claim",
+                    },
+                )
+
+                trajectory.append({
+                    "round":
+                        round_index + 1,
+
+                    "phase":
+                        "option_verify",
+
+                    "decision": {
+                        "action":
+                            "OPTION_VERIFY",
+
+                        "tool":
+                            "OPTION_VERIFY",
+
+                        "query":
+                            state.question,
+                    },
+
+                    "evidence_id":
+                        len(
+                            state.evidence
+                        )
+                        - 1,
+                })
+
+                print(
+                    "    evidence",
+                    len(
+                        state.evidence
+                    )
+                    - 1,
+                    "[OPTION_VERIFY]",
+                    f"{evidence.start_s:.2f}",
+                    "->",
+                    f"{evidence.end_s:.2f}",
+                )
+
+                print(
+                    "      ",
+                    evidence.observation,
+                )
+
+                if state.supported_answer:
+                    break
+
+                previous_plan = {
+                    "action":
+                        "OPTION_VERIFY",
+
+                    "tool":
+                        "OPTION_VERIFY",
+
+                    "query":
+                        state.question,
+                }
+
+                continue
+
+            if action == "OPTION_VERIFY":
+                action = "ANSWER"
 
             if action == "ANSWER":
                 break
@@ -13254,6 +14269,16 @@ def main():
     )
 
     parser.add_argument(
+        "--detector-classes",
+        default="",
+        help=(
+            "Comma-separated open-vocabulary detector classes. "
+            "Used when the detector supports set_classes, e.g. "
+            "YOLO-World/YOLOE-style Ultralytics models."
+        ),
+    )
+
+    parser.add_argument(
         "--profiler-model",
         default=None,
     )
@@ -13682,6 +14707,14 @@ def main():
 
             conf=
                 args.detector_conf,
+
+            classes=[
+                item.strip()
+                for item in args.detector_classes.split(
+                    ","
+                )
+                if item.strip()
+            ],
         )
 
     fixed_executor = (
