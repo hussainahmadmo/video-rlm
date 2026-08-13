@@ -732,6 +732,27 @@ def is_global_summary_question(
     }
 
 
+def derive_causal_action_query(
+    question,
+):
+    text = str(
+        question
+        or ""
+    ).strip()
+
+    lowered = text.lower()
+
+    if lowered.startswith(
+        "why "
+    ):
+        text = text[4:].strip()
+
+    return (
+        "Find the visible action/event whose cause is being asked: "
+        + text
+    )
+
+
 def truncate_text(
     value,
     *,
@@ -4584,6 +4605,10 @@ Return ONLY JSON:
             )
         )
 
+        skills = infer_question_skills(
+            state.question
+        )
+
         has_global = any(
             evidence.action == "GLOBAL_SCAN"
             for evidence in state.evidence
@@ -5194,12 +5219,21 @@ Return ONLY JSON:
             ),
         )
 
+        skills = sorted(
+            infer_question_skills(
+                state.question
+            )
+        )
+
         prompt = f"""
             Answer the multiple-choice VideoQA question using ONLY the
             accumulated VIDEO memory and evidence.
 
             Question:
             {state.question}
+
+            Inferred question skills:
+            {skills}
 
             Choices:
             {format_choices(
@@ -5289,6 +5323,22 @@ Return ONLY JSON:
             memory says the person looks at a laptop first, choose the
             laptop option over an art-board option even if both mention
             painting and cloth use.
+
+            17. For CAUSAL_WHY questions, separate the observed action from
+            the cause. Evidence that only repeats the action is not enough
+            to support a cause option. Prefer the option whose cause is
+            most directly entailed by before/during/after context. If two
+            options are semantically close, choose the more specific cause
+            entailed by the evidence.
+
+            18. For TEMPORAL_AFTER questions, first identify the anchor
+            event from the question, then use only later evidence to decide
+            what happened after it. Do not answer with the anchor event
+            itself.
+
+            19. For TEMPORAL_BEFORE questions, first identify the anchor
+            event from the question, then use earlier evidence to decide
+            what happened before it.
 
             Return ONLY JSON:
 
@@ -5590,12 +5640,21 @@ Return ONLY JSON:
             ),
         )
 
+        skills = sorted(
+            infer_question_skills(
+                state.question
+            )
+        )
+
         prompt = f"""
         Verify the final multiple-choice label. The evidence/reason may
         describe the right visual answer while using the wrong option letter.
 
         Question:
         {state.question}
+
+        Inferred question skills:
+        {skills}
 
         Choices:
         {format_choices(choices)}
@@ -5620,6 +5679,13 @@ Return ONLY JSON:
            visual facts.
         4. If the current prediction already matches the option text, keep it.
         5. Do not choose an option only because the question setup repeats.
+        6. For CAUSAL_WHY, choose the option whose cause is most directly
+           entailed by surrounding before/during/after evidence; action-only
+           evidence is not enough.
+        7. For TEMPORAL_AFTER, choose the option supported by evidence after
+           the anchor event, not the anchor event itself.
+        8. When two choices are near-synonyms, choose the more specific one
+           entailed by the evidence.
 
         Return ONLY JSON:
 
@@ -7517,18 +7583,20 @@ class VideoAgent(
             for evidence in state.evidence
         )
 
+        skills = infer_question_skills(
+            state.question
+        )
+
         needs_fine_detail = (
             evidence_type in {
                 "local_detail",
                 "generic_local_mcq",
             }
-            or is_fine_detail_question(
-                state.question
-            )
+            or "LOCAL_DETAIL" in skills
         )
 
-        needs_recurrence = is_recurrence_question(
-            state.question
+        needs_recurrence = (
+            "RECURRENCE" in skills
         )
 
         if needs_recurrence:
@@ -7560,9 +7628,7 @@ class VideoAgent(
                 requirement == "global"
                 and relation == "ordering"
             )
-            or is_sequence_question(
-                state.question
-            )
+            or "SEQUENCE_ORDER" in skills
         )
 
         has_sequence_detail = any(
@@ -7574,7 +7640,150 @@ class VideoAgent(
             for evidence in state.evidence
         )
 
+        if "TEMPORAL_AFTER" in skills:
+            anchor_id = self.best_anchor_evidence_id(
+                state
+            )
+
+            if not local_ids and anchor_id is None:
+                action = "SEARCH_LOCAL"
+                decision[
+                    "query"
+                ] = derive_temporal_anchor_query(
+                    state.question,
+                    "after",
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "temporal-after question: first localize "
+                    "the anchor event before inspecting what follows"
+                )
+
+            elif not self.has_temporal_context_after_anchor(
+                state,
+                action="SEARCH_AFTER",
+            ):
+                anchor_id = (
+                    anchor_id
+                    if anchor_id is not None
+                    else local_ids[0]
+                )
+                action = "SEARCH_AFTER"
+                decision[
+                    "evidence_id"
+                ] = anchor_id
+                decision[
+                    "query"
+                ] = (
+                    "Inspect strictly after the localized anchor "
+                    "event and identify the next visible action."
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "temporal-after question requires post-anchor "
+                    "evidence, not another caption of the trigger"
+                )
+
+        elif "CAUSAL_WHY" in skills:
+            anchor_id = self.best_anchor_evidence_id(
+                state
+            )
+
+            if not local_ids and anchor_id is None:
+                action = "SEARCH_LOCAL"
+                decision[
+                    "query"
+                ] = derive_causal_action_query(
+                    state.question
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "causal why question: first localize the "
+                    "visible action/event whose cause is asked"
+                )
+
+            elif not self.has_temporal_context_after_anchor(
+                state,
+                action="SEARCH_BEFORE",
+            ):
+                anchor_id = (
+                    anchor_id
+                    if anchor_id is not None
+                    else local_ids[0]
+                )
+                action = "SEARCH_BEFORE"
+                decision[
+                    "evidence_id"
+                ] = anchor_id
+                decision[
+                    "query"
+                ] = (
+                    "Inspect immediately before the action/event "
+                    "to find visual cause or motivation context."
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "causal why question needs context before "
+                    "the observed action, not only the action itself"
+                )
+
+            elif not self.has_temporal_context_after_anchor(
+                state,
+                action="SEARCH_AFTER",
+            ):
+                anchor_id = (
+                    anchor_id
+                    if anchor_id is not None
+                    else local_ids[0]
+                )
+                action = "SEARCH_AFTER"
+                decision[
+                    "evidence_id"
+                ] = anchor_id
+                decision[
+                    "query"
+                ] = (
+                    "Inspect immediately after the action/event "
+                    "for visual outcome or cause context."
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "causal why question needs surrounding context "
+                    "before selecting a cause option"
+                )
+
+            elif not self.has_causal_context(
+                state
+            ):
+                action = "IMAGE_CAPTION"
+                if anchor_id is not None:
+                    decision[
+                        "evidence_id"
+                    ] = anchor_id
+                decision[
+                    "query"
+                ] = (
+                    "Caption the localized action together with "
+                    "nearby context and compare possible causes."
+                )
+                decision[
+                    "reason"
+                ] = (
+                    "causal why question still needs explicit "
+                    "action-plus-context evidence"
+                )
+
         if (
+            action not in {
+                "SEARCH_BEFORE",
+                "SEARCH_AFTER",
+            }
+            and
             needs_fine_detail
             and local_ids
             and not has_fine_detail
@@ -7808,6 +8017,60 @@ class VideoAgent(
                     item[1]
                 ),
         )
+
+    def best_anchor_evidence_id(
+        self,
+        state,
+    ):
+        best = self.best_local_evidence(
+            state
+        )
+
+        if best is not None:
+            return best[0]
+
+        best = self.best_evidence(
+            state,
+            actions={
+                "IMAGE_CAPTION",
+                "VERIFY_DETAIL",
+                "ZOOM_CAPTION",
+            },
+        )
+
+        if best is not None:
+            return best[0]
+
+        return None
+
+    def has_temporal_context_after_anchor(
+        self,
+        state,
+        *,
+        action,
+    ):
+        return any(
+            evidence.action == action
+            for evidence in state.evidence
+        )
+
+    def has_causal_context(
+        self,
+        state,
+    ):
+        contextual_evidence = sum(
+            1
+            for evidence in state.evidence
+            if evidence.action in {
+                "SEARCH_BEFORE",
+                "SEARCH_AFTER",
+                "IMAGE_CAPTION",
+                "VERIFY_DETAIL",
+                "ZOOM_CAPTION",
+            }
+        )
+
+        return contextual_evidence >= 2
 
     def assessment_support_text(
         self,
@@ -8049,6 +8312,18 @@ class VideoAgent(
                 )
 
             has_temporal_evidence = False
+            anchor_end_s = None
+
+            anchor_id = self.best_anchor_evidence_id(
+                state
+            )
+
+            if anchor_id is not None:
+                anchor_end_s = float(
+                    state.evidence[
+                        anchor_id
+                    ].end_s
+                )
 
             for value in assessment.get(
                 "support_evidence_ids",
@@ -8068,11 +8343,23 @@ class VideoAgent(
                 ):
                     continue
 
-                if state.evidence[
+                evidence = state.evidence[
                     index
-                ].action in temporal_actions:
-                    has_temporal_evidence = True
-                    break
+                ]
+
+                if evidence.action not in temporal_actions:
+                    continue
+
+                if (
+                    "TEMPORAL_AFTER" in skills
+                    and evidence.action != "SEARCH_AFTER"
+                    and anchor_end_s is not None
+                    and float(evidence.start_s) < anchor_end_s
+                ):
+                    continue
+
+                has_temporal_evidence = True
+                break
 
             if not has_temporal_evidence:
                 return False
