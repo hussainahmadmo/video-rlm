@@ -7726,10 +7726,6 @@ class VideoAgent(
             anchor_id = self.best_anchor_evidence_id(
                 state
             )
-            after_count = self.temporal_context_count(
-                state,
-                action="SEARCH_AFTER",
-            )
 
             if not local_ids and anchor_id is None:
                 action = "SEARCH_LOCAL"
@@ -7770,31 +7766,6 @@ class VideoAgent(
                 ] = (
                     "temporal-after question requires post-anchor "
                     "evidence, not another caption of the trigger"
-                )
-
-            elif after_count < 2:
-                anchor_id = (
-                    anchor_id
-                    if anchor_id is not None
-                    else local_ids[0]
-                )
-                action = "SEARCH_AFTER"
-                decision[
-                    "evidence_id"
-                ] = anchor_id
-                decision[
-                    "query"
-                ] = (
-                    "Inspect another window strictly after the anchor "
-                    "event. Build an ordered post-anchor event list "
-                    "and include the next two visible actions if present."
-                )
-                decision[
-                    "reason"
-                ] = (
-                    "temporal-after question needs multiple post-anchor "
-                    "events so the final answer does not stop at the "
-                    "wrong later action"
                 )
 
         elif "CAUSAL_WHY" in skills:
@@ -8511,16 +8482,6 @@ class VideoAgent(
                 break
 
             if not has_temporal_evidence:
-                return False
-
-            if (
-                "TEMPORAL_AFTER" in skills
-                and self.temporal_context_count(
-                    state,
-                    action="SEARCH_AFTER",
-                )
-                < 2
-            ):
                 return False
 
             if text_has_uncertain_support(
