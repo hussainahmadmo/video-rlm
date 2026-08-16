@@ -2,9 +2,11 @@
 import argparse
 import importlib.util
 import json
+import queue
 import sys
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
@@ -56,6 +58,18 @@ def completed_keys(path):
     for row in load_jsonl(path):
         keys.add((qid(row), row.get("config_name")))
     return keys
+
+
+def log_result(result):
+    print(
+        f"[done] qid={result.get('qid')} "
+        f"config={result.get('config_name')} "
+        f"pred={result.get('prediction_label')} "
+        f"gold={result.get('answer_label')} "
+        f"correct={result.get('correct')} "
+        f"latency={float(result.get('latency_s') or 0.0):.2f}s",
+        flush=True,
+    )
 
 
 def port_from_base_url(base_url):
@@ -397,6 +411,7 @@ def main():
     parser.add_argument("--ports", default="9000")
     parser.add_argument("--concurrency", type=int, default=None)
     parser.add_argument("--queue-depth", type=int, default=18)
+    parser.add_argument("--prepared-queue-depth", type=int, default=None)
     parser.add_argument("--prep-batch-size", type=int, default=32)
     parser.add_argument("--clip-image-batch-size", type=int, default=128)
     parser.add_argument("--max-tokens", type=int, default=32)
@@ -451,133 +466,156 @@ def main():
         f"examples={len(examples)} planned={len(planned)} "
         f"ports={','.join(ports)} concurrency={concurrency} "
         f"queue_depth={args.queue_depth} "
+        f"prepared_queue_depth={args.prepared_queue_depth or args.queue_depth} "
         f"prep_batch_size={args.prep_batch_size} "
         f"clip_image_batch_size={args.clip_image_batch_size}",
         flush=True,
     )
 
+    prepared_queue = queue.Queue(
+        maxsize=args.prepared_queue_depth or args.queue_depth
+    )
+    sentinel = object()
+    prep_errors = []
     send_futures = {}
     total_started = 0
     total_completed = 0
     total_prepared = 0
     started = time.time()
 
-    with ThreadPoolExecutor(max_workers=concurrency) as send_pool:
-        for batch_start in range(0, len(planned), args.prep_batch_size):
-            batch = planned[batch_start:batch_start + args.prep_batch_size]
-            print(
-                f"[batch-prep] {batch_start + 1}-"
-                f"{batch_start + len(batch)} size={len(batch)}",
-                flush=True,
-            )
-            retrievals, batch_latency = batched_clip_retrieve(
-                runner,
-                batch,
-                image_batch_size=args.clip_image_batch_size,
-            )
-
-            for row, retrieval in zip(batch, retrievals):
-                item = row["item"]
-                config = row["config"]
-                key = (qid(item), config["name"])
-                try:
-                    job = build_job_from_batched_retrieval(
-                        runner,
-                        item,
-                        config,
-                        retrieval,
-                        batch_latency,
-                    )
-                except Exception as exc:
-                    import traceback
-
-                    traceback.print_exc()
-                    job = {
-                        "qid": item.get("qid"),
-                        "video_id": item.get("video_id"),
-                        "video": item.get("video"),
-                        "dataset": item.get("dataset"),
-                        "question": item.get("question"),
-                        "choices": item.get("choices"),
-                        "answer_idx": item.get("answer_idx"),
-                        "answer_label": item.get("answer_label"),
-                        "answer": item.get("answer"),
-                        "config_name": config.get("name"),
-                        "method": config.get("method"),
-                        "prepare_error": repr(exc),
-                        "latency_breakdown": dict(runner.LATENCY_STATS),
-                    }
-
-                if key not in prepared_done:
-                    append_jsonl(args.prepared_output, job)
-                    prepared_done.add(key)
-                total_prepared += 1
-
-                while len(send_futures) >= args.queue_depth:
-                    for future in as_completed(list(send_futures), timeout=None):
-                        send_job = send_futures.pop(future)
-                        result = future.result()
-                        append_jsonl(args.results_output, result)
-                        total_completed += 1
-                        print(
-                            f"[done] qid={result.get('qid')} "
-                            f"config={result.get('config_name')} "
-                            f"pred={result.get('prediction_label')} "
-                            f"gold={result.get('answer_label')} "
-                            f"correct={result.get('correct')} "
-                            f"latency={float(result.get('latency_s') or 0.0):.2f}s",
-                            flush=True,
-                        )
-                        break
-
-                base_url = base_urls[total_started % len(base_urls)]
-                future = send_pool.submit(
-                    send.run_one,
-                    job,
-                    base_url,
-                    args.max_tokens,
-                )
-                send_futures[future] = job
-                total_started += 1
+    def prepare_jobs():
+        try:
+            for batch_start in range(0, len(planned), args.prep_batch_size):
+                batch = planned[batch_start:batch_start + args.prep_batch_size]
                 print(
-                    f"[send] qid={qid(job)} "
-                    f"port={port_from_base_url(base_url)} "
-                    f"inflight={len(send_futures)}",
+                    f"[batch-prep] {batch_start + 1}-"
+                    f"{batch_start + len(batch)} size={len(batch)}",
                     flush=True,
                 )
+                retrievals, batch_latency = batched_clip_retrieve(
+                    runner,
+                    batch,
+                    image_batch_size=args.clip_image_batch_size,
+                )
+
+                for row, retrieval in zip(batch, retrievals):
+                    item = row["item"]
+                    config = row["config"]
+                    key = (qid(item), config["name"])
+                    try:
+                        job = build_job_from_batched_retrieval(
+                            runner,
+                            item,
+                            config,
+                            retrieval,
+                            batch_latency,
+                        )
+                    except Exception as exc:
+                        import traceback
+
+                        traceback.print_exc()
+                        job = {
+                            "qid": item.get("qid"),
+                            "video_id": item.get("video_id"),
+                            "video": item.get("video"),
+                            "dataset": item.get("dataset"),
+                            "question": item.get("question"),
+                            "choices": item.get("choices"),
+                            "answer_idx": item.get("answer_idx"),
+                            "answer_label": item.get("answer_label"),
+                            "answer": item.get("answer"),
+                            "config_name": config.get("name"),
+                            "method": config.get("method"),
+                            "prepare_error": repr(exc),
+                            "latency_breakdown": dict(runner.LATENCY_STATS),
+                        }
+
+                    if key not in prepared_done:
+                        append_jsonl(args.prepared_output, job)
+                        prepared_done.add(key)
+                    prepared_queue.put(job)
+                    print(
+                        f"[prepared] qid={qid(job)} "
+                        f"config={job.get('config_name')} "
+                        f"queue={prepared_queue.qsize()}",
+                        flush=True,
+                    )
+        except BaseException as exc:
+            import traceback
+
+            traceback.print_exc()
+            prep_errors.append(exc)
+        finally:
+            prepared_queue.put(sentinel)
+
+    def submit_job(send_pool, job):
+        nonlocal total_started
+        base_url = base_urls[total_started % len(base_urls)]
+        future = send_pool.submit(
+            send.run_one,
+            job,
+            base_url,
+            args.max_tokens,
+        )
+        send_futures[future] = job
+        total_started += 1
+        print(
+            f"[send] qid={qid(job)} "
+            f"port={port_from_base_url(base_url)} "
+            f"inflight={len(send_futures)} "
+            f"prepared_queue={prepared_queue.qsize()}",
+            flush=True,
+        )
+
+    def drain_done(done_futures):
+        nonlocal total_completed
+        for future in list(done_futures):
+            send_futures.pop(future, None)
+            result = future.result()
+            append_jsonl(args.results_output, result)
+            total_completed += 1
+            log_result(result)
+
+    prep_thread = threading.Thread(target=prepare_jobs, daemon=True)
+    prep_thread.start()
+
+    with ThreadPoolExecutor(max_workers=concurrency) as send_pool:
+        prep_finished = False
+        while not prep_finished or send_futures:
+            while not prep_finished and len(send_futures) < args.queue_depth:
+                try:
+                    timeout = 0.1 if not send_futures else 0.0
+                    job = prepared_queue.get(timeout=timeout)
+                except queue.Empty:
+                    break
+                if job is sentinel:
+                    prep_finished = True
+                    break
+                total_prepared += 1
+                submit_job(send_pool, job)
 
             done_now = [
                 future for future in send_futures
                 if future.done()
             ]
-            for future in done_now:
-                result = future.result()
-                send_futures.pop(future)
-                append_jsonl(args.results_output, result)
-                total_completed += 1
-                print(
-                    f"[done] qid={result.get('qid')} "
-                    f"config={result.get('config_name')} "
-                    f"pred={result.get('prediction_label')} "
-                    f"gold={result.get('answer_label')} "
-                    f"correct={result.get('correct')} "
-                    f"latency={float(result.get('latency_s') or 0.0):.2f}s",
-                    flush=True,
-                )
+            if done_now:
+                drain_done(done_now)
+                continue
 
-        for future in as_completed(send_futures):
-            result = future.result()
-            append_jsonl(args.results_output, result)
-            total_completed += 1
-            print(
-                f"[done] qid={result.get('qid')} "
-                f"config={result.get('config_name')} "
-                f"pred={result.get('prediction_label')} "
-                f"gold={result.get('answer_label')} "
-                f"correct={result.get('correct')} "
-                f"latency={float(result.get('latency_s') or 0.0):.2f}s",
-                flush=True,
-            )
+            if send_futures:
+                done_now, _ = wait(
+                    list(send_futures),
+                    timeout=0.2,
+                    return_when=FIRST_COMPLETED,
+                )
+                if done_now:
+                    drain_done(done_now)
+            elif not prep_finished:
+                time.sleep(0.05)
+
+    prep_thread.join()
+    if prep_errors:
+        raise prep_errors[0]
 
     print(
         f"prepared={total_prepared} sent={total_started} "
