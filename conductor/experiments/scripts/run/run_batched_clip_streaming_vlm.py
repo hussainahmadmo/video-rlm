@@ -76,6 +76,14 @@ def port_from_base_url(base_url):
     return base_url.rsplit(":", 1)[-1].split("/", 1)[0]
 
 
+def frames_to_numpy(frames):
+    if hasattr(frames, "cpu"):
+        return frames.cpu().numpy()
+    if hasattr(frames, "asnumpy"):
+        return frames.asnumpy()
+    return np.asarray(frames)
+
+
 def make_scan_indices(runner, video_path, scan_fps):
     vr = runner.get_vr(video_path)
     fps = float(vr.get_avg_fps())
@@ -169,7 +177,7 @@ def batched_clip_retrieve(runner, batch, *, image_batch_size):
             decode_s += time.time() - t0
 
             t0 = time.time()
-            cpu_frames = frames.cpu().numpy()
+            cpu_frames = frames_to_numpy(frames)
             runner.sync_device()
             copy_s += time.time() - t0
 
