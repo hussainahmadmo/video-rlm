@@ -2895,7 +2895,10 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
 
 
             config = {
-                "name": "vimio",
+                "name": p.get(
+                    "chosen_config",
+                    p.get("selected_config", "vimio"),
+                ),
                 "method": "clip_oneshot",
                 "scan_fps": p["probe_fps"],
                 "clip_topk": p["probe_topk"],
@@ -2914,8 +2917,13 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
                 "use_choice_sequence_verifier": bool(
                     p.get("use_choice_sequence_verifier")
                 ),
+                "scheduler_reason": p.get("scheduler_reason"),
+                "scheduler_query_class": p.get("scheduler_query_class"),
+                "scheduler_gpu_state": p.get("scheduler_gpu_state"),
                 "answer_with_confidence": True,
-                "enable_evidence_fallback": True,
+                "enable_evidence_fallback": bool(
+                    p.get("enable_evidence_fallback", True)
+                ),
             }
 
             if config["evidence_type"] == "sequence_ordering":
@@ -3060,6 +3068,15 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
                 ),
                 "fallback_config": pred.get(
                     "fallback_config"
+                ),
+                "scheduler_reason": config.get(
+                    "scheduler_reason"
+                ),
+                "scheduler_query_class": config.get(
+                    "scheduler_query_class"
+                ),
+                "scheduler_gpu_state": config.get(
+                    "scheduler_gpu_state"
                 ),
                 "error": error,
                 "retrieval_effort":
