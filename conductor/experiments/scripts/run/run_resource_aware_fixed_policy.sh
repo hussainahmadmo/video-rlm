@@ -8,6 +8,7 @@ DATASET="${DATASET:-$ROOT/conductor/experiments/diverse_eval/agent_friendly_egos
 OUT_DIR="${OUT_DIR:-$ROOT/conductor/experiments/large_sweeps/resource_aware_fixed_$(date +%Y%m%d_%H%M%S)}"
 PORTS="${PORTS:-9000}"
 CLIP_DEVICE="${CLIP_DEVICE:-cpu}"
+DECORD_CTX="${DECORD_CTX:-cpu}"
 MAX_EXAMPLES="${MAX_EXAMPLES:-}"
 FORCE_TIER="${FORCE_TIER:-}"
 SELECTOR_MODEL="${SELECTOR_MODEL:-}"
@@ -19,6 +20,7 @@ export PYTHONPATH="$ROOT/decord/python:$ROOT"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export CLIP_DEVICE
+export DECORD_CTX
 export DECORD_EOF_RETRY_MAX="${DECORD_EOF_RETRY_MAX:-20480}"
 
 SCHEDULE="$OUT_DIR/resource_aware_schedule.jsonl"

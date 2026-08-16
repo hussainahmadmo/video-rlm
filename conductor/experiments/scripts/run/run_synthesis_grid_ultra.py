@@ -27,6 +27,7 @@ print("PYTHON:", sys.executable)
 print("CWD:", __file__)
 
 CLIP_DEVICE = os.environ.get("CLIP_DEVICE", "cuda:0")
+DECORD_CTX = os.environ.get("DECORD_CTX", "cpu")
 
 VLM_BASE_URL = os.environ.get(
     "VLM_BASE_URL",
@@ -45,6 +46,10 @@ _CLIP_DEVICE = None
 _VR_CACHE = {}
 
 
+def add_latency(name, value):
+    LATENCY_STATS[name] = LATENCY_STATS.get(name, 0.0) + float(value)
+
+
 def sync_device():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -55,19 +60,35 @@ from decord import gpu
 from decord import bridge
 bridge.set_bridge("torch")
 
+
+def parse_decord_ctx():
+    raw = str(DECORD_CTX or "cpu").strip().lower()
+    if raw.startswith("gpu"):
+        parts = raw.split(":", 1)
+        device_id = int(parts[1]) if len(parts) == 2 and parts[1] else 0
+        return gpu(device_id), f"gpu:{device_id}"
+    return cpu(0), "cpu"
+
+
 class DecordVideo:
 
     def __init__(self, path):
         self.path = path
+        ctx, ctx_name = parse_decord_ctx()
+        t0 = time.time()
 
         self.vr = VideoReader(
             path,
-            ctx=cpu(0),
+            ctx=ctx,
             width=224,
             height=224,
             )
-        
-        print("CPU decode enabled")
+
+        add_latency("video_open_s", time.time() - t0)
+        LATENCY_STATS["decord_gpu_decode_enabled"] = (
+            1.0 if ctx_name.startswith("gpu") else 0.0
+        )
+        print(f"Decord decode enabled: {ctx_name}")
 
         self.nframes = len(self.vr)
 
@@ -174,6 +195,50 @@ def append_jsonl(row, path):
         f.write(json.dumps(row) + "\n")
 
 
+def latency_value(name):
+    value = LATENCY_STATS.get(name, 0.0)
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def build_stage_latency_summary(total_latency_s):
+    clip_retrieval_s = latency_value("clip_total_s")
+    if clip_retrieval_s <= 0:
+        clip_retrieval_s = sum(
+            latency_value(name)
+            for name in (
+                "clip_decode_s",
+                "clip_gpu_cpu_copy_s",
+                "clip_pil_s",
+                "clip_processor_s",
+                "clip_image_encode_s",
+                "clip_text_s",
+                "clip_score_s",
+            )
+        )
+
+    frame_pack_s = latency_value("frame_extract_s")
+    if frame_pack_s <= 0:
+        frame_pack_s = sum(
+            latency_value(name)
+            for name in (
+                "answer_decode_s",
+                "gpu_cpu_copy_s",
+                "pil_s",
+                "jpeg_base64_s",
+            )
+        )
+
+    vlm_s = latency_value("vlm_call_s") + latency_value("llm_request_s")
+    measured = clip_retrieval_s + frame_pack_s + vlm_s
+    return {
+        "clip_retrieval_s": clip_retrieval_s,
+        "answer_frame_pack_s": frame_pack_s,
+        "vlm_generation_s": vlm_s,
+        "other_s": max(0.0, float(total_latency_s) - measured),
+        "total_s": float(total_latency_s),
+    }
+
+
 def make_uniform_windows(duration_s, num_windows):
     window_size = duration_s / num_windows
     return [
@@ -197,6 +262,7 @@ def pil_to_data_url(img, max_side=768, jpeg_quality=85):
 
 
 def sample_uniform_frames(video_path, num_frames, start_s, end_s, max_side=768, jpeg_quality=85):
+    t0 = time.time()
     vr = get_vr(video_path)
     fps = float(vr.get_avg_fps())
     n = len(vr)
@@ -233,13 +299,27 @@ def sample_uniform_frames(video_path, num_frames, start_s, end_s, max_side=768, 
             unique_timestamps.append(ts)
             seen.add(idx)
 
+    sync_device()
+    t_decode = time.time()
     batch = vr.get_batch(unique_idxs)
+    sync_device()
+    add_latency("answer_decode_s", time.time() - t_decode)
+
+    t_copy = time.time()
+    cpu_batch = batch.cpu().numpy()
+    sync_device()
+    add_latency("gpu_cpu_copy_s", time.time() - t_copy)
+
     print(type(batch))
     print(batch.device)
 
     images = []
-    for arr in batch:
-        img = Image.fromarray(arr.cpu().numpy()).convert("RGB")
+    for arr in cpu_batch:
+        t_pil = time.time()
+        img = Image.fromarray(arr).convert("RGB")
+        add_latency("pil_s", time.time() - t_pil)
+
+        t_jpeg = time.time()
         images.append(
             pil_to_data_url(
                 img,
@@ -247,6 +327,9 @@ def sample_uniform_frames(video_path, num_frames, start_s, end_s, max_side=768, 
                 jpeg_quality=jpeg_quality,
             )
         )
+        add_latency("jpeg_base64_s", time.time() - t_jpeg)
+
+    add_latency("frame_extract_s", time.time() - t0)
 
     return {
         "video_path": video_path,
@@ -908,7 +991,9 @@ def call_vlm_images(frames, prompt, max_tokens=512):
         "text": prompt,
     })
 
-    t_vlm = time.time()
+    add_latency("vlm_prepare_s", time.time() - t0)
+
+    t_request = time.time()
 
     resp = client.chat.completions.create(
         model=VLM_MODEL,
@@ -922,7 +1007,9 @@ def call_vlm_images(frames, prompt, max_tokens=512):
         max_tokens=max_tokens,
     )
 
-    LATENCY_STATS["vlm_call_s"] = time.time() - t0
+    add_latency("vlm_request_s", time.time() - t_request)
+    add_latency("vlm_call_s", time.time() - t0)
+    add_latency("vlm_call_count", 1)
 
     return resp.choices[0].message.content
 
@@ -947,6 +1034,7 @@ def call_llm_answer(prompt, max_tokens=32):
     print("[REAL LLM CALL]", flush=True)
 
     for attempt in range(2):
+        t_request = time.time()
         resp = client.chat.completions.create(
             model=VLM_MODEL,
             messages=[
@@ -958,6 +1046,8 @@ def call_llm_answer(prompt, max_tokens=32):
             temperature=0.0,
             max_tokens=max_tokens,
         )
+        add_latency("llm_request_s", time.time() - t_request)
+        add_latency("llm_call_count", 1)
 
         content = resp.choices[0].message.content
 
@@ -1084,20 +1174,19 @@ def clip_topk_windows(
 
     sync_device()
 
-    LATENCY_STATS["clip_text_s"] = (
-        LATENCY_STATS.get("clip_text_s", 0)
-        + (time.time() - t_text)
-    )
+    add_latency("clip_text_s", time.time() - t_text)
 
     text_feat = text_feat / text_feat.norm(
         dim=-1,
         keepdim=True,
     )
 
+    t_score = time.time()
     scores_by_query = scan["features"] @ text_feat.T
     scores = scores_by_query.max(dim=1).values
 
     scores = scores.cpu().numpy()
+    add_latency("clip_score_s", time.time() - t_score)
     raw_top = np.argsort(scores)[::-1][:k]
     print("\n[BASELINE TOPK]")
 
@@ -1144,7 +1233,8 @@ def clip_topk_windows(
             "score": float(scores[idx]),
         })
 
-    LATENCY_STATS["clip_total_s"] = time.time() - t0
+    add_latency("clip_total_s", time.time() - t0)
+    add_latency("clip_retrieval_calls", 1)
 
     candidate_windows_examined = len(scan["windows"])
 
@@ -1441,10 +1531,7 @@ def sample_frames_from_windows(
 
     sync_device()
 
-    LATENCY_STATS["answer_decode_s"] = (
-        LATENCY_STATS.get("answer_decode_s", 0)
-        + (time.time() - t_decode)
-    )
+    add_latency("answer_decode_s", time.time() - t_decode)
 
     sync_device()
 
@@ -1454,10 +1541,7 @@ def sample_frames_from_windows(
 
     sync_device()
 
-    LATENCY_STATS["gpu_cpu_copy_s"] = (
-        LATENCY_STATS.get("gpu_cpu_copy_s", 0)
-        + (time.time() - t_copy)
-    )
+    add_latency("gpu_cpu_copy_s", time.time() - t_copy)
 
     images = []
 
@@ -1467,10 +1551,7 @@ def sample_frames_from_windows(
 
         img = Image.fromarray(arr).convert("RGB")
 
-        LATENCY_STATS["pil_s"] = (
-            LATENCY_STATS.get("pil_s", 0)
-            + (time.time() - t_pil)
-        )
+        add_latency("pil_s", time.time() - t_pil)
 
         t_jpeg = time.time()
 
@@ -1482,14 +1563,9 @@ def sample_frames_from_windows(
             )
         )
 
-        LATENCY_STATS["jpeg_base64_s"] = (
-            LATENCY_STATS.get("jpeg_base64_s", 0)
-            + (time.time() - t_jpeg)
-        )
+        add_latency("jpeg_base64_s", time.time() - t_jpeg)
 
-    LATENCY_STATS["frame_extract_s"] = (
-        time.time() - t0
-    )
+    add_latency("frame_extract_s", time.time() - t0)
 
     return {
         "video_path": video_path,
@@ -2198,10 +2274,12 @@ def build_frame_scan_embeddings(
 
     decode_time = 0.0
     encode_time = 0.0
+    copy_time = 0.0
+    pil_time = 0.0
+    processor_time = 0.0
 
     all_feats = []
     all_times = []
-    resize_time = 0.0
 
     for start in range(0, len(scan_idxs), 256):
         chunk = scan_idxs[start:start+256]
@@ -2229,12 +2307,19 @@ def build_frame_scan_embeddings(
         sync_device()
         decode_time += time.time() - t
 
-        t_resize = time.time()
-        pil_images = [
-            Image.fromarray(x.cpu().numpy()).convert("RGB")
-            for x in batch
-        ]
+        t_copy = time.time()
+        cpu_batch = batch.cpu().numpy()
+        sync_device()
+        copy_time += time.time() - t_copy
 
+        t_pil = time.time()
+        pil_images = [
+            Image.fromarray(x).convert("RGB")
+            for x in cpu_batch
+        ]
+        pil_time += time.time() - t_pil
+
+        t_processor = time.time()
         inputs = processor(
             images=pil_images,
             return_tensors="pt"
@@ -2244,18 +2329,16 @@ def build_frame_scan_embeddings(
             k: v.to(device)
             for k, v in inputs.items()
         }
+        processor_time += time.time() - t_processor
 
+        t_encode = time.time()
         feats = extract_feature_tensor(
             model.get_image_features(
                 **inputs
             )
         )
         sync_device()
-        resize_time += time.time() - t_resize
-        t = time.time()
-
-        sync_device()
-        encode_time += time.time() - t
+        encode_time += time.time() - t_encode
 
         feats = feats / feats.norm(
             dim=-1,
@@ -2269,8 +2352,11 @@ def build_frame_scan_embeddings(
 
     feats = torch.cat(all_feats, dim=0)
 
-    LATENCY_STATS["clip_decode_s"] = decode_time
-    LATENCY_STATS["clip_encode_s"] = encode_time
+    add_latency("clip_decode_s", decode_time)
+    add_latency("clip_gpu_cpu_copy_s", copy_time)
+    add_latency("clip_pil_s", pil_time)
+    add_latency("clip_processor_s", processor_time)
+    add_latency("clip_image_encode_s", encode_time)
 
     duration_s = nframes / fps
 
@@ -2293,8 +2379,10 @@ def build_frame_scan_embeddings(
     print(
         f"[PROFILE] "
         f"decode={decode_time:.2f}s "
-        f"resize={resize_time:.2f}s "
-        f"encode={encode_time:.2f}s"
+        f"copy={copy_time:.2f}s "
+        f"pil={pil_time:.2f}s "
+        f"processor={processor_time:.2f}s "
+        f"image_encode={encode_time:.2f}s"
     )
     return {
         "timestamps": all_times,
@@ -2984,6 +3072,7 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
             print(f"  [{run_idx}/{total}] run {config['name']}")
 
             start = time.time()
+            LATENCY_STATS.clear()
 
             try:
                 pred = run_single_config_with_evidence_fallback(
@@ -3032,6 +3121,11 @@ def run_experiment(dataset, output, max_examples=None, resume=True, profiler=Non
                 "window_len_s": config.get("window_len_s"),
                 "clip_topk": config.get("clip_topk"),
                 "latency_breakdown": dict(LATENCY_STATS),
+                "stage_latency_s": build_stage_latency_summary(
+                    latency_s
+                ),
+                "decord_ctx": DECORD_CTX,
+                "clip_device": CLIP_DEVICE,
                 "scan_fps": config.get("scan_fps"),
                 "config_name": config["name"],
                 "method": config["method"],
