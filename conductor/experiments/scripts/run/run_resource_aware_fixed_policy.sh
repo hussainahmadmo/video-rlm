@@ -10,6 +10,7 @@ PORTS="${PORTS:-9000}"
 CLIP_DEVICE="${CLIP_DEVICE:-cpu}"
 MAX_EXAMPLES="${MAX_EXAMPLES:-}"
 FORCE_TIER="${FORCE_TIER:-}"
+SELECTOR_MODEL="${SELECTOR_MODEL:-}"
 NO_HARD_QUERY_UPGRADE="${NO_HARD_QUERY_UPGRADE:-0}"
 
 mkdir -p "$OUT_DIR"
@@ -28,6 +29,10 @@ SCHEDULER_ARGS=(
 
 if [ -n "$FORCE_TIER" ]; then
   SCHEDULER_ARGS+=(--force-tier "$FORCE_TIER")
+fi
+
+if [ -n "$SELECTOR_MODEL" ]; then
+  SCHEDULER_ARGS+=(--selector-model "$SELECTOR_MODEL")
 fi
 
 if [ "$NO_HARD_QUERY_UPGRADE" = "1" ]; then

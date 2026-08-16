@@ -3,9 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 from pathlib import Path
 from statistics import mean
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[4]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from conductor.profiler.resource_aware_selector import ResourceAwareSelector
 
 
 PARETO_CONFIGS = {
@@ -255,6 +262,7 @@ def schedule_row(
     tier: str,
     reason: str,
     gpu_state: dict[str, Any],
+    selector_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     config = dict(PARETO_CONFIGS[tier])
     hard_query = is_hard_query(row)
@@ -282,6 +290,7 @@ def schedule_row(
         "scheduler_reason": reason,
         "scheduler_query_class": query_class,
         "scheduler_gpu_state": gpu_state,
+        "scheduler_selector_meta": selector_meta or {},
         "probe_fps": config["probe_fps"],
         "probe_topk": config["probe_topk"],
         "window_len_s": config["window_len_s"],
@@ -300,6 +309,13 @@ def main() -> None:
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--force-tier", choices=TIER_ORDER)
+    parser.add_argument(
+        "--selector-model",
+        help=(
+            "Optional model from train_config_selector.py. "
+            "When set, learned per-question selection replaces keyword rules."
+        ),
+    )
     parser.add_argument("--low-util-pct", type=float, default=35.0)
     parser.add_argument("--high-util-pct", type=float, default=75.0)
     parser.add_argument("--critical-util-pct", type=float, default=92.0)
@@ -314,6 +330,11 @@ def main() -> None:
 
     dataset = load_jsonl(Path(args.dataset))
     gpu_state = query_gpu_state()
+    selector = (
+        ResourceAwareSelector.load(args.selector_model)
+        if args.selector_model and not args.force_tier
+        else None
+    )
     base_tier = args.force_tier or base_tier_from_gpu(
         gpu_state,
         low_util_pct=args.low_util_pct,
@@ -325,12 +346,32 @@ def main() -> None:
     scheduled = []
     counts: dict[str, int] = {}
     for row in dataset:
-        tier, reason = choose_tier(
-            row,
-            base_tier=base_tier,
-            allow_hard_query_upgrade=not args.no_hard_query_upgrade,
-            long_video_s=args.long_video_s,
-        )
+        selector_meta: dict[str, Any] | None = None
+        if selector is not None:
+            tier, reason, selector_meta = selector.choose_config(
+                row,
+                gpu_state,
+            )
+            dur = duration_s(row)
+            if dur is not None and dur >= args.long_video_s:
+                capped = min(
+                    tier,
+                    "scan0.0039_k8_budget32",
+                    key=TIER_ORDER.index,
+                )
+                if capped != tier:
+                    reason = (
+                        f"{reason};long_video_downgrade "
+                        f"{tier}->{capped} duration_s={dur:.1f}"
+                    )
+                    tier = capped
+        else:
+            tier, reason = choose_tier(
+                row,
+                base_tier=base_tier,
+                allow_hard_query_upgrade=not args.no_hard_query_upgrade,
+                long_video_s=args.long_video_s,
+            )
         counts[tier] = counts.get(tier, 0) + 1
         scheduled.append(
             schedule_row(
@@ -338,6 +379,7 @@ def main() -> None:
                 tier=tier,
                 reason=reason,
                 gpu_state=gpu_state,
+                selector_meta=selector_meta,
             )
         )
 
@@ -356,6 +398,7 @@ def main() -> None:
         ),
     )
     print(f"base_tier: {base_tier}")
+    print(f"selector_model: {args.selector_model or 'none'}")
     print("selected configs:")
     for name in TIER_ORDER:
         if counts.get(name):
