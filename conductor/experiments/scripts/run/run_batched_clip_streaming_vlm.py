@@ -60,6 +60,17 @@ def completed_keys(path):
     return keys
 
 
+def load_skip_qids(values, path):
+    skip_qids = set(values or [])
+    if path:
+        for line in Path(path).read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            skip_qids.add(line)
+    return skip_qids
+
+
 def log_result(result):
     print(
         f"[done] qid={result.get('qid')} "
@@ -425,6 +436,17 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--max-examples", type=int, default=None)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument(
+        "--skip-qid",
+        action="append",
+        default=[],
+        help="Question id to skip before video decode. Can be repeated.",
+    )
+    parser.add_argument(
+        "--skip-qids-file",
+        default=None,
+        help="Optional newline-delimited qid file to skip before video decode.",
+    )
     args = parser.parse_args()
 
     prep = import_from_path("build_prepared_vlm_jobs", BUILD_PREPARED_PATH)
@@ -445,8 +467,16 @@ def main():
         result_done = completed_keys(args.results_output)
         prepared_done = completed_keys(args.prepared_output)
 
+    skip_qids = load_skip_qids(args.skip_qid, args.skip_qids_file)
+    if skip_qids:
+        print(f"skip_qids={len(skip_qids)}", flush=True)
+
     planned = []
     for idx, item in enumerate(examples, start=1):
+        item_qid = qid(item)
+        if item_qid in skip_qids:
+            print(f"[{idx}/{len(examples)}] skip requested qid={item_qid}", flush=True)
+            continue
         schedule_row = schedule_by_qid.get(qid(item))
         if schedule_row is None:
             print(f"[skip] missing schedule qid={qid(item)}", flush=True)
