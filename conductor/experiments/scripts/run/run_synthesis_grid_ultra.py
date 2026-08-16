@@ -1,5 +1,6 @@
 import argparse
 import base64
+import hashlib
 import io
 import json
 import time
@@ -28,6 +29,7 @@ print("CWD:", __file__)
 
 CLIP_DEVICE = os.environ.get("CLIP_DEVICE", "cuda:0")
 DECORD_CTX = os.environ.get("DECORD_CTX", "cpu")
+FRAME_PAYLOAD_CACHE_DIR = os.environ.get("FRAME_PAYLOAD_CACHE_DIR", "")
 
 VLM_BASE_URL = os.environ.get(
     "VLM_BASE_URL",
@@ -261,6 +263,62 @@ def pil_to_data_url(img, max_side=768, jpeg_quality=85):
     return f"data:image/jpeg;base64,{b64}"
 
 
+def frame_payload_cache_path(
+    *,
+    video_path,
+    frame_indices,
+    max_side,
+    jpeg_quality,
+):
+    if not FRAME_PAYLOAD_CACHE_DIR:
+        return None
+
+    payload = {
+        "video_path": str(Path(video_path).resolve()),
+        "frame_indices": [int(idx) for idx in frame_indices],
+        "max_side": int(max_side),
+        "jpeg_quality": int(jpeg_quality),
+    }
+    key = hashlib.sha1(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return Path(FRAME_PAYLOAD_CACHE_DIR) / f"{key}.json"
+
+
+def read_frame_payload_cache(cache_path):
+    if cache_path is None or not cache_path.exists():
+        return None
+
+    t0 = time.time()
+    try:
+        row = json.loads(cache_path.read_text())
+    except Exception:
+        return None
+
+    if not isinstance(row.get("images"), list):
+        return None
+
+    add_latency("frame_payload_cache_read_s", time.time() - t0)
+    add_latency("frame_payload_cache_hits", 1)
+    return row
+
+
+def write_frame_payload_cache(cache_path, row):
+    if cache_path is None:
+        return
+
+    t0 = time.time()
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(row))
+        tmp.replace(cache_path)
+        add_latency("frame_payload_cache_write_s", time.time() - t0)
+        add_latency("frame_payload_cache_writes", 1)
+    except Exception as exc:
+        print(f"[FRAME PAYLOAD CACHE WRITE FAILED] {exc}", flush=True)
+
+
 def sample_uniform_frames(video_path, num_frames, start_s, end_s, max_side=768, jpeg_quality=85):
     t0 = time.time()
     vr = get_vr(video_path)
@@ -299,6 +357,19 @@ def sample_uniform_frames(video_path, num_frames, start_s, end_s, max_side=768, 
             unique_timestamps.append(ts)
             seen.add(idx)
 
+    cache_path = frame_payload_cache_path(
+        video_path=video_path,
+        frame_indices=unique_idxs,
+        max_side=max_side,
+        jpeg_quality=jpeg_quality,
+    )
+    cached = read_frame_payload_cache(cache_path)
+    if cached is not None:
+        add_latency("frame_extract_s", time.time() - t0)
+        return cached
+
+    add_latency("frame_payload_cache_misses", 1)
+
     sync_device()
     t_decode = time.time()
     batch = vr.get_batch(unique_idxs)
@@ -331,12 +402,14 @@ def sample_uniform_frames(video_path, num_frames, start_s, end_s, max_side=768, 
 
     add_latency("frame_extract_s", time.time() - t0)
 
-    return {
+    row = {
         "video_path": video_path,
         "timestamps": unique_timestamps,
         "frame_indices": unique_idxs,
         "images": images,
     }
+    write_frame_payload_cache(cache_path, row)
+    return row
 
 
 def format_choices(choices):
@@ -1523,6 +1596,19 @@ def sample_frames_from_windows(
             unique_timestamps.append(ts)
             seen.add(idx)
 
+    cache_path = frame_payload_cache_path(
+        video_path=video_path,
+        frame_indices=unique_idxs,
+        max_side=max_side,
+        jpeg_quality=jpeg_quality,
+    )
+    cached = read_frame_payload_cache(cache_path)
+    if cached is not None:
+        add_latency("frame_extract_s", time.time() - t0)
+        return cached
+
+    add_latency("frame_payload_cache_misses", 1)
+
     sync_device()
 
     t_decode = time.time()
@@ -1567,12 +1653,14 @@ def sample_frames_from_windows(
 
     add_latency("frame_extract_s", time.time() - t0)
 
-    return {
+    row = {
         "video_path": video_path,
         "timestamps": unique_timestamps,
         "frame_indices": unique_idxs,
         "images": images,
     }
+    write_frame_payload_cache(cache_path, row)
+    return row
 
 
 def build_clip_query(item, config=None):
