@@ -79,16 +79,36 @@ class DecordVideo:
         ctx, ctx_name = parse_decord_ctx()
         t0 = time.time()
 
-        self.vr = VideoReader(
-            path,
-            ctx=ctx,
-            width=224,
-            height=224,
+        try:
+            self.vr = VideoReader(
+                path,
+                ctx=ctx,
+                width=224,
+                height=224,
+            )
+        except Exception as exc:
+            if not ctx_name.startswith("gpu"):
+                raise
+            print(
+                f"[DECORD FALLBACK] gpu decode failed for {path}: {exc}; "
+                "retrying with cpu",
+                flush=True,
+            )
+            ctx = cpu(0)
+            ctx_name = "cpu_fallback"
+            self.vr = VideoReader(
+                path,
+                ctx=ctx,
+                width=224,
+                height=224,
             )
 
         add_latency("video_open_s", time.time() - t0)
         LATENCY_STATS["decord_gpu_decode_enabled"] = (
             1.0 if ctx_name.startswith("gpu") else 0.0
+        )
+        LATENCY_STATS["decord_cpu_fallback"] = (
+            1.0 if ctx_name == "cpu_fallback" else 0.0
         )
         print(f"Decord decode enabled: {ctx_name}")
 
