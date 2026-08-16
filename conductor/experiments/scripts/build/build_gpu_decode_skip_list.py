@@ -3,6 +3,7 @@ import argparse
 import json
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
 from pathlib import Path
 
@@ -95,6 +96,41 @@ def run_probe(video, args):
     )
 
 
+def check_probe(idx, total, row_qid, video, args):
+    print(
+        f"[{idx}/{total}] probe qid={row_qid} "
+        f"ctx={args.ctx} video={video}",
+        flush=True,
+    )
+    try:
+        result = run_probe(video, args)
+    except subprocess.TimeoutExpired:
+        return {
+            "qid": row_qid,
+            "video": video,
+            "ok": False,
+            "reason": f"timeout_s={args.timeout_s}",
+            "stderr": "",
+        }
+
+    if result.returncode == 0:
+        return {
+            "qid": row_qid,
+            "video": video,
+            "ok": True,
+            "reason": "ok",
+            "stderr": "",
+        }
+
+    return {
+        "qid": row_qid,
+        "video": video,
+        "ok": False,
+        "reason": f"returncode={result.returncode}",
+        "stderr": result.stderr[-2000:] if result.stderr else "",
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=False)
@@ -106,6 +142,7 @@ def main():
     parser.add_argument("--width", type=int, default=224)
     parser.add_argument("--height", type=int, default=224)
     parser.add_argument("--max-examples", type=int, default=None)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--probe-video", default=None)
     args = parser.parse_args()
 
@@ -133,39 +170,40 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
     bad = []
     ok = 0
+    items = [
+        (idx, len(by_key), row_qid, video)
+        for idx, ((row_qid, video), row) in enumerate(by_key.items(), start=1)
+    ]
 
     with output.open("w") as handle:
-        for idx, ((row_qid, video), row) in enumerate(by_key.items(), start=1):
-            print(
-                f"[{idx}/{len(by_key)}] probe qid={row_qid} "
-                f"ctx={args.ctx} video={video}",
-                flush=True,
-            )
-            try:
-                result = run_probe(video, args)
-            except subprocess.TimeoutExpired:
-                print(
-                    f"[bad] timeout qid={row_qid} timeout_s={args.timeout_s}",
-                    flush=True,
-                )
-                handle.write(row_qid + "\n")
-                handle.flush()
-                bad.append(row_qid)
-                continue
-
-            if result.returncode == 0:
+        def record_result(result):
+            nonlocal ok
+            row_qid = result["qid"]
+            if result["ok"]:
                 ok += 1
-                continue
+                return
 
             print(
-                f"[bad] failed qid={row_qid} returncode={result.returncode}",
+                f"[bad] qid={row_qid} reason={result['reason']}",
                 flush=True,
             )
-            if result.stderr:
-                print(result.stderr[-2000:], flush=True)
+            if result["stderr"]:
+                print(result["stderr"], flush=True)
             handle.write(row_qid + "\n")
             handle.flush()
             bad.append(row_qid)
+
+        if args.workers <= 1:
+            for idx, total, row_qid, video in items:
+                record_result(check_probe(idx, total, row_qid, video, args))
+        else:
+            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                futures = [
+                    pool.submit(check_probe, idx, total, row_qid, video, args)
+                    for idx, total, row_qid, video in items
+                ]
+                for future in as_completed(futures):
+                    record_result(future.result())
 
     print(f"probed: {len(by_key)}")
     print(f"ok: {ok}")
