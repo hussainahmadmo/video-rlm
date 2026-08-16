@@ -57,6 +57,14 @@ def sync_device():
         torch.cuda.synchronize()
 
 
+def frames_to_numpy(frames):
+    if hasattr(frames, "cpu"):
+        return frames.cpu().numpy()
+    if hasattr(frames, "asnumpy"):
+        return frames.asnumpy()
+    return np.asarray(frames)
+
+
 from decord import VideoReader, cpu
 from decord import gpu
 from decord import bridge
@@ -397,12 +405,12 @@ def sample_uniform_frames(video_path, num_frames, start_s, end_s, max_side=768, 
     add_latency("answer_decode_s", time.time() - t_decode)
 
     t_copy = time.time()
-    cpu_batch = batch.cpu().numpy()
+    cpu_batch = frames_to_numpy(batch)
     sync_device()
     add_latency("gpu_cpu_copy_s", time.time() - t_copy)
 
     print(type(batch))
-    print(batch.device)
+    print(getattr(batch, "device", getattr(batch, "ctx", None)))
 
     images = []
     for arr in cpu_batch:
@@ -1202,8 +1210,8 @@ def sample_clip_frames_for_scoring(video_path, window, frames_per_candidate=1):
     idxs = list(dict.fromkeys(idxs))
     batch = vr.get_batch(idxs)
     images = [
-        Image.fromarray(arr.cpu().numpy()).convert("RGB")
-        for arr in batch
+        Image.fromarray(arr).convert("RGB")
+        for arr in frames_to_numpy(batch)
     ]
 
     return images, idxs
@@ -1643,7 +1651,7 @@ def sample_frames_from_windows(
 
     t_copy = time.time()
 
-    cpu_batch = batch.cpu().numpy()
+    cpu_batch = frames_to_numpy(batch)
 
     sync_device()
 
@@ -2416,7 +2424,7 @@ def build_frame_scan_embeddings(
         decode_time += time.time() - t
 
         t_copy = time.time()
-        cpu_batch = batch.cpu().numpy()
+        cpu_batch = frames_to_numpy(batch)
         sync_device()
         copy_time += time.time() - t_copy
 
