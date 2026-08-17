@@ -91,13 +91,6 @@ def feature_names() -> list[str]:
         "question_len_log",
         "choice_count",
         "avg_choice_len_log",
-        "dataset_egoschema",
-        "dataset_intentqa",
-        "dataset_nextqa",
-        "dataset_lvbench",
-        "dataset_vrbench",
-        "dataset_temporalbench",
-        "dataset_star",
         "category_reasoning",
         "category_temporal",
         "category_sequence",
@@ -116,7 +109,6 @@ def extract_features(row: dict[str, Any]) -> dict[str, float]:
         choices = []
 
     duration_s = safe_float(row.get("duration_s"))
-    dataset = str(row.get("dataset") or "").lower()
     category = " ".join(
         str(row.get(key) or "").lower()
         for key in (
@@ -143,13 +135,6 @@ def extract_features(row: dict[str, Any]) -> dict[str, float]:
         "question_len_log": math.log1p(len(tokens)),
         "choice_count": float(len(choices)),
         "avg_choice_len_log": math.log1p(avg_choice_len),
-        "dataset_egoschema": 1.0 if "egoschema" in dataset else 0.0,
-        "dataset_intentqa": 1.0 if "intent" in dataset else 0.0,
-        "dataset_nextqa": 1.0 if "next" in dataset else 0.0,
-        "dataset_lvbench": 1.0 if "lvbench" in dataset else 0.0,
-        "dataset_vrbench": 1.0 if "vrbench" in dataset else 0.0,
-        "dataset_temporalbench": 1.0 if "temporalbench" in dataset else 0.0,
-        "dataset_star": 1.0 if "star" in dataset else 0.0,
         "category_reasoning": 1.0 if "reason" in category else 0.0,
         "category_temporal": 1.0 if "temporal" in category else 0.0,
         "category_sequence": 1.0 if "sequence" in category else 0.0,
