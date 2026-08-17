@@ -12,7 +12,11 @@ ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from conductor.profiler.resource_aware_selector import ResourceAwareSelector
+from conductor.profiler.resource_aware_selector import (
+    Budget2GateSelector,
+    ResourceAwareSelector,
+    apply_gpu_pressure,
+)
 
 
 PARETO_CONFIGS = {
@@ -316,6 +320,25 @@ def main() -> None:
             "When set, learned per-question selection replaces keyword rules."
         ),
     )
+    parser.add_argument(
+        "--budget2-gate-model",
+        help=(
+            "Optional binary model from train_budget2_gate_selector.py. "
+            "When set, budget2 is used only when the gate predicts it is safe."
+        ),
+    )
+    parser.add_argument(
+        "--budget2-gate-threshold",
+        type=float,
+        default=0.5,
+        help="Minimum predicted budget2_ok probability needed to use budget2.",
+    )
+    parser.add_argument(
+        "--budget2-gate-upgrade-config",
+        choices=TIER_ORDER,
+        default="scan0.0039_k8_budget32",
+        help="Config to use when the budget2 gate predicts budget2 is unsafe.",
+    )
     parser.add_argument("--low-util-pct", type=float, default=35.0)
     parser.add_argument("--high-util-pct", type=float, default=75.0)
     parser.add_argument("--critical-util-pct", type=float, default=92.0)
@@ -327,12 +350,21 @@ def main() -> None:
         help="Disable question-driven upgrades and use GPU state only.",
     )
     args = parser.parse_args()
+    if args.selector_model and args.budget2_gate_model:
+        raise SystemExit(
+            "use either --selector-model or --budget2-gate-model, not both"
+        )
 
     dataset = load_jsonl(Path(args.dataset))
     gpu_state = query_gpu_state()
     selector = (
         ResourceAwareSelector.load(args.selector_model)
         if args.selector_model and not args.force_tier
+        else None
+    )
+    budget2_gate = (
+        Budget2GateSelector.load(args.budget2_gate_model)
+        if args.budget2_gate_model and not args.force_tier
         else None
     )
     base_tier = args.force_tier or base_tier_from_gpu(
@@ -347,7 +379,33 @@ def main() -> None:
     counts: dict[str, int] = {}
     for row in dataset:
         selector_meta: dict[str, Any] | None = None
-        if selector is not None:
+        if budget2_gate is not None:
+            prob, selector_meta = budget2_gate.predict_probability(row)
+            predicted = (
+                "budget2"
+                if prob >= args.budget2_gate_threshold
+                else args.budget2_gate_upgrade_config
+            )
+            tier, gpu_reason = apply_gpu_pressure(predicted, gpu_state)
+            reason = (
+                f"budget2_gate p_ok={prob:.3f} "
+                f"threshold={args.budget2_gate_threshold:.3f} "
+                f"predicted={predicted};{gpu_reason}"
+            )
+            dur = duration_s(row)
+            if dur is not None and dur >= args.long_video_s:
+                capped = min(
+                    tier,
+                    "scan0.0039_k8_budget32",
+                    key=TIER_ORDER.index,
+                )
+                if capped != tier:
+                    reason = (
+                        f"{reason};long_video_downgrade "
+                        f"{tier}->{capped} duration_s={dur:.1f}"
+                    )
+                    tier = capped
+        elif selector is not None:
             tier, reason, selector_meta = selector.choose_config(
                 row,
                 gpu_state,

@@ -282,6 +282,76 @@ class ResourceAwareSelector:
         return chosen, reason, meta
 
 
+class Budget2GateSelector:
+    def __init__(self, model: dict[str, Any]):
+        self.model = model
+        self.features = list(model["features"])
+        self.means = list(model["means"])
+        self.stds = list(model["stds"])
+        self.examples = [
+            {
+                "budget2_ok": bool(example["budget2_ok"]),
+                "vector": list(example["vector"]),
+            }
+            for example in model.get("examples", [])
+        ]
+        self.k_neighbors = int(model.get("k_neighbors") or 15)
+        self.default_probability = float(
+            model.get("default_probability", 0.0)
+        )
+
+    @classmethod
+    def load(cls, path: str | Path) -> "Budget2GateSelector":
+        with Path(path).open("rb") as handle:
+            return cls(pickle.load(handle))
+
+    def save(self, path: str | Path) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with Path(path).open("wb") as handle:
+            pickle.dump(self.model, handle)
+
+    def predict_probability(
+        self,
+        row: dict[str, Any],
+    ) -> tuple[float, dict[str, Any]]:
+        if not self.examples:
+            return self.default_probability, {
+                "selector": "budget2_gate",
+                "fallback": "no_examples",
+            }
+
+        raw = vectorize(row, self.features)
+        vec = standardize(raw, self.means, self.stds)
+
+        neighbors = []
+        for example in self.examples:
+            distance = euclidean(vec, example["vector"])
+            neighbors.append((distance, example["budget2_ok"]))
+        neighbors.sort()
+
+        ok_weight = 0.0
+        total_weight = 0.0
+        for distance, ok in neighbors[: self.k_neighbors]:
+            weight = 1.0 / (distance + 1e-6)
+            ok_weight += weight * float(ok)
+            total_weight += weight
+
+        probability = (
+            ok_weight / total_weight
+            if total_weight
+            else self.default_probability
+        )
+        return probability, {
+            "selector": "budget2_gate",
+            "k_neighbors": self.k_neighbors,
+            "probability_budget2_ok": probability,
+            "neighbors": [
+                {"budget2_ok": ok, "distance": distance}
+                for distance, ok in neighbors[: self.k_neighbors]
+            ],
+        }
+
+
 def train_nearest_centroid(
     rows: list[dict[str, Any]],
     *,
@@ -341,6 +411,52 @@ def train_nearest_centroid(
             "label_key": label_key,
             "training_examples": len(training),
             "label_counts": dict(counts),
+        }
+    )
+
+
+def train_budget2_gate(
+    rows: list[dict[str, Any]],
+    *,
+    label_key: str = "budget2_ok",
+    k_neighbors: int = 15,
+) -> Budget2GateSelector:
+    names = feature_names()
+    training = [
+        row
+        for row in rows
+        if label_key in row
+    ]
+    if not training:
+        raise ValueError(f"no rows have {label_key}")
+
+    labels = [bool(row[label_key]) for row in training]
+    vectors = [vectorize(row, names) for row in training]
+    means, stds = fit_standardizer(vectors)
+    standardized = [
+        standardize(vector, means, stds)
+        for vector in vectors
+    ]
+    ok_count = sum(int(label) for label in labels)
+
+    return Budget2GateSelector(
+        {
+            "model_type": "budget2_gate_selector",
+            "features": names,
+            "means": means,
+            "stds": stds,
+            "examples": [
+                {"budget2_ok": label, "vector": vector}
+                for label, vector in zip(labels, standardized)
+            ],
+            "k_neighbors": k_neighbors,
+            "default_probability": ok_count / len(labels),
+            "label_key": label_key,
+            "training_examples": len(training),
+            "label_counts": {
+                "budget2_ok": ok_count,
+                "budget2_not_ok": len(labels) - ok_count,
+            },
         }
     )
 
