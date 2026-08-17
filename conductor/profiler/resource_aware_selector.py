@@ -12,19 +12,45 @@ from typing import Any
 
 TIER_ORDER = [
     "budget2",
+    "budget8",
     "scan0.0039_k8_budget32",
     "w4_k8_budget16",
+    "w8_k8_budget16",
+    "w16_k8_budget16",
     "budget32",
+    "scan0.0156_k8_budget32",
     "scan0.03125_k8_budget32",
+    "scan0.125_k8_budget32",
+    "k1",
+    "k4",
+    "k16",
+    "scan05",
+    "long_sparse_k16_w8_budget32",
+    "temporal_uniform_k8_w16_budget32",
+    "midscan_k12_w12_budget32",
+    "local_neighbors_k16_w4_budget32",
 ]
 
 
 CONFIG_TO_TIER = {
     "budget2": "budget2",
+    "budget8": "budget8",
     "scan0.0039_k8_budget32": "scan0.0039_k8_budget32",
     "w4_k8_budget16": "w4_k8_budget16",
+    "w8_k8_budget16": "w8_k8_budget16",
+    "w16_k8_budget16": "w16_k8_budget16",
     "budget32": "budget32",
+    "scan0.0156_k8_budget32": "scan0.0156_k8_budget32",
     "scan0.03125_k8_budget32": "scan0.03125_k8_budget32",
+    "scan0.125_k8_budget32": "scan0.125_k8_budget32",
+    "k1": "k1",
+    "k4": "k4",
+    "k16": "k16",
+    "scan05": "scan05",
+    "long_sparse_k16_w8_budget32": "long_sparse_k16_w8_budget32",
+    "temporal_uniform_k8_w16_budget32": "temporal_uniform_k8_w16_budget32",
+    "midscan_k12_w12_budget32": "midscan_k12_w12_budget32",
+    "local_neighbors_k16_w4_budget32": "local_neighbors_k16_w4_budget32",
 }
 
 
