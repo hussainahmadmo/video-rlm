@@ -177,6 +177,16 @@ def main() -> None:
     parser.add_argument("--medium-schedule", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dispatch-plan", type=Path)
+    parser.add_argument(
+        "--dispatch-policy",
+        choices=["queue_aware", "fifo"],
+        default="queue_aware",
+        help=(
+            "queue_aware prioritizes costly preparation when the prepared "
+            "queue is empty; fifo is the same implementation/configuration "
+            "but preserves dataset arrival order as a scheduling control."
+        ),
+    )
     parser.add_argument("--ports", default="9000")
     parser.add_argument("--cpu-workers", type=int, default=2)
     parser.add_argument("--vlm-concurrency", type=int, default=1)
@@ -236,7 +246,8 @@ def main() -> None:
         if decision and decision.get("route") != route:
             raise SystemExit(f"plan route mismatch for {qid(row)}")
         pending.append({"row": row, "route": route, "duration_s": value, "cost": cost(route, value), "rank": int((decision or {}).get("dispatch_rank", 10**9)), "decision": decision})
-    pending.sort(key=lambda item: item["rank"])
+    if args.dispatch_policy == "queue_aware":
+        pending.sort(key=lambda item: item["rank"])
     ports = [part.strip() for part in args.ports.split(",") if part.strip()]
     urls = [f"http://127.0.0.1:{port}/v1" for port in ports]
     for url in urls:
@@ -254,6 +265,10 @@ def main() -> None:
     started = time.perf_counter()
 
     def select_pending() -> dict[str, Any]:
+        if args.dispatch_policy == "fifo":
+            item = pending.pop(0)
+            item["live_rule"] = "fifo_arrival_order"
+            return item
         # Empty ready queue: hide a costly preparation behind future VLM work.
         candidates = [item for item in pending if item["route"] != "short_native"]
         if not ready and not prep_futures and candidates:
@@ -349,7 +364,7 @@ def main() -> None:
                         result = {"qid": qid(item["row"]), "dataset": item["row"].get("dataset"), "correct": False, "error": repr(exc), "latency_s": 0.0}
                     record_result(item, result)
     wall_s = time.perf_counter() - started
-    summary = {"method": "dynamic_queue_aware_duration_hybrid", "dataset": str(args.dataset.resolve()), "questions": len(completed), "correct": sum(bool(row.get("correct")) for row in completed), "errors": sum(row.get("error") is not None for row in completed), "accuracy_percent": 100 * sum(bool(row.get("correct")) for row in completed) / len(completed) if completed else 0.0, "wall_time_s": wall_s, "throughput_qps": len(completed) / wall_s if wall_s else 0.0, "routes": dict(Counter(row.get("hybrid_route") for row in completed)), "cpu_workers": args.cpu_workers, "vlm_concurrency": args.vlm_concurrency, "prepared_queue_depth": args.prepared_queue_depth, "ports": ports}
+    summary = {"method": "dynamic_queue_aware_duration_hybrid", "dispatch_policy": args.dispatch_policy, "dataset": str(args.dataset.resolve()), "questions": len(completed), "correct": sum(bool(row.get("correct")) for row in completed), "errors": sum(row.get("error") is not None for row in completed), "accuracy_percent": 100 * sum(bool(row.get("correct")) for row in completed) / len(completed) if completed else 0.0, "wall_time_s": wall_s, "throughput_qps": len(completed) / wall_s if wall_s else 0.0, "routes": dict(Counter(row.get("hybrid_route") for row in completed)), "cpu_workers": args.cpu_workers, "vlm_concurrency": args.vlm_concurrency, "prepared_queue_depth": args.prepared_queue_depth, "ports": ports}
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2), flush=True)
 
