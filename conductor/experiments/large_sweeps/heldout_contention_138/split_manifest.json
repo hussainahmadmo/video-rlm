@@ -1,0 +1,20 @@
+{
+  "split_key": [
+    "dataset",
+    "qid"
+  ],
+  "training_labels": "/tmp/stronger_labels_balanced_train_40x5.jsonl",
+  "adaptive_jobs_source": "/workspace/video-rlm/conductor/experiments/large_sweeps/metis_style_prepared_saturation_249/stronger_learned/prepared_jobs.jsonl",
+  "baseline_jobs_source": "/workspace/video-rlm/conductor/experiments/large_sweeps/metis_style_prepared_saturation_249/budget32/prepared_jobs.jsonl",
+  "training_examples": 200,
+  "source_common_examples": 249,
+  "heldout_examples": 138,
+  "training_overlap": 0,
+  "heldout_by_dataset": {
+    "EgoSchema": 30,
+    "LVBench": 27,
+    "NExT-QA": 15,
+    "STAR": 39,
+    "VRBench": 27
+  }
+}

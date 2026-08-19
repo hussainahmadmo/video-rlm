@@ -1,0 +1,22 @@
+{
+  "dataset": "/dataheart/hussainahmad/video-rlm/conductor/experiments/diverse_eval/agent_friendly_egoschema_nextqa_intentqa.jsonl",
+  "output": "/dataheart/hussainahmad/video-rlm/conductor/experiments/large_sweeps/heldout_contention_138/native_full/results_learned_adaptive_150_clean.jsonl",
+  "method": "native_vllm_learned_adaptive_video",
+  "schedule": "/dataheart/hussainahmad/video-rlm/conductor/experiments/large_sweeps/learned_resource_aware_agent_friendly_150/resource_aware_schedule.jsonl",
+  "frame_counts": [
+    32
+  ],
+  "examples": 150,
+  "planned_this_invocation": 150,
+  "completed_this_invocation": 150,
+  "errors_this_invocation": 0,
+  "correct_this_invocation": 109,
+  "wall_time_s": 89.06846196576953,
+  "throughput_qps": 1.6840977905024055,
+  "ports": [
+    "9000"
+  ],
+  "concurrency": 4,
+  "video_root": "/dataheart/hussainahmad",
+  "video_base_url": "http://127.0.0.1:8088"
+}
