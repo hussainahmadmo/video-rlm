@@ -132,6 +132,15 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--summary-output", type=Path)
     parser.add_argument("--medium-schedule", type=Path, required=True)
+    parser.add_argument(
+        "--dispatch-plan",
+        type=Path,
+        help=(
+            "Optional dispatch_plan.jsonl from build_queue_aware_video_plan.py. "
+            "The plan's route validation and priority order are applied before "
+            "each existing bounded execution pipeline starts."
+        ),
+    )
     parser.add_argument("--ports", default="9000")
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--short-max-s", type=float, default=300.0)
@@ -170,6 +179,19 @@ def main() -> None:
     rows = load_jsonl(args.dataset)
     if args.max_examples is not None:
         rows = rows[:args.max_examples]
+    dispatch_by_qid: dict[str, dict[str, Any]] = {}
+    if args.dispatch_plan:
+        for decision in load_jsonl(args.dispatch_plan):
+            key = str(decision["qid"])
+            if key in dispatch_by_qid:
+                raise SystemExit(f"duplicate qid in dispatch plan: {key}")
+            dispatch_by_qid[key] = decision
+        missing = {row_qid(row) for row in rows} - set(dispatch_by_qid)
+        if missing:
+            raise SystemExit(
+                f"dispatch plan missing {len(missing)} dataset qids; "
+                f"first={sorted(missing)[0]}"
+            )
     routed: dict[str, list[dict[str, Any]]] = defaultdict(list)
     routing_errors: list[dict[str, Any]] = []
     routing_started = time.perf_counter()
@@ -190,14 +212,27 @@ def main() -> None:
                 routed[route].append(enriched)
                 continue
         route = route_for(duration_s, args.short_max_s, args.medium_max_s)
+        decision = dispatch_by_qid.get(row_qid(row))
+        if decision is not None and str(decision["route"]) != route:
+            raise SystemExit(
+                f"dispatch route mismatch qid={row_qid(row)} "
+                f"plan={decision['route']} router={route}"
+            )
         enriched = dict(row)
         enriched["_measured_duration_s"] = duration_s
         enriched["_router_duration_s"] = duration_s
         enriched["_router_duration_source"] = duration_source
+        if decision is not None:
+            enriched["_dispatch_rank"] = decision["dispatch_rank"]
+            enriched["_dispatch_decision_rule"] = decision["decision_rule"]
         routed[route].append(enriched)
     routing_wall_s = time.perf_counter() - routing_started
 
     args.output.mkdir(parents=True, exist_ok=True)
+    for route_rows in routed.values():
+        # This is the order in which a child runner fills its bounded decode /
+        # prepared queues. Dataset order is retained when no plan is supplied.
+        route_rows.sort(key=lambda row: int(row.get("_dispatch_rank", 10**12)))
     parts = args.output / "parts"
     manifest = {
         "dataset": str(args.dataset.resolve()),
@@ -208,6 +243,7 @@ def main() -> None:
         "route_counts": {route: len(values) for route, values in routed.items()},
         "routing_wall_s": routing_wall_s,
         "routing_errors": routing_errors,
+        "dispatch_plan": str(args.dispatch_plan.resolve()) if args.dispatch_plan else None,
     }
     (args.output / "routing_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
@@ -273,6 +309,10 @@ def main() -> None:
     for route, result_path in route_outputs.items():
         for row in load_jsonl(result_path):
             row["hybrid_route"] = route
+            decision = dispatch_by_qid.get(row_qid(row))
+            if decision is not None:
+                row["dispatch_rank"] = decision["dispatch_rank"]
+                row["dispatch_decision_rule"] = decision["decision_rule"]
             merged.append(row)
     expected = Counter(row_qid(row) for row in rows)
     received = Counter(row_qid(row) for row in merged)
