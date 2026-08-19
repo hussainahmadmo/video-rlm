@@ -213,6 +213,10 @@ def main() -> None:
     send = import_path("dynamic_send", SEND_PATH)
     retrieval_runner = prep.import_runner()
     retrieval_lock = threading.Lock()
+    # The retrieval CLIP model and codec SigLIP may share the same GPU as
+    # vLLM. Serialize their bounded scoring/preparation phases so increasing
+    # CPU workers never creates overlapping vision-model peaks and an OOM.
+    vision_prepare_lock = threading.Lock()
     native_args = SimpleNamespace(
         video_mappings=[(args.video_root.resolve(), args.video_base_url)], max_pixels=args.max_pixels,
         model=args.model, max_tokens=args.max_tokens, request_timeout_s=args.request_timeout_s,
@@ -278,9 +282,10 @@ def main() -> None:
         return {"kind": "medium", "job": job}
 
     def prepare_item(item):
-        if item["route"] == "medium_retrieval":
-            return prepare_medium(item)
-        return prepare_codec(codec, item["row"], args.long_frames, codec_args)
+        with vision_prepare_lock:
+            if item["route"] == "medium_retrieval":
+                return prepare_medium(item)
+            return prepare_codec(codec, item["row"], args.long_frames, codec_args)
 
     def choose_url() -> str:
         return min(urls, key=lambda url: (inflight_by_url[url], url))
