@@ -126,6 +126,7 @@ def prepare_codec(codec, row, frame_count: int, codec_args) -> dict[str, Any]:
     content.append({"type": "text", "text": codec.make_prompt(row)})
     return {
         "kind": "codec", "row": row, "content": content,
+        "frame_count": frame_count,
         "duration_s": duration_s, "timestamps": timestamps, "probes": probes,
         "scores": scores, "centers": centers, "packet_windows": len(activity),
         "probe_decode_s": probe_decode_s, "clip_score_s": clip_score_s,
@@ -156,8 +157,8 @@ def finish_codec(codec, prepared: dict[str, Any], client: OpenAI, base_url: str,
         "qid": qid(row), "video_id": row.get("video_id"), "video": row.get("video"),
         "dataset": row.get("dataset"), "question": row.get("question"), "choices": choices,
         "answer_idx": row.get("answer_idx"), "answer_label": gold, "answer": row.get("answer"),
-        "config_name": "codec_refined_8", "method": "codec_guided_query_refined_frames",
-        "retrieval_mode": "codec_siglip_coarse_to_fine", "uniform_frame_count": 8,
+        "config_name": f"codec_refined_{prepared['frame_count']}", "method": "codec_guided_query_refined_frames",
+        "retrieval_mode": "codec_siglip_coarse_to_fine", "uniform_frame_count": prepared["frame_count"],
         "max_pixels": codec_args.max_pixels, "duration_s": prepared["duration_s"],
         "selected_timestamps_s": prepared["timestamps"], "probe_timestamps_s": prepared["probes"],
         "probe_scores": prepared["scores"], "refinement_centers_s": prepared["centers"],
