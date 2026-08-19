@@ -53,8 +53,8 @@ def add_latency(name, value):
 
 
 def sync_device():
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    if torch.cuda.is_available() and str(CLIP_DEVICE).startswith("cuda"):
+        torch.cuda.synchronize(torch.device(CLIP_DEVICE))
 
 
 def frames_to_numpy(frames):

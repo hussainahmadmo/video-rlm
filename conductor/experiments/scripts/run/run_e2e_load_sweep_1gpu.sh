@@ -18,8 +18,13 @@ TASK_ANSWER_FRAME_WORKERS=${TASK_ANSWER_FRAME_WORKERS:-1}
 TASK_DECODE_AHEAD_BATCHES=${TASK_DECODE_AHEAD_BATCHES:-2}
 TASK_DECODE_TIMEOUT_S=${TASK_DECODE_TIMEOUT_S:-60}
 TASK_NATIVE_REQUEST_TIMEOUT_S=${TASK_NATIVE_REQUEST_TIMEOUT_S:-600}
+# One retrieval job shares the GPU of its assigned vLLM port. Keep the CLIP
+# batch bounded because vLLM has already reserved most GPU memory.
+TASK_RETRIEVAL_CLIP_DEVICES=${TASK_RETRIEVAL_CLIP_DEVICES:-"cuda:0,cuda:1,cuda:2,cuda:3"}
+TASK_CLIP_IMAGE_BATCH_SIZE=${TASK_CLIP_IMAGE_BATCH_SIZE:-16}
 
 IFS=',' read -r -a PORTS <<< "$TASK_PORTS"
+IFS=',' read -r -a RETRIEVAL_CLIP_DEVICES <<< "$TASK_RETRIEVAL_CLIP_DEVICES"
 read -r -a CONCURRENCIES <<< "$TASK_CONCURRENCIES"
 METHODS=(
   native_uniform_2
@@ -32,6 +37,11 @@ METHODS=(
 )
 
 mkdir -p "$TASK_SWEEP_ROOT"
+
+if [[ ${#RETRIEVAL_CLIP_DEVICES[@]} -ne ${#PORTS[@]} ]]; then
+  echo "TASK_RETRIEVAL_CLIP_DEVICES must provide one device per port" >&2
+  exit 2
+fi
 
 if [[ ! -s "$TASK_DATASET" ]]; then
   echo "missing dataset: $TASK_DATASET" >&2
@@ -99,9 +109,20 @@ run_one() {
       --request-timeout-s "$TASK_NATIVE_REQUEST_TIMEOUT_S" >> "$output_dir/run.log" 2>&1
     status=$?
   else
-    local schedule
+    local schedule port_index=-1 clip_device
     schedule=$(schedule_for "$method")
-    "$TASK_PYTHON" "$TASK_ROOT/conductor/experiments/scripts/run/run_batched_clip_streaming_vlm.py" \
+    for ((index=0; index<${#PORTS[@]}; index++)); do
+      if [[ "${PORTS[$index]}" == "$port" ]]; then
+        port_index=$index
+        break
+      fi
+    done
+    if [[ $port_index -lt 0 ]]; then
+      echo "could not map port $port to a CLIP device" >&2
+      return 2
+    fi
+    clip_device=${RETRIEVAL_CLIP_DEVICES[$port_index]}
+    CLIP_DEVICE="$clip_device" "$TASK_PYTHON" "$TASK_ROOT/conductor/experiments/scripts/run/run_batched_clip_streaming_vlm.py" \
       --dataset "$TASK_DATASET" \
       --schedule "$schedule" \
       --prepared-output "$output_dir/prepared.jsonl" \
@@ -111,6 +132,7 @@ run_one() {
       --decode-workers "$TASK_DECODE_WORKERS" \
       --answer-frame-workers "$TASK_ANSWER_FRAME_WORKERS" \
       --decode-ahead-batches "$TASK_DECODE_AHEAD_BATCHES" \
+      --clip-image-batch-size "$TASK_CLIP_IMAGE_BATCH_SIZE" \
       --decode-timeout-s "$TASK_DECODE_TIMEOUT_S" >> "$output_dir/run.log" 2>&1
     status=$?
   fi
@@ -132,6 +154,8 @@ run_one() {
   echo "decode_ahead_batches=$TASK_DECODE_AHEAD_BATCHES"
   echo "decode_timeout_s=$TASK_DECODE_TIMEOUT_S"
   echo "native_request_timeout_s=$TASK_NATIVE_REQUEST_TIMEOUT_S"
+  echo "retrieval_clip_devices=$TASK_RETRIEVAL_CLIP_DEVICES"
+  echo "clip_image_batch_size=$TASK_CLIP_IMAGE_BATCH_SIZE"
   printf 'methods=%s\n' "${METHODS[*]}"
 } > "$TASK_SWEEP_ROOT/manifest.txt"
 
