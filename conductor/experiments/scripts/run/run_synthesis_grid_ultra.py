@@ -2418,7 +2418,10 @@ def build_frame_scan_embeddings(
             "[BATCH]",
             batch.shape,
             batch.dtype,
-            batch.device,
+            # Decord returns an NDArray for CPU decode and a Torch tensor for
+            # CUDA decode. This is diagnostic output only; do not assume the
+            # CPU object exposes ``.device``.
+            getattr(batch, "device", "cpu/decord"),
         )
         sync_device()
         decode_time += time.time() - t
