@@ -159,7 +159,7 @@ def run_one(
         ),
         "retrieval_mode": "none",
         "source_policy_config": (
-            schedule_row.get("config_name") if schedule_row else None
+            schedule_row.get("chosen_config") if schedule_row else None
         ),
         "uniform_frame_count": frame_count,
         "max_pixels": args.max_pixels,
@@ -189,6 +189,14 @@ def main():
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
     parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument(
+        "--request-timeout-s", type=float, default=600.0,
+        help=(
+            "Maximum wall time for one native vLLM request, including video "
+            "fetch/decode and generation (default: 600). A timeout is "
+            "recorded as an error so the resumable run can continue."
+        ),
+    )
     parser.add_argument(
         "--max-pixels", type=int, default=100352,
         help=(
@@ -223,6 +231,8 @@ def main():
             parser.error("--frame-counts contains duplicates")
     if args.concurrency < 1:
         parser.error("--concurrency must be positive")
+    if args.request_timeout_s <= 0:
+        parser.error("--request-timeout-s must be positive")
     if args.max_pixels is not None and args.max_pixels < 28 * 28:
         parser.error("--max-pixels must be at least 784")
     video_mappings = []
@@ -245,7 +255,15 @@ def main():
     for base_url in base_urls:
         check_server(base_url)
     clients = {
-        url: OpenAI(base_url=url, api_key="EMPTY") for url in base_urls
+        # A bad or pathological video must release this worker after one
+        # bounded attempt; it is written as an error and the run continues.
+        url: OpenAI(
+            base_url=url,
+            api_key="EMPTY",
+            timeout=args.request_timeout_s,
+            max_retries=0,
+        )
+        for url in base_urls
     }
 
     completed = set()
@@ -343,6 +361,7 @@ def main():
         "wall_time_s": wall_s,
         "throughput_qps": len(new_results) / wall_s if wall_s else 0.0,
         "ports": ports, "concurrency": args.concurrency,
+        "request_timeout_s": args.request_timeout_s,
         "video_root": str(args.video_root.resolve()),
         "video_base_url": args.video_base_url,
     }

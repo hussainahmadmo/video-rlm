@@ -236,6 +236,7 @@ def base_result_fields(job):
         "include_uniform_anchors": job.get("include_uniform_anchors"),
         "decord_ctx": job.get("decord_ctx"),
         "clip_device": job.get("clip_device"),
+        "retrieval_mode": job.get("retrieval_mode"),
         "evidence": job.get("evidence"),
         "retrieval_effort": job.get("retrieval_effort"),
         "fallback_used": False,

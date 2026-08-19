@@ -100,7 +100,21 @@ def frames_to_numpy(frames):
     return np.asarray(frames)
 
 
-def make_scan_indices(runner, video_path, scan_fps, *, private_reader=False):
+def uniformly_subsample_indices(indices, limit):
+    if limit is None or limit <= 0 or len(indices) <= limit:
+        return list(indices)
+    positions = np.linspace(0, len(indices) - 1, int(limit))
+    return [indices[int(round(position))] for position in positions]
+
+
+def make_scan_indices(
+    runner,
+    video_path,
+    scan_fps,
+    *,
+    private_reader=False,
+    max_scan_frames=None,
+):
     # Decord VideoReader objects are not safe to use from multiple threads.
     # Parallel decode uses one reader per task instead of the shared cache.
     vr = (
@@ -112,6 +126,7 @@ def make_scan_indices(runner, video_path, scan_fps, *, private_reader=False):
     nframes = len(vr)
     step = max(1, int(round(fps / float(scan_fps))))
     idxs = list(range(0, nframes, step))
+    idxs = uniformly_subsample_indices(idxs, max_scan_frames)
     return vr, fps, nframes, idxs
 
 
@@ -159,30 +174,27 @@ def select_non_overlapping_topk(scores, windows, k):
     ]
 
 
-def decode_scan_row(runner, row, *, private_reader):
-    item = row["item"]
-    config = row["config"]
-    vr, fps, nframes, scan_idxs = make_scan_indices(
-        runner,
-        item["video"],
-        config["scan_fps"],
-        private_reader=private_reader,
-    )
-    duration_s = nframes / fps
-    times = [idx / fps for idx in scan_idxs]
+class DecodeTimeoutError(TimeoutError):
+    pass
+
+
+def decode_indices(vr, indices, *, timeout_s=None):
     images = []
     decode_s = 0.0
     copy_s = 0.0
     pil_s = 0.0
-
-    print(
-        f"[BATCH-SCAN] qid={qid(item)} frames={len(scan_idxs)} "
-        f"fps={config['scan_fps']}",
-        flush=True,
-    )
-
-    for start in range(0, len(scan_idxs), 256):
-        chunk = scan_idxs[start:start + 256]
+    started = time.monotonic()
+    # Smaller chunks provide timeout checkpoints around Decord's blocking
+    # get_batch call. A native call cannot be interrupted safely, but once it
+    # returns we stop before decoding the remainder of a pathological video.
+    chunk_size = 16 if timeout_s else 256
+    for start in range(0, len(indices), chunk_size):
+        if timeout_s and time.monotonic() - started >= timeout_s:
+            raise DecodeTimeoutError(
+                f"video decode exceeded {timeout_s:.1f}s "
+                f"after {start}/{len(indices)} frames"
+            )
+        chunk = indices[start:start + chunk_size]
         if not chunk:
             continue
         t0 = time.time()
@@ -199,16 +211,103 @@ def decode_scan_row(runner, row, *, private_reader):
             for frame in cpu_frames
         )
         pil_s += time.time() - t0
+    return images, decode_s, copy_s, pil_s
+
+
+def decode_scan_row(
+    runner,
+    row,
+    *,
+    private_reader,
+    max_coarse_frames=None,
+    decode_timeout_s=None,
+):
+    item = row["item"]
+    config = row["config"]
+    vr, fps, nframes, scan_idxs = make_scan_indices(
+        runner,
+        item["video"],
+        config["scan_fps"],
+        private_reader=private_reader,
+        max_scan_frames=max_coarse_frames,
+    )
+    duration_s = nframes / fps
+    times = [idx / fps for idx in scan_idxs]
+
+    print(
+        f"[BATCH-SCAN] qid={qid(item)} coarse_frames={len(scan_idxs)} "
+        f"fps={config['scan_fps']}",
+        flush=True,
+    )
+    images, decode_s, copy_s, pil_s = decode_indices(
+        vr, scan_idxs, timeout_s=decode_timeout_s
+    )
 
     return {
         "images": images,
         "times": times,
         "duration_s": duration_s,
-        "windows": windows_from_times(
-            times,
-            duration_s,
-            config["window_len_s"],
-        ),
+        "fps": fps,
+        "nframes": nframes,
+        "indices": scan_idxs,
+        "decode_s": decode_s,
+        "copy_s": copy_s,
+        "pil_s": pil_s,
+    }
+
+
+def refinement_indices(
+    coarse_indices,
+    coarse_scores,
+    *,
+    fps,
+    nframes,
+    frame_budget,
+    region_count,
+    radius_s,
+):
+    """Choose a bounded, question-conditioned set near top coarse regions."""
+    if frame_budget <= 0 or not coarse_indices:
+        return []
+    region_count = max(1, min(int(region_count), len(coarse_indices)))
+    frames_per_region = max(1, int(np.ceil(frame_budget / region_count)))
+    order = np.argsort(coarse_scores)[::-1]
+    chosen_centers = []
+    minimum_gap = max(1, int(round(2.0 * radius_s * fps)))
+    for position in order:
+        center = int(coarse_indices[int(position)])
+        if all(
+            abs(center - existing) >= minimum_gap
+            for existing in chosen_centers
+        ):
+            chosen_centers.append(center)
+        if len(chosen_centers) == region_count:
+            break
+    if not chosen_centers:
+        chosen_centers = [int(coarse_indices[int(order[0])])]
+
+    selected = []
+    coarse_set = set(coarse_indices)
+    radius_frames = max(1, int(round(radius_s * fps)))
+    for center in chosen_centers:
+        start = max(0, center - radius_frames)
+        end = min(nframes - 1, center + radius_frames)
+        for index in np.linspace(start, end, frames_per_region):
+            index = int(round(index))
+            if index not in coarse_set:
+                selected.append(index)
+    return sorted(set(selected))[: int(frame_budget)]
+
+
+def decode_refinement_row(runner, task, *, decode_timeout_s=None):
+    vr = runner.DecordVideo(task["video"])
+    images, decode_s, copy_s, pil_s = decode_indices(
+        vr, task["indices"], timeout_s=decode_timeout_s
+    )
+    return {
+        "images": images,
+        "indices": task["indices"],
+        "times": [index / task["fps"] for index in task["indices"]],
         "decode_s": decode_s,
         "copy_s": copy_s,
         "pil_s": pil_s,
@@ -222,6 +321,11 @@ def batched_clip_retrieve(
     *,
     image_batch_size,
     decode_workers=1,
+    max_coarse_frames=None,
+    refinement_frames=0,
+    refinement_regions=3,
+    refinement_radius_s=16.0,
+    decode_timeout_s=None,
 ):
     model, processor, device = runner.get_retrieval_model()
     scan_specs = []
@@ -229,20 +333,21 @@ def batched_clip_retrieve(
     processor_s = 0.0
     image_encode_s = 0.0
 
-    # Image scan frames depend only on the video and scan rate, not the
-    # question. Decode and encode each unique visual scan once per batch.
+    # Coarse visual scans depend on video, scan rate, and the global cap.
+    # They do not depend on the question, so reuse them within the batch.
     unique_scan_rows = {}
     row_scan_keys = []
     for row in batch:
         key = (
             str(row["item"]["video"]),
             float(row["config"]["scan_fps"]),
+            int(max_coarse_frames or 0),
         )
         row_scan_keys.append(key)
         unique_scan_rows.setdefault(key, row)
 
     unique_items = list(unique_scan_rows.items())
-    decode_started = time.time()
+    coarse_decode_started = time.time()
     if decode_workers > 1:
         with ThreadPoolExecutor(max_workers=decode_workers) as decode_pool:
             decoded_unique = list(
@@ -253,6 +358,8 @@ def batched_clip_retrieve(
                             runner,
                             entry[1],
                             private_reader=True,
+                            max_coarse_frames=max_coarse_frames,
+                            decode_timeout_s=decode_timeout_s,
                         ),
                     ),
                     unique_items,
@@ -262,21 +369,33 @@ def batched_clip_retrieve(
         decoded_unique = [
             (
                 key,
-                decode_scan_row(runner, row, private_reader=False),
+                decode_scan_row(
+                    runner,
+                    row,
+                    private_reader=False,
+                    max_coarse_frames=max_coarse_frames,
+                    decode_timeout_s=decode_timeout_s,
+                ),
             )
             for key, row in unique_items
         ]
-    decode_wall_s = time.time() - decode_started
+    coarse_decode_wall_s = time.time() - coarse_decode_started
     decoded_by_key = dict(decoded_unique)
 
-    raw_decode_s = sum(row["decode_s"] for _, row in decoded_unique)
-    raw_copy_s = sum(row["copy_s"] for _, row in decoded_unique)
-    raw_pil_s = sum(row["pil_s"] for _, row in decoded_unique)
-    raw_total_s = raw_decode_s + raw_copy_s + raw_pil_s
-    wall_scale = decode_wall_s / raw_total_s if raw_total_s else 0.0
-    decode_s = raw_decode_s * wall_scale
-    copy_s = raw_copy_s * wall_scale
-    pil_s = raw_pil_s * wall_scale
+    coarse_worker_decode_s = sum(row["decode_s"] for _, row in decoded_unique)
+    coarse_worker_copy_s = sum(row["copy_s"] for _, row in decoded_unique)
+    coarse_worker_pil_s = sum(row["pil_s"] for _, row in decoded_unique)
+    coarse_worker_total_s = (
+        coarse_worker_decode_s + coarse_worker_copy_s + coarse_worker_pil_s
+    )
+    coarse_scale = (
+        coarse_decode_wall_s / coarse_worker_total_s
+        if coarse_worker_total_s
+        else 0.0
+    )
+    coarse_decode_s = coarse_worker_decode_s * coarse_scale
+    coarse_copy_s = coarse_worker_copy_s * coarse_scale
+    coarse_pil_s = coarse_worker_pil_s * coarse_scale
 
     ranges_by_key = {}
     for key, decoded in decoded_unique:
@@ -292,45 +411,46 @@ def batched_clip_retrieve(
                 "start": start_offset,
                 "end": end_offset,
                 "times": decoded["times"],
-                "windows": windows_from_times(
-                    decoded["times"],
-                    decoded["duration_s"],
-                    row["config"]["window_len_s"],
-                ),
+                "indices": decoded["indices"],
+                "fps": decoded["fps"],
+                "nframes": decoded["nframes"],
+                "duration_s": decoded["duration_s"],
             }
         )
 
-    image_feats = []
-    for start in range(0, len(all_images), image_batch_size):
-        images = all_images[start:start + image_batch_size]
-        t0 = time.time()
-        inputs = processor(images=images, return_tensors="pt")
-        inputs = {key: value.to(device) for key, value in inputs.items()}
-        processor_s += time.time() - t0
+    def encode_images(images):
+        nonlocal processor_s, image_encode_s
+        encoded = []
+        for image_start in range(0, len(images), image_batch_size):
+            image_batch = images[image_start:image_start + image_batch_size]
+            t0 = time.time()
+            inputs = processor(images=image_batch, return_tensors="pt")
+            inputs = {key: value.to(device) for key, value in inputs.items()}
+            processor_s += time.time() - t0
 
-        runner.sync_device()
-        t0 = time.time()
-        feats = runner.extract_feature_tensor(
-            model.get_image_features(**inputs)
-        )
-        runner.sync_device()
-        image_encode_s += time.time() - t0
-        feats = feats / feats.norm(dim=-1, keepdim=True)
-        image_feats.append(feats)
+            runner.sync_device()
+            t0 = time.time()
+            feats = runner.extract_feature_tensor(
+                model.get_image_features(**inputs)
+            )
+            runner.sync_device()
+            image_encode_s += time.time() - t0
+            encoded.append(feats / feats.norm(dim=-1, keepdim=True))
+        if encoded:
+            return torch.cat(encoded, dim=0)
+        return torch.empty((0, 768), device=device)
 
-    if image_feats:
-        image_feats = torch.cat(image_feats, dim=0)
-    else:
-        image_feats = torch.empty((0, 768), device=device)
+    coarse_image_feats = encode_images(all_images)
 
     all_queries = []
     query_ranges = []
     for row in batch:
         query = runner.build_clip_query(row["item"], config=row["config"])
-        if isinstance(query, (list, tuple)):
-            queries = [str(value) for value in query]
-        else:
-            queries = [str(query)]
+        queries = (
+            [str(value) for value in query]
+            if isinstance(query, (list, tuple))
+            else [str(query)]
+        )
         query_ranges.append((len(all_queries), len(all_queries) + len(queries)))
         all_queries.extend(queries)
 
@@ -354,25 +474,142 @@ def batched_clip_retrieve(
     text_encode_s = time.time() - t0
     text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
 
-    retrievals = []
-    for row, scan, query_range in zip(batch, scan_specs, query_ranges):
-        start, end = scan["start"], scan["end"]
+    coarse_scores_by_row = []
+    refinement_tasks = []
+    for row_index, (row, scan, query_range) in enumerate(
+        zip(batch, scan_specs, query_ranges)
+    ):
         q_start, q_end = query_range
-        feats = image_feats[start:end]
         q_feats = text_feats[q_start:q_end]
-        scores = (feats @ q_feats.T).max(dim=1).values.cpu().numpy()
+        coarse_feats = coarse_image_feats[scan["start"]:scan["end"]]
+        coarse_scores = (
+            (coarse_feats @ q_feats.T).max(dim=1).values.cpu().numpy()
+        )
+        coarse_scores_by_row.append(coarse_scores)
+        indices = refinement_indices(
+            scan["indices"],
+            coarse_scores,
+            fps=scan["fps"],
+            nframes=scan["nframes"],
+            frame_budget=int(refinement_frames),
+            region_count=int(refinement_regions),
+            radius_s=float(refinement_radius_s),
+        )
+        if indices:
+            refinement_tasks.append(
+                {
+                    "row_index": row_index,
+                    "video": row["item"]["video"],
+                    "indices": indices,
+                    "fps": scan["fps"],
+                }
+            )
+
+    refinement_decode_started = time.time()
+    if refinement_tasks and decode_workers > 1:
+        with ThreadPoolExecutor(max_workers=decode_workers) as decode_pool:
+            refined_rows = list(
+                decode_pool.map(
+                    lambda task: (
+                        task["row_index"],
+                        decode_refinement_row(
+                            runner, task, decode_timeout_s=decode_timeout_s
+                        ),
+                    ),
+                    refinement_tasks,
+                )
+            )
+    else:
+        refined_rows = [
+            (
+                task["row_index"],
+                decode_refinement_row(
+                    runner, task, decode_timeout_s=decode_timeout_s
+                ),
+            )
+            for task in refinement_tasks
+        ]
+    refinement_decode_wall_s = (
+        time.time() - refinement_decode_started if refinement_tasks else 0.0
+    )
+
+    refinement_worker_decode_s = sum(row["decode_s"] for _, row in refined_rows)
+    refinement_worker_copy_s = sum(row["copy_s"] for _, row in refined_rows)
+    refinement_worker_pil_s = sum(row["pil_s"] for _, row in refined_rows)
+    refinement_worker_total_s = (
+        refinement_worker_decode_s
+        + refinement_worker_copy_s
+        + refinement_worker_pil_s
+    )
+    refinement_scale = (
+        refinement_decode_wall_s / refinement_worker_total_s
+        if refinement_worker_total_s
+        else 0.0
+    )
+    refinement_decode_s = refinement_worker_decode_s * refinement_scale
+    refinement_copy_s = refinement_worker_copy_s * refinement_scale
+    refinement_pil_s = refinement_worker_pil_s * refinement_scale
+
+    refinement_images = []
+    refinement_ranges = {}
+    refinement_by_row = dict(refined_rows)
+    for row_index, decoded in refined_rows:
+        offset = len(refinement_images)
+        refinement_images.extend(decoded["images"])
+        refinement_ranges[row_index] = (offset, len(refinement_images))
+    refinement_image_feats = encode_images(refinement_images)
+
+    retrievals = []
+    for row_index, (row, scan, query_range, coarse_scores) in enumerate(
+        zip(batch, scan_specs, query_ranges, coarse_scores_by_row)
+    ):
+        all_times = list(scan["times"])
+        all_scores = list(coarse_scores)
+        refined = refinement_by_row.get(row_index)
+        if refined is not None:
+            q_start, q_end = query_range
+            q_feats = text_feats[q_start:q_end]
+            start_offset, end_offset = refinement_ranges[row_index]
+            refined_feats = refinement_image_feats[start_offset:end_offset]
+            refined_scores = (
+                (refined_feats @ q_feats.T).max(dim=1).values.cpu().numpy()
+            )
+            all_times.extend(refined["times"])
+            all_scores.extend(refined_scores)
+
+        windows = windows_from_times(
+            all_times,
+            scan["duration_s"],
+            row["config"]["window_len_s"],
+        )
         top_windows = select_non_overlapping_topk(
-            scores,
-            scan["windows"],
+            np.asarray(all_scores),
+            windows,
             int(row["config"]["clip_topk"]),
         )
+        refined_count = len(refined["indices"]) if refined is not None else 0
         retrievals.append(
             {
                 "top_windows": top_windows,
-                "candidate_windows_examined": len(scan["windows"]),
+                "candidate_windows_examined": len(windows),
+                "coarse_frames_examined": len(scan["indices"]),
+                "refinement_frames_examined": refined_count,
+                "retrieval_mode": (
+                    "bounded_coarse_to_fine"
+                    if max_coarse_frames
+                    else "fixed_fps"
+                ),
+                "max_coarse_frames": int(max_coarse_frames or 0),
+                "max_refinement_frames": int(refinement_frames),
+                "refinement_regions": int(refinement_regions),
+                "refinement_radius_s": float(refinement_radius_s),
             }
         )
 
+    decode_s = coarse_decode_s + refinement_decode_s
+    copy_s = coarse_copy_s + refinement_copy_s
+    pil_s = coarse_pil_s + refinement_pil_s
+    total_images = len(all_images) + len(refinement_images)
     batch_latency = {
         "clip_decode_s": decode_s,
         "clip_gpu_cpu_copy_s": copy_s,
@@ -389,13 +626,23 @@ def batched_clip_retrieve(
             + image_encode_s
             + text_encode_s
         ),
+        "coarse_decode_wall_s": coarse_decode_wall_s,
+        "refinement_decode_wall_s": refinement_decode_wall_s,
+        "coarse_frames": float(len(all_images)),
+        "refinement_frames": float(len(refinement_images)),
+        "max_coarse_frames": float(max_coarse_frames or 0),
+        "max_refinement_frames": float(refinement_frames),
         "batched_clip_questions": float(len(batch)),
-        "batched_clip_images": float(len(all_images)),
+        "batched_clip_images": float(total_images),
         "batched_clip_unique_scans": float(len(unique_scan_rows)),
         "scan_reuse_hits": float(len(batch) - len(unique_scan_rows)),
         "decode_workers": float(decode_workers),
-        "clip_decode_wall_s": decode_wall_s,
-        "clip_decode_worker_s": raw_decode_s,
+        "clip_decode_wall_s": (
+            coarse_decode_wall_s + refinement_decode_wall_s
+        ),
+        "clip_decode_worker_s": (
+            coarse_worker_decode_s + refinement_worker_decode_s
+        ),
     }
     return retrievals, batch_latency
 
@@ -456,8 +703,13 @@ def sample_answer_frames_private(runner, video_path, windows, frame_allocations,
 
 def build_job_from_batched_retrieval(runner, item, config, retrieval, batch_latency, *, answer_frame_workers=1):
     latency_breakdown = {}
+    invariant_latency_fields = {
+        "decode_workers",
+        "max_coarse_frames",
+        "max_refinement_frames",
+    }
     for key, value in batch_latency.items():
-        if key == "decode_workers":
+        if key in invariant_latency_fields:
             latency_breakdown[key] = value
         else:
             latency_breakdown[key] = value / max(1.0, batch_latency["batched_clip_questions"])
@@ -554,8 +806,19 @@ def build_job_from_batched_retrieval(runner, item, config, retrieval, batch_late
         "stage_latency_s": stage_latency_s,
         "decord_ctx": runner.DECORD_CTX,
         "clip_device": runner.CLIP_DEVICE,
+        "retrieval_mode": retrieval.get("retrieval_mode", "fixed_fps"),
         "retrieval_effort": {
             "candidate_windows": retrieval["candidate_windows_examined"],
+            "coarse_frames": retrieval.get("coarse_frames_examined"),
+            "refinement_frames": retrieval.get(
+                "refinement_frames_examined"
+            ),
+            "max_coarse_frames": retrieval.get("max_coarse_frames", 0),
+            "max_refinement_frames": retrieval.get(
+                "max_refinement_frames", 0
+            ),
+            "refinement_regions": retrieval.get("refinement_regions"),
+            "refinement_radius_s": retrieval.get("refinement_radius_s"),
             "selected_windows": len(selected_windows),
             "selected_frames": len(frames["frame_indices"]),
         },
@@ -590,6 +853,47 @@ def main():
     parser.add_argument("--prep-batch-size", type=int, default=32)
     parser.add_argument("--clip-image-batch-size", type=int, default=128)
     parser.add_argument(
+        "--max-coarse-frames",
+        type=int,
+        default=None,
+        help=(
+            "Enable duration-bounded coarse-to-fine retrieval and cap the "
+            "uniform coarse scan at this many frames per video/scan rate. "
+            "Omit to preserve fixed-FPS behavior."
+        ),
+    )
+    parser.add_argument(
+        "--refinement-frames",
+        type=int,
+        default=24,
+        help=(
+            "Maximum question-conditioned refinement frames decoded around "
+            "the strongest coarse regions. Used only with --max-coarse-frames."
+        ),
+    )
+    parser.add_argument(
+        "--refinement-regions",
+        type=int,
+        default=3,
+        help="Maximum number of top coarse regions to refine.",
+    )
+    parser.add_argument(
+        "--refinement-radius-s",
+        type=float,
+        default=16.0,
+        help="Seconds on either side of each coarse center to refine.",
+    )
+    parser.add_argument(
+        "--decode-timeout-s",
+        type=float,
+        default=60.0,
+        help=(
+            "Soft timeout per coarse/refinement decode. Decoding uses small "
+            "batches and stops at the next checkpoint after this deadline. "
+            "Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--decode-workers",
         type=int,
         default=1,
@@ -617,11 +921,20 @@ def main():
     args = parser.parse_args()
     if args.decode_workers < 1:
         parser.error("--decode-workers must be at least 1")
+    if args.decode_timeout_s < 0:
+        parser.error("--decode-timeout-s cannot be negative")
     if args.answer_frame_workers < 1:
         parser.error("--answer-frame-workers must be at least 1")
     if args.decode_ahead_batches < 1:
         parser.error("--decode-ahead-batches must be at least 1")
-
+    if args.max_coarse_frames is not None and args.max_coarse_frames < 2:
+        parser.error("--max-coarse-frames must be at least 2")
+    if args.refinement_frames < 0:
+        parser.error("--refinement-frames cannot be negative")
+    if args.refinement_regions < 1:
+        parser.error("--refinement-regions must be at least 1")
+    if args.refinement_radius_s <= 0:
+        parser.error("--refinement-radius-s must be positive")
     prep = import_from_path("build_prepared_vlm_jobs", BUILD_PREPARED_PATH)
     send = import_from_path("run_prepared_vlm_jobs", RUN_PREPARED_PATH)
     runner = prep.import_runner()
@@ -711,8 +1024,16 @@ def main():
         f"prep_batch_size={args.prep_batch_size} "
         f"clip_image_batch_size={args.clip_image_batch_size} "
         f"decode_workers={args.decode_workers} "
+        f"decode_timeout_s={args.decode_timeout_s:g} "
         f"answer_frame_workers={args.answer_frame_workers} "
-        f"decode_ahead_batches={args.decode_ahead_batches}",
+        f"decode_ahead_batches={args.decode_ahead_batches} "
+        f"retrieval_mode="
+        f"{'bounded_coarse_to_fine' if args.max_coarse_frames else 'fixed_fps'} "
+        f"max_coarse_frames={args.max_coarse_frames or 0} "
+        f"refinement_frames="
+        f"{args.refinement_frames if args.max_coarse_frames else 0} "
+        f"refinement_regions={args.refinement_regions} "
+        f"refinement_radius_s={args.refinement_radius_s}",
         flush=True,
     )
 
@@ -768,11 +1089,33 @@ def main():
                     f"size={len(batch)}",
                     flush=True,
                 )
-                retrievals, batch_latency = batched_clip_retrieve(
-                    runner, batch,
-                    image_batch_size=args.clip_image_batch_size,
-                    decode_workers=args.decode_workers,
-                )
+                try:
+                    retrievals, batch_latency = batched_clip_retrieve(
+                        runner, batch,
+                        image_batch_size=args.clip_image_batch_size,
+                        decode_workers=args.decode_workers,
+                        max_coarse_frames=args.max_coarse_frames,
+                        refinement_frames=(
+                            args.refinement_frames
+                            if args.max_coarse_frames
+                            else 0
+                        ),
+                        refinement_regions=args.refinement_regions,
+                        refinement_radius_s=args.refinement_radius_s,
+                        decode_timeout_s=(args.decode_timeout_s or None),
+                    )
+                except Exception as exc:
+                    import traceback
+                    traceback.print_exc()
+                    print(
+                        f"[batch-prepare-error] {batch_start + 1}-{batch_end} "
+                        f"error={exc!r}; recording errors and continuing",
+                        flush=True,
+                    )
+                    retrievals = [
+                        {"_prepare_error": repr(exc)} for _ in batch
+                    ]
+                    batch_latency = {}
                 if not bounded_put(retrieval_queue, (batch, retrievals, batch_latency)):
                     break
                 batch_start = batch_end
@@ -797,14 +1140,16 @@ def main():
                             build_job_from_batched_retrieval,
                             runner, row["item"], row["config"], retrieval, batch_latency,
                             answer_frame_workers=args.answer_frame_workers,
-                        ): row
+                        ): (row, retrieval)
                         for row, retrieval in zip(batch, retrievals)
                     }
                     for future in as_completed(futures):
-                        row = futures[future]
+                        row, retrieval = futures[future]
                         item, config = row["item"], row["config"]
                         key = (qid(item), config["name"])
                         try:
+                            if retrieval.get("_prepare_error"):
+                                raise RuntimeError(retrieval["_prepare_error"])
                             job = future.result()
                         except Exception as exc:
                             import traceback
