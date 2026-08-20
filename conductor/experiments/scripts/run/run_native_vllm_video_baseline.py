@@ -10,12 +10,19 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from openai import OpenAI
 
 LOCK = threading.Lock()
+
+
+def percentile(values, fraction):
+    if not values:
+        return 0.0
+    values = sorted(values)
+    return float(values[round((len(values) - 1) * fraction)])
 
 
 def load_jsonl(path):
@@ -113,13 +120,17 @@ def run_one(
         url = make_video_url(row, args.video_mappings)
         duration_s = video_duration_s(row)
         sampling_fps = frame_count / max(duration_s, 1e-6)
-        extra_body = {"media_io_kwargs": {"video": {
+        video_io_kwargs = {
             # Qwen2/2.5-VL is FPS-driven and ignores num_frames.
             "fps": sampling_fps,
             "min_frames": frame_count,
             "max_frames": frame_count,
             "max_duration": max(1, math.ceil(duration_s)),
-        }}}
+        }
+        if args.video_backend is not None:
+            video_io_kwargs["backend"] = args.video_backend
+        video_io_kwargs.update(args.video_backend_kwargs)
+        extra_body = {"media_io_kwargs": {"video": video_io_kwargs}}
         if args.max_pixels is not None:
             extra_body["mm_processor_kwargs"] = {
                 "max_pixels": args.max_pixels,
@@ -162,6 +173,8 @@ def run_one(
             schedule_row.get("chosen_config") if schedule_row else None
         ),
         "uniform_frame_count": frame_count,
+        "video_backend": args.video_backend or "server_default",
+        "video_backend_kwargs": args.video_backend_kwargs,
         "max_pixels": args.max_pixels,
         "duration_s": duration_s, "sampling_fps": sampling_fps,
         "prediction_label": prediction, "prediction_text": prediction_text,
@@ -187,6 +200,13 @@ def main():
     )
     parser.add_argument("--schedule-budget-field", default="vlm_budget")
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument(
+        "--arrival-rate-qps", type=float,
+        help=(
+            "Open-loop offered request rate. Omit for burst arrivals at t=0. "
+            "Use for fair delay-under-load comparisons with the dynamic pipeline."
+        ),
+    )
     parser.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument(
@@ -212,6 +232,21 @@ def main():
         "--video-base-url", default="http://127.0.0.1:8088"
     )
     parser.add_argument(
+        "--video-backend",
+        choices=["opencv", "pyav", "torchcodec", "pynvvideocodec", "deepstream"],
+        help=(
+            "vLLM video decoder backend. Omit to use the server default "
+            "(currently OpenCV in this setup)."
+        ),
+    )
+    parser.add_argument(
+        "--video-backend-kwargs", default="{}",
+        help=(
+            "JSON object forwarded inside media_io_kwargs.video, for example "
+            "'{\"seek_mode\": \"approximate\", \"num_ffmpeg_threads\": 4}'."
+        ),
+    )
+    parser.add_argument(
         "--video-map", action="append", default=[],
         help="LOCAL_ROOT=HTTP_BASE; repeat for multiple roots",
     )
@@ -231,10 +266,20 @@ def main():
             parser.error("--frame-counts contains duplicates")
     if args.concurrency < 1:
         parser.error("--concurrency must be positive")
+    if args.arrival_rate_qps is not None and args.arrival_rate_qps <= 0:
+        parser.error("--arrival-rate-qps must be positive")
     if args.request_timeout_s <= 0:
         parser.error("--request-timeout-s must be positive")
     if args.max_pixels is not None and args.max_pixels < 28 * 28:
         parser.error("--max-pixels must be at least 784")
+    try:
+        args.video_backend_kwargs = json.loads(args.video_backend_kwargs)
+    except json.JSONDecodeError as exc:
+        parser.error(f"invalid --video-backend-kwargs JSON: {exc}")
+    if not isinstance(args.video_backend_kwargs, dict):
+        parser.error("--video-backend-kwargs must decode to a JSON object")
+    if "backend" in args.video_backend_kwargs:
+        parser.error("set --video-backend instead of backend in --video-backend-kwargs")
     video_mappings = []
     for value in args.video_map:
         if "=" not in value:
@@ -310,39 +355,78 @@ def main():
             for row in rows
             if (qid(row), f"native_uniform_{count}") not in completed
         ]
+    arrival_description = "burst" if args.arrival_rate_qps is None else f"{args.arrival_rate_qps:g}qps"
     print(
         f"examples={len(rows)} frame_counts={frame_counts} "
         f"planned={len(planned)} concurrency={args.concurrency} "
-        f"ports={','.join(ports)}",
+        f"arrival_rate={arrival_description} ports={','.join(ports)}",
         flush=True,
     )
 
     started = time.perf_counter()
     new_results = []
+    next_job = 0
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = {}
-        for row, count, config_name, schedule_row in planned:
-            # Video affinity lets each server reuse multimodal preprocessing.
-            route_key = str(row.get("video") or row.get("video_url") or qid(row))
-            base_url = base_urls[hash(route_key) % len(base_urls)]
-            future = pool.submit(
-                run_one, row, count, clients[base_url], base_url, args,
-                config_name=config_name, schedule_row=schedule_row,
-            )
-            futures[future] = (row, count, config_name)
-        for future in as_completed(futures):
-            result = future.result()
-            append_jsonl(args.output, result)
-            new_results.append(result)
-            print(
-                f"[done] qid={result['qid']} config={result['config_name']} "
-                f"pred={result['prediction_label']} gold={result['answer_label']} "
-                f"correct={result['correct']} latency={result['latency_s']:.2f}s "
-                f"error={result['error'] is not None}",
-                flush=True,
-            )
+        while next_job < len(planned) or futures:
+            now_s = time.perf_counter() - started
+            while next_job < len(planned) and len(futures) < args.concurrency:
+                arrival_s = (
+                    0.0 if args.arrival_rate_qps is None
+                    else next_job / args.arrival_rate_qps
+                )
+                if now_s < arrival_s:
+                    break
+                row, count, config_name, schedule_row = planned[next_job]
+                next_job += 1
+                # Video affinity lets each server reuse multimodal preprocessing.
+                route_key = str(row.get("video") or row.get("video_url") or qid(row))
+                base_url = base_urls[hash(route_key) % len(base_urls)]
+                submit_s = time.perf_counter() - started
+                future = pool.submit(
+                    run_one, row, count, clients[base_url], base_url, args,
+                    config_name=config_name, schedule_row=schedule_row,
+                )
+                futures[future] = (arrival_s, submit_s)
+                now_s = time.perf_counter() - started
+
+            if not futures:
+                if next_job < len(planned):
+                    next_arrival_s = next_job / args.arrival_rate_qps if args.arrival_rate_qps else 0.0
+                    time.sleep(max(0.0, min(0.2, next_arrival_s - (time.perf_counter() - started))))
+                continue
+
+            timeout_s = 0.2
+            if next_job < len(planned) and args.arrival_rate_qps is not None:
+                timeout_s = max(0.0, min(timeout_s, next_job / args.arrival_rate_qps - (time.perf_counter() - started)))
+            done, _ = wait(list(futures), timeout=timeout_s, return_when=FIRST_COMPLETED)
+            for future in done:
+                arrival_s, submit_s = futures.pop(future)
+                result = future.result()
+                completion_s = time.perf_counter() - started
+                result["arrival_s"] = arrival_s
+                result["dispatch_s"] = submit_s
+                result["prep_started_s"] = submit_s
+                result["prep_ready_s"] = submit_s
+                result["vlm_submit_s"] = submit_s
+                result["completion_s"] = completion_s
+                result["queue_wait_before_prepare_s"] = max(0.0, submit_s - arrival_s)
+                result["preparation_wall_s"] = 0.0
+                result["prepared_queue_wait_s"] = 0.0
+                result["vlm_service_wall_s"] = max(0.0, completion_s - submit_s)
+                result["end_to_end_delay_s"] = max(0.0, completion_s - arrival_s)
+                append_jsonl(args.output, result)
+                new_results.append(result)
+                print(
+                    f"[done] qid={result['qid']} config={result['config_name']} "
+                    f"pred={result['prediction_label']} gold={result['answer_label']} "
+                    f"correct={result['correct']} latency={result['latency_s']:.2f}s "
+                    f"e2e={result['end_to_end_delay_s']:.2f}s error={result['error'] is not None}",
+                    flush=True,
+                )
 
     wall_s = time.perf_counter() - started
+    delays = [float(row["end_to_end_delay_s"]) for row in new_results]
     summary = {
         "dataset": str(args.dataset.resolve()),
         "output": str(args.output.resolve()),
@@ -360,8 +444,14 @@ def main():
         "correct_this_invocation": sum(bool(r["correct"]) for r in new_results),
         "wall_time_s": wall_s,
         "throughput_qps": len(new_results) / wall_s if wall_s else 0.0,
+        "arrival_rate_qps": args.arrival_rate_qps,
+        "mean_end_to_end_delay_s": sum(delays) / len(delays) if delays else 0.0,
+        "p50_end_to_end_delay_s": percentile(delays, 0.50),
+        "p95_end_to_end_delay_s": percentile(delays, 0.95),
         "ports": ports, "concurrency": args.concurrency,
         "request_timeout_s": args.request_timeout_s,
+        "video_backend": args.video_backend or "server_default",
+        "video_backend_kwargs": args.video_backend_kwargs,
         "video_root": str(args.video_root.resolve()),
         "video_base_url": args.video_base_url,
     }

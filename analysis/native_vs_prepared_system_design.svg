@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1020" viewBox="0 0 1800 1020">
+  <defs>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #172033; }
+      .subtitle { font: 600 24px Arial, sans-serif; fill: #172033; }
+      .label { font: 600 20px Arial, sans-serif; fill: #172033; }
+      .small { font: 18px Arial, sans-serif; fill: #334155; }
+      .note { font: 600 18px Arial, sans-serif; fill: #7f1d1d; }
+      .box { stroke: #334155; stroke-width: 2.5; rx: 16; }
+      .arrow { stroke: #334155; stroke-width: 3.5; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #b91c1c; stroke-width: 2.5; stroke-dasharray: 10 8; fill: none; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#334155"/></marker>
+  </defs>
+  <rect width="1800" height="1020" fill="#ffffff"/>
+  <text x="900" y="62" text-anchor="middle" class="title">Video-VLM Serving: Native vLLM vs. External Prepared-Frame Pipeline</text>
+
+  <rect x="55" y="105" width="820" height="760" rx="24" fill="#fff7ed" stroke="#f97316" stroke-width="3"/>
+  <text x="465" y="158" text-anchor="middle" class="subtitle">A. Native vLLM Video-URL Path</text>
+  <text x="465" y="190" text-anchor="middle" class="small">MP4 ingestion is coupled to the serving frontend</text>
+
+  <rect class="box" x="120" y="250" width="190" height="100" fill="#dbeafe"/>
+  <text x="215" y="292" text-anchor="middle" class="label">Video URL</text>
+  <text x="215" y="322" text-anchor="middle" class="small">compressed MP4</text>
+  <path class="arrow" d="M310 300 H390"/>
+
+  <rect class="box" x="390" y="230" width="260" height="145" fill="#fee2e2"/>
+  <text x="520" y="274" text-anchor="middle" class="label">vLLM API frontend</text>
+  <text x="520" y="306" text-anchor="middle" class="small">fetch • seek • decode</text>
+  <text x="520" y="334" text-anchor="middle" class="small">sample • preprocess</text>
+  <path class="arrow" d="M650 300 H730"/>
+
+  <rect class="box" x="730" y="250" width="100" height="100" fill="#e2e8f0"/>
+  <text x="780" y="290" text-anchor="middle" class="label">VLM</text>
+  <text x="780" y="320" text-anchor="middle" class="small">engine</text>
+
+  <path class="dash" d="M120 460 H830 V690 H120 Z"/>
+  <text x="145" y="505" class="note">Under video-load variability:</text>
+  <text x="145" y="542" class="small">Slow MP4 ingestion occupies the frontend / request path.</text>
+  <text x="145" y="574" class="small">Short, model-fast requests can wait behind long video work.</text>
+  <text x="145" y="625" class="note">Observed symptom: queue buildup, high E2E and timeout tail.</text>
+  <rect x="205" y="715" width="510" height="85" rx="14" fill="#fed7aa" stroke="#ea580c" stroke-width="2"/>
+  <text x="460" y="748" text-anchor="middle" class="label">One coupled serving path</text>
+  <text x="460" y="778" text-anchor="middle" class="small">video ingestion competes with serving admission</text>
+
+  <rect x="925" y="105" width="820" height="760" rx="24" fill="#f0fdf4" stroke="#16a34a" stroke-width="3"/>
+  <text x="1335" y="158" text-anchor="middle" class="subtitle">B. Your External Prepared-Frame Pipeline</text>
+  <text x="1335" y="190" text-anchor="middle" class="small">bounded preparation is disaggregated from VLM serving</text>
+
+  <rect class="box" x="970" y="250" width="150" height="100" fill="#dbeafe"/>
+  <text x="1045" y="292" text-anchor="middle" class="label">Video URL</text>
+  <text x="1045" y="322" text-anchor="middle" class="small">compressed MP4</text>
+  <path class="arrow" d="M1120 300 H1180"/>
+  <rect class="box" x="1180" y="230" width="240" height="145" fill="#dcfce7"/>
+  <text x="1300" y="274" text-anchor="middle" class="label">External worker pool</text>
+  <text x="1300" y="306" text-anchor="middle" class="small">ffprobe / ffmpeg</text>
+  <text x="1300" y="334" text-anchor="middle" class="small">uniformly sample 8 JPEGs</text>
+  <path class="arrow" d="M1420 300 H1470"/>
+  <rect class="box" x="1470" y="245" width="200" height="110" fill="#fef3c7"/>
+  <text x="1570" y="285" text-anchor="middle" class="label">Prepared queue</text>
+  <text x="1570" y="315" text-anchor="middle" class="small">ready image requests</text>
+  <path class="arrow" d="M1570 355 V435"/>
+  <rect class="box" x="1450" y="435" width="240" height="110" fill="#e2e8f0"/>
+  <text x="1570" y="478" text-anchor="middle" class="label">vLLM image serving</text>
+  <text x="1570" y="508" text-anchor="middle" class="small">preprocess • batch • infer</text>
+
+  <rect x="970" y="615" width="700" height="150" rx="16" fill="#dcfce7" stroke="#16a34a" stroke-width="2.5"/>
+  <text x="1320" y="657" text-anchor="middle" class="label">Control boundaries</text>
+  <text x="1320" y="692" text-anchor="middle" class="small">CPU preparation workers: bounded concurrency</text>
+  <text x="1320" y="722" text-anchor="middle" class="small">Prepared queue: bounded depth • VLM requests: bounded concurrency</text>
+  <text x="1320" y="752" text-anchor="middle" class="small">Decode can overlap with inference instead of blocking it</text>
+
+  <rect x="170" y="910" width="1460" height="65" rx="14" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text x="900" y="951" text-anchor="middle" class="label">Core difference: same 8-frame visual input target, but different ownership and scheduling of compressed-video preparation.</text>
+</svg>
