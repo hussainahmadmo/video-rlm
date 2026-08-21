@@ -14,6 +14,7 @@ import csv
 import io
 import json
 import math
+import os
 import re
 import subprocess
 import threading
@@ -162,12 +163,15 @@ def select_timestamps(activity, duration_s, window_s, frame_count):
 
 def decode_jpeg(video_path, timestamp_s, max_side, timeout_s):
     """Fast input seek: FFmpeg decodes only from the prior keyframe onward."""
+    ffmpeg_threads = int(os.environ.get("VIDEO_RLM_FFMPEG_THREADS", "0"))
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{timestamp_s:.3f}",
         "-i", str(video_path), "-frames:v", "1",
         "-vf", f"scale={max_side}:{max_side}:force_original_aspect_ratio=decrease",
         "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
     ]
+    if ffmpeg_threads > 0:
+        command[4:4] = ["-threads", str(ffmpeg_threads)]
     result = subprocess.run(
         command, check=True, capture_output=True, timeout=timeout_s,
     )

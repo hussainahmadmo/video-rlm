@@ -14,6 +14,7 @@ import base64
 import importlib.util
 import json
 import os
+import random
 import sys
 import threading
 import time
@@ -231,18 +232,54 @@ def main() -> None:
     parser.add_argument("--dispatch-plan", type=Path)
     parser.add_argument(
         "--dispatch-policy",
-        choices=["queue_aware", "fifo"],
+        choices=["queue_aware", "fifo", "shortest_estimated"],
         default="queue_aware",
         help=(
             "queue_aware prioritizes costly preparation when the prepared "
             "queue is empty; fifo is the same implementation/configuration "
-            "but preserves dataset arrival order as a scheduling control."
+            "but preserves dataset arrival order as a scheduling control; "
+            "shortest_estimated prefers the smallest duration-derived "
+            "preparation-cost estimate."
         ),
     )
     parser.add_argument("--ports", default="9000")
     parser.add_argument("--cpu-workers", type=int, default=2)
     parser.add_argument("--vlm-concurrency", type=int, default=1)
     parser.add_argument("--prepared-queue-depth", type=int, default=8)
+    parser.add_argument(
+        "--max-pending", type=int, default=0,
+        help=(
+            "Maximum requests visible to the preparation dispatcher. Zero preserves "
+            "the legacy unbounded pending list; a positive value applies backpressure "
+            "before preparation admission."
+        ),
+    )
+    parser.add_argument(
+        "--resource-policy", choices=["fixed", "stage_adaptive"], default="fixed",
+        help=(
+            "fixed uses configured worker limits throughout the run; "
+            "stage_adaptive regulates preparation admission from observed stage "
+            "service times and queue occupancy while preserving a safe VLM floor."
+        ),
+    )
+    parser.add_argument(
+        "--min-vlm-concurrency", type=int,
+        help=(
+            "Minimum effective VLM admission limit for stage_adaptive. Defaults "
+            "to --vlm-concurrency, so adaptation never throttles configured GPU serving."
+        ),
+    )
+    parser.add_argument(
+        "--controller-interval-s", type=float, default=1.0,
+        help="Minimum interval between stage-adaptive control decisions.",
+    )
+    parser.add_argument(
+        "--target-ready-queue", type=int,
+        help=(
+            "Target number of prepared jobs. Defaults to half of "
+            "--prepared-queue-depth when stage_adaptive is enabled."
+        ),
+    )
     parser.add_argument(
         "--warmup-prepared", type=int, default=0,
         help=(
@@ -256,6 +293,18 @@ def main() -> None:
             "Open-loop offered request rate. Omit for a burst arrival at t=0. "
             "Use this, rather than client concurrency alone, for delay-under-load sweeps."
         ),
+    )
+    parser.add_argument(
+        "--arrival-order", choices=["dataset", "seeded_random", "long_short"], default="dataset",
+        help=(
+            "dataset preserves the legacy order; seeded_random uses --arrival-seed; "
+            "long_short alternates highest and lowest estimated preparation cost. "
+            "Use --dispatch-policy fifo to preserve the selected arrival trace."
+        ),
+    )
+    parser.add_argument(
+        "--arrival-seed", type=int, default=0,
+        help="Seed used by --arrival-order seeded_random.",
     )
     parser.add_argument("--short-max-s", type=float, default=300.0)
     parser.add_argument("--medium-max-s", type=float, default=1200.0)
@@ -303,6 +352,14 @@ def main() -> None:
     args = parser.parse_args()
     if min(args.cpu_workers, args.vlm_concurrency, args.prepared_queue_depth) < 1:
         parser.error("worker and queue sizes must be positive")
+    if args.min_vlm_concurrency is not None and not 1 <= args.min_vlm_concurrency <= args.vlm_concurrency:
+        parser.error("--min-vlm-concurrency must be between one and --vlm-concurrency")
+    if args.max_pending < 0:
+        parser.error("--max-pending must be non-negative")
+    if args.controller_interval_s <= 0:
+        parser.error("--controller-interval-s must be positive")
+    if args.target_ready_queue is not None and not 0 <= args.target_ready_queue <= args.prepared_queue_depth:
+        parser.error("--target-ready-queue must be between zero and --prepared-queue-depth")
     if not 0 <= args.warmup_prepared <= args.prepared_queue_depth:
         parser.error("--warmup-prepared must be between zero and --prepared-queue-depth")
     if args.adaptive_high_load < 1:
@@ -347,7 +404,23 @@ def main() -> None:
         if decision and decision.get("route") != route:
             raise SystemExit(f"plan route mismatch for {qid(row)}")
         items.append({"row": row, "route": route, "duration_s": value, "cost": cost(route, value), "rank": int((decision or {}).get("dispatch_rank", 10**9)), "decision": decision})
-    if args.dispatch_policy == "queue_aware":
+    if args.arrival_order == "seeded_random":
+        random.Random(args.arrival_seed).shuffle(items)
+    elif args.arrival_order == "long_short":
+        ordered = sorted(items, key=lambda item: (item["duration_s"], qid(item["row"])))
+        low, high = deque(ordered), deque(reversed(ordered))
+        trace_items = []
+        while low:
+            trace_items.append(high.popleft())
+            if low:
+                low.pop()
+            if low:
+                trace_items.append(low.popleft())
+                if high:
+                    high.pop()
+        items = trace_items
+    elif args.dispatch_policy == "queue_aware":
+        # Preserve the legacy queue-aware order for the default dataset trace.
         items.sort(key=lambda item: item["rank"])
     ports = [part.strip() for part in args.ports.split(",") if part.strip()]
     urls = [f"http://127.0.0.1:{port}/v1" for port in ports]
@@ -357,7 +430,17 @@ def main() -> None:
     args.output.mkdir(parents=True)
     results_path = args.output / "results.jsonl"
     decisions_path = args.output / "dispatch_events.jsonl"
+    resource_events_path = args.output / "resource_events.jsonl"
+    arrival_trace_path = args.output / "arrival_trace.jsonl"
     write_lock = threading.Lock()
+    for index, item in enumerate(items):
+        append_jsonl(arrival_trace_path, {
+            "arrival_index": index,
+            "qid": qid(item["row"]),
+            "route": item["route"],
+            "duration_s": item["duration_s"],
+            "estimated_prepare_cost": item["cost"],
+        }, write_lock)
     pending: list[dict[str, Any]] = []
     arrivals: deque[dict[str, Any]] = deque(items)
     ready: deque[dict[str, Any]] = deque()
@@ -367,14 +450,79 @@ def main() -> None:
     completed: list[dict[str, Any]] = []
     started = time.perf_counter()
     vlm_admission_open = args.warmup_prepared == 0
+    target_ready_queue = args.target_ready_queue if args.target_ready_queue is not None else max(1, args.prepared_queue_depth // 2)
+    min_vlm_concurrency = (
+        args.min_vlm_concurrency
+        if args.min_vlm_concurrency is not None
+        else args.vlm_concurrency
+    )
+    effective_prep_limit = args.cpu_workers
+    effective_vlm_limit = args.vlm_concurrency
+    prep_ewma_s: float | None = None
+    vlm_ewma_s: float | None = None
+    last_controller_s = -float("inf")
 
     def elapsed() -> float:
         return time.perf_counter() - started
 
+    def observe_stage(stage: str, value: float) -> None:
+        """Maintain an EWMA service-time profile for preparation and VLM stages."""
+        nonlocal prep_ewma_s, vlm_ewma_s
+        if value <= 0:
+            return
+        alpha = 0.2
+        if stage == "prep":
+            prep_ewma_s = value if prep_ewma_s is None else alpha * value + (1 - alpha) * prep_ewma_s
+        else:
+            vlm_ewma_s = value if vlm_ewma_s is None else alpha * value + (1 - alpha) * vlm_ewma_s
+
+    def update_resource_limits() -> None:
+        """Adapt admission limits, not physical thread-pool sizes, from live state."""
+        nonlocal effective_prep_limit, effective_vlm_limit, last_controller_s
+        now = elapsed()
+        if args.resource_policy != "stage_adaptive" or now - last_controller_s < args.controller_interval_s:
+            return
+        last_controller_s = now
+        old_limits = (effective_prep_limit, effective_vlm_limit)
+        # Keep all configured VLM capacity available by default. The first
+        # controller version reduced VLM admission to match the slower prep
+        # stage, which created an avoidable ready-queue bottleneck. Adaptation
+        # instead controls how aggressively preparation is admitted.
+        effective_vlm_limit = args.vlm_concurrency
+        if prep_ewma_s is None or vlm_ewma_s is None:
+            effective_prep_limit = args.cpu_workers
+        else:
+            ratio = max(0.1, prep_ewma_s / vlm_ewma_s)
+            if len(ready) >= target_ready_queue:
+                # Prepared work is accumulating, so reserve CPU capacity by
+                # reducing new preparation admission, never inference service.
+                effective_prep_limit = max(1, args.cpu_workers - 1)
+            elif not ready and (pending or arrivals):
+                # The preparation stage is starving inference; use the full
+                # preparation pool to replenish the ready queue.
+                effective_prep_limit = args.cpu_workers
+            else:
+                # Keep a small amount of headroom when stages are balanced.
+                effective_prep_limit = max(1, min(args.cpu_workers, round(ratio)))
+            effective_vlm_limit = max(min_vlm_concurrency, effective_vlm_limit)
+        if old_limits != (effective_prep_limit, effective_vlm_limit):
+            event = {
+                "time_s": now,
+                "policy": args.resource_policy,
+                "prep_limit": effective_prep_limit,
+                "vlm_limit": effective_vlm_limit,
+                "prep_ewma_s": prep_ewma_s,
+                "vlm_ewma_s": vlm_ewma_s,
+                "ready_queue": len(ready),
+                "pending_queue": len(pending),
+            }
+            append_jsonl(resource_events_path, event, write_lock)
+            print("[resource] " + json.dumps(event), flush=True)
+
     def release_arrivals() -> None:
         """Move due open-loop requests into the dispatcher-visible pending queue."""
         now = elapsed()
-        while arrivals:
+        while arrivals and (args.max_pending == 0 or len(pending) < args.max_pending):
             index = int(arrivals[0]["arrival_index"])
             scheduled = 0.0 if args.arrival_rate_qps is None else index / args.arrival_rate_qps
             if now < scheduled:
@@ -390,6 +538,14 @@ def main() -> None:
         if args.dispatch_policy == "fifo":
             item = pending.pop(0)
             item["live_rule"] = "fifo_arrival_order"
+            return item
+        if args.dispatch_policy == "shortest_estimated":
+            item = min(
+                pending,
+                key=lambda value: (value["cost"], value["duration_s"], value["rank"]),
+            )
+            pending.remove(item)
+            item["live_rule"] = "shortest_estimated_prepare_cost"
             return item
         # Empty ready queue: hide a costly preparation behind future VLM work.
         candidates = [item for item in pending if item["route"] != "short_native"]
@@ -500,6 +656,8 @@ def main() -> None:
         result["vlm_service_wall_s"] = (
             max(0.0, completion_s - float(vlm_submit_s)) if vlm_submit_s is not None else None
         )
+        if result["vlm_service_wall_s"] is not None:
+            observe_stage("vlm", result["vlm_service_wall_s"])
         result["end_to_end_delay_s"] = max(0.0, completion_s - arrival_s)
         result["hybrid_route"] = item["route"]
         result["dispatch_rank"] = item["rank"]
@@ -507,6 +665,8 @@ def main() -> None:
         result["selected_config"] = item.get("selected_config")
         result["config_decision_rule"] = item.get("config_decision_rule")
         result["queue_load_at_dispatch"] = item.get("queue_load_at_dispatch")
+        result["estimated_video_duration_s"] = item["duration_s"]
+        result["estimated_prepare_cost"] = item["cost"]
         append_jsonl(results_path, result, write_lock)
         completed.append(result)
         print(f"[done] qid={result['qid']} route={item['route']} correct={result.get('correct')} error={result.get('error') is not None}", flush=True)
@@ -516,7 +676,8 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=args.cpu_workers) as prep_pool, ThreadPoolExecutor(max_workers=args.vlm_concurrency) as vlm_pool:
         while arrivals or pending or prep_futures or ready or vlm_futures:
             release_arrivals()
-            while pending and len(prep_futures) < args.cpu_workers and len(ready) < args.prepared_queue_depth:
+            update_resource_limits()
+            while pending and len(prep_futures) < effective_prep_limit and len(ready) < args.prepared_queue_depth:
                 item = select_pending()
                 item["dispatch_s"] = elapsed()
                 select_config(item)
@@ -536,7 +697,7 @@ def main() -> None:
             ):
                 vlm_admission_open = True
                 print(f"[warmup-complete] prepared_queue={len(ready)}", flush=True)
-            while vlm_admission_open and ready and len(vlm_futures) < args.vlm_concurrency:
+            while vlm_admission_open and ready and len(vlm_futures) < effective_vlm_limit:
                 item, payload = ready.popleft()
                 if payload["kind"] == "error":
                     record_result(item, {"qid": qid(item["row"]), "dataset": item["row"].get("dataset"), "correct": False, "error": payload["error"], "latency_s": 0.0})
@@ -554,6 +715,7 @@ def main() -> None:
                 if future in prep_futures:
                     item = prep_futures.pop(future)
                     item["prep_ready_s"] = elapsed()
+                    observe_stage("prep", item["prep_ready_s"] - item["prep_started_s"])
                     try:
                         ready.append((item, future.result()))
                     except Exception as exc:
@@ -570,6 +732,21 @@ def main() -> None:
     wall_s = elapsed()
     delays = [float(row["end_to_end_delay_s"]) for row in completed]
     summary = {"method": "dynamic_queue_aware_duration_hybrid", "dispatch_policy": args.dispatch_policy, "config_policy": args.config_policy, "arrival_rate_qps": args.arrival_rate_qps, "dataset": str(args.dataset.resolve()), "questions": len(completed), "correct": sum(bool(row.get("correct")) for row in completed), "errors": sum(row.get("error") is not None for row in completed), "accuracy_percent": 100 * sum(bool(row.get("correct")) for row in completed) / len(completed) if completed else 0.0, "wall_time_s": wall_s, "throughput_qps": len(completed) / wall_s if wall_s else 0.0, "mean_end_to_end_delay_s": sum(delays) / len(delays) if delays else 0.0, "p50_end_to_end_delay_s": percentile(delays, 0.50), "p95_end_to_end_delay_s": percentile(delays, 0.95), "routes": dict(Counter(row.get("hybrid_route") for row in completed)), "selected_configs": dict(Counter(row.get("selected_config") for row in completed)), "config_decision_rules": dict(Counter(row.get("config_decision_rule") for row in completed)), "short_input_mode": args.short_input_mode, "long_input_mode": args.long_input_mode, "cpu_workers": args.cpu_workers, "vlm_concurrency": args.vlm_concurrency, "prepared_queue_depth": args.prepared_queue_depth, "warmup_prepared": args.warmup_prepared, "ports": ports}
+    summary["arrival_order"] = args.arrival_order
+    summary["arrival_seed"] = args.arrival_seed if args.arrival_order == "seeded_random" else None
+    summary["resource_policy"] = args.resource_policy
+    summary["controller_interval_s"] = args.controller_interval_s
+    summary["target_ready_queue"] = target_ready_queue
+    summary["min_vlm_concurrency"] = min_vlm_concurrency
+    summary["effective_prep_limit_final"] = effective_prep_limit
+    summary["effective_vlm_limit_final"] = effective_vlm_limit
+    summary["stage_profile"] = {
+        "prep_ewma_s": prep_ewma_s,
+        "vlm_ewma_s": vlm_ewma_s,
+        "suggested_prepare_workers_per_vlm": (
+            prep_ewma_s / vlm_ewma_s if prep_ewma_s is not None and vlm_ewma_s else None
+        ),
+    }
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2), flush=True)
 

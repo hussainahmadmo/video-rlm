@@ -4,6 +4,7 @@
 import argparse
 import json
 import math
+import random
 import re
 import subprocess
 import threading
@@ -207,6 +208,14 @@ def main():
             "Use for fair delay-under-load comparisons with the dynamic pipeline."
         ),
     )
+    parser.add_argument(
+        "--arrival-order", choices=["dataset", "seeded_random", "long_short"], default="dataset",
+        help=(
+            "dataset preserves file order; seeded_random uses --arrival-seed; "
+            "long_short alternates longest and shortest videos."
+        ),
+    )
+    parser.add_argument("--arrival-seed", type=int, default=0)
     parser.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument(
@@ -251,6 +260,18 @@ def main():
         help="LOCAL_ROOT=HTTP_BASE; repeat for multiple roots",
     )
     parser.add_argument("--max-examples", type=int)
+    parser.add_argument(
+        "--repeat-qid",
+        help=(
+            "Repeat exactly one dataset record; cloned requests receive unique qids. "
+            "Useful for controlled single-video stress tests."
+        ),
+    )
+    parser.add_argument(
+        "--repeat-count",
+        type=int,
+        help="Number of unique clones to create with --repeat-qid.",
+    )
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
 
@@ -293,6 +314,23 @@ def main():
     )
 
     rows = load_jsonl(args.dataset)
+    if args.repeat_qid is not None:
+        if args.repeat_count is None or args.repeat_count < 1:
+            parser.error("--repeat-qid requires --repeat-count >= 1")
+        matches = [row for row in rows if qid(row) == args.repeat_qid]
+        if len(matches) != 1:
+            parser.error(
+                f"--repeat-qid expected one matching record, found {len(matches)}: "
+                f"{args.repeat_qid}"
+            )
+        source_row = matches[0]
+        rows = []
+        for index in range(args.repeat_count):
+            clone = dict(source_row)
+            clone["qid"] = f"{args.repeat_qid}__repeat_{index:04d}"
+            rows.append(clone)
+    elif args.repeat_count is not None:
+        parser.error("--repeat-count requires --repeat-qid")
     if args.max_examples is not None:
         rows = rows[:args.max_examples]
     ports = [value.strip() for value in args.ports.split(",") if value.strip()]
@@ -355,6 +393,32 @@ def main():
             for row in rows
             if (qid(row), f"native_uniform_{count}") not in completed
         ]
+    if args.arrival_order == "seeded_random":
+        random.Random(args.arrival_seed).shuffle(planned)
+    elif args.arrival_order == "long_short":
+        ordered = sorted(planned, key=lambda entry: (video_duration_s(entry[0]), qid(entry[0])))
+        low, high = deque(ordered), deque(reversed(ordered))
+        trace_planned = []
+        while low:
+            trace_planned.append(high.popleft())
+            if low:
+                low.pop()
+            if low:
+                trace_planned.append(low.popleft())
+                if high:
+                    high.pop()
+        planned = trace_planned
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    arrival_trace_path = args.output.parent / "arrival_trace.jsonl"
+    with arrival_trace_path.open("w") as trace_handle:
+        for index, (row, count, config_name, _) in enumerate(planned):
+            trace_handle.write(json.dumps({
+                "arrival_index": index,
+                "qid": qid(row),
+                "duration_s": video_duration_s(row),
+                "config_name": config_name,
+                "frame_count": count,
+            }) + "\n")
     arrival_description = "burst" if args.arrival_rate_qps is None else f"{args.arrival_rate_qps:g}qps"
     print(
         f"examples={len(rows)} frame_counts={frame_counts} "
@@ -445,6 +509,8 @@ def main():
         "wall_time_s": wall_s,
         "throughput_qps": len(new_results) / wall_s if wall_s else 0.0,
         "arrival_rate_qps": args.arrival_rate_qps,
+        "arrival_order": args.arrival_order,
+        "arrival_seed": args.arrival_seed if args.arrival_order == "seeded_random" else None,
         "mean_end_to_end_delay_s": sum(delays) / len(delays) if delays else 0.0,
         "p50_end_to_end_delay_s": percentile(delays, 0.50),
         "p95_end_to_end_delay_s": percentile(delays, 0.95),
