@@ -27,3 +27,6 @@ conductor/experiments/diverse_eval/*.jsonl
 conductor/image.png
 commit.logs
 nano
+conductor/experiments/*_pareto*.png
+conductor/experiments/*_pareto*.csv
+conductor/experiments/*_pareto*.pdf
