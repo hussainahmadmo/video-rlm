@@ -1,2 +1,9 @@
 videos/
 UCF-101_mp4/*.jsonl
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+logs/
+conductor/experiments/large_sweeps/
+*.pt
