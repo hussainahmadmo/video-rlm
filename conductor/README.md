@@ -334,8 +334,68 @@ is expensive.
     in each iteration the captioning model generatees and an input prompt for
     a window.
 
-- We identify that agentic visual systems have coupled stages with very different execution properties: video captioning is reusable, batchable, and GPU-parallel, while agentic tool use is query-specific, latency-sensitive, and often sequential.
 
-- We present VIMIO, a disaggregated execution system for long-video agentic QA. VIMIO separates video-level caption-memory construction from query-level agentic reasoning/tool use, allowing each stage to be scheduled, scaled, cached, and optimized independent
+Depreacted - video captioning did not give us great results.
+  
+- We identify that agentic visual systems have coupled stages with very different execution properties: video captioning is reusable, batchable, and GPU-parallel, while agentic tool use is  latency-sensitive, and often sequential.
+
+- We present VIMIO, a disaggregated execution system for long-video agentic QA. VIMIO separates each stage to be scheduled, scaled, cached, and optimized independent.
 
 - VIMIO batches and parallelizes caption generation across GPUs to reduce time-to-memory-ready, then reuses the resulting caption cache across many questions and retrieval sweeps. Query-level agentic workers consume this cached memory and invoke tools only when additional evidence is needed.
+
+}
+
+
+# TODOS
+
+Experiment - check whether VLLM gives the same accuracy if we run the videos with vidoes
+and different images sweeps.
+- Important to just send these video to VLLM exactly and see the accuracy.
+
+
+Experiments to add in the paper:
+
+# caps in the VLLM or QWEN side.
+Native-video comparisons use an explicit spatial cap of 100,352 pixels per
+frame (`128 * 28 * 28`, approximately 317 x 317 for a square frame). The
+installed Qwen2.5-VL processor otherwise permits up to 1,003,520 pixels per
+frame, which can make 32-frame inputs exceed the server's 16,384-token context.
+The cap preserves the selected temporal frame count while bounding visual
+tokens and must be held constant across all compared native-video policies.
+
+Modern VLM serving systems do not accept unbounded visual inputs: they enforce
+some combination of pixel, frame, visual-token, and total-context limits. The
+exact limit is model- and deployment-specific; 100,352 pixels is this
+experiment's declared cap, not a universal limit for all modern VLMs.
+
+- in the current experiment multimodal caching is stopped so when we send a video or images, each
+video has to incur the video and the image cost.
+
+
+# decode is CPU bound and VLM is GPU bound
+
+- before checking this idea 
+
+[] verify that we cannot control decode with VLLM only(e.g can we use more workers to decode faster)
+[] verify the code for the codec is choosing frames not just anything else.
+
+
+# Remove the code 
+
+# Problems:
+
+Wrong Experiment: Move video prep outside native request path.
+
+We tried with here that native mulimodal serving systems do not scale the multimodal video and 
+when we send a very large decode job it will suffer(just a single video) will take 
+![alt text](image.png)
+
+I think we have not tested until now the config adaptation under load. We have that QPS matters.
+
+
+# Previous problem: low througput with better E2E latency
+- bounding the queue is good for latency e2e latency but througput an
+
+# Fix
+
+Experiment

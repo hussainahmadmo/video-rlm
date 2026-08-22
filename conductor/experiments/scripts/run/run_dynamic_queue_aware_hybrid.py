@@ -564,7 +564,10 @@ def main() -> None:
 
     def select_config(item: dict[str, Any]) -> None:
         """Select a budget from the live shared queue state at dispatch time."""
-        queue_load = len(prep_futures) + len(ready) + len(vlm_futures)
+        # Include requests still waiting for preparation. During an immediate
+        # burst, excluding ``pending`` hides most of the backlog and makes the
+        # adaptive selector keep choosing rich configurations.
+        queue_load = len(pending) + 1 + len(prep_futures) + len(ready) + len(vlm_futures)
         item["queue_load_at_dispatch"] = queue_load
         if args.config_policy == "fixed":
             if item["route"] == "short_native":
