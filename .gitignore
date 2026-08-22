@@ -7,3 +7,13 @@ __pycache__/
 logs/
 conductor/experiments/large_sweeps/
 *.pt
+conductor/experiments/cache/
+conductor/experiments/self_improving/data/video_agent_caption_cache_*/
+analysis/*.png
+conductor/experiments/consistent_eval/*.csv
+conductor/experiments/consistent_eval/*.pdf
+conductor/experiments/consistent_eval/*.png
+conductor/experiments/diverse_eval/*.jsonl
+conductor/image.png
+commit.logs
+nano
