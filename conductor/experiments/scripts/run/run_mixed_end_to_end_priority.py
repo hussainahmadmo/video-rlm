@@ -413,15 +413,15 @@ def main() -> None:
             return args.urgent_ttft_slo_s
         return args.background_ttft_slo_s
 
-    def adaptive_key(job: dict[str, Any], now: float) -> tuple[float, int, int]:
+    def adaptive_key(job: dict[str, Any], now: float) -> tuple[int, float, int]:
         wait_s = max(0.0, now - job["arrival_s"])
         slack_s = (
             job["arrival_s"] + ttft_slo_s(job) - now
             - predicted_prep_service_s(job)
         )
         if job["workload"] == "background" and wait_s > args.background_aging_s:
-            slack_s -= 10.0 * (wait_s - args.background_aging_s)
-        return slack_s, job["priority"], job["sequence"]
+            slack_s -= wait_s - args.background_aging_s
+        return job["priority"], slack_s, job["sequence"]
 
     def remove_pending(index: int) -> dict[str, Any]:
         _, _, job = pending[index]
@@ -525,7 +525,7 @@ def main() -> None:
                     "prep_start", job,
                     pending_depth=len(pending),
                     predicted_prep_service_s=job["predicted_prep_service_s"],
-                    deadline_slack_s=adaptive_key(job, elapsed())[0],
+                    deadline_slack_s=adaptive_key(job, elapsed())[1],
                     active_background=sum(
                         item["workload"] == "background"
                         for item in prep_futures.values()
