@@ -97,6 +97,8 @@ def make_codec_args(args: argparse.Namespace) -> SimpleNamespace:
         max_tokens=args.max_tokens,
         max_pixels=args.max_pixels,
         window_s=8.0,
+        decode_backend=args.decode_backend,
+        batch_decode=None,
         decode_max_side=args.decode_max_side,
         index_timeout_s=args.index_timeout_s,
         decode_timeout_s=args.decode_timeout_s,
@@ -119,14 +121,21 @@ def prepare_uniform(
     started = time.perf_counter()
     duration_s = codec.probe_duration(video, codec_args.index_timeout_s)
     timestamps = codec.temporal_anchors(duration_s, job["frame_count"])
-    content: list[dict[str, Any]] = []
-    for timestamp in timestamps:
-        jpeg = codec.decode_jpeg(
-            video,
-            timestamp,
-            codec_args.decode_max_side,
+    if codec_args.decode_backend == "batch_cpu":
+        jpegs = codec_args.batch_decode(
+            video, timestamps, codec_args.decode_max_side,
             codec_args.decode_timeout_s,
         )
+    else:
+        jpegs = [
+            codec.decode_jpeg(
+                video, timestamp, codec_args.decode_max_side,
+                codec_args.decode_timeout_s,
+            )
+            for timestamp in timestamps
+        ]
+    content: list[dict[str, Any]] = []
+    for jpeg in jpegs:
         content.append(
             {
                 "type": "image_url",
@@ -263,6 +272,11 @@ def main() -> None:
     parser.add_argument("--urgent-priority", type=int, default=0)
     parser.add_argument("--prep-workers", type=int, default=4)
     parser.add_argument(
+        "--decode-backend", choices=["seek_cpu", "batch_cpu"],
+        default="seek_cpu",
+        help="External frame preparation backend",
+    )
+    parser.add_argument(
         "--background-prep-limit",
         type=int,
         help=(
@@ -338,6 +352,11 @@ def main() -> None:
 
     codec = import_path("mixed_priority_codec", CODEC_PATH)
     codec_args = make_codec_args(args)
+    if args.decode_backend == "batch_cpu":
+        batch_codec = import_path(
+            "batched_cpu_decode", CODEC_PATH.with_name("batched_cpu_decode.py")
+        )
+        codec_args.batch_decode = batch_codec.decode_jpegs_batch_cpu
     ports = list(dict.fromkeys(args.ports or [args.port]))
     base_urls = {port: f"http://127.0.0.1:{port}/v1" for port in ports}
     for base_url in base_urls.values():
@@ -692,6 +711,7 @@ def main() -> None:
         "errors": sum(row.get("error") is not None for row in completed),
         "throughput_qps": len(completed) / wall_s if wall_s else 0.0,
         "prep_workers": args.prep_workers,
+        "decode_backend": args.decode_backend,
         "background_prep_limit": (
             args.background_prep_limit
             if args.prep_policy == "priority_reserved"
