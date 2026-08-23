@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Measure end-to-end priority across external video preparation and vLLM.
 
-Background videos arrive first and urgent videos arrive later.  The preparation
-dispatcher can be FCFS or priority ordered.  Prepared requests retain the same
-priority when submitted to a vLLM server using ``--scheduling-policy priority``.
+Background videos arrive first and urgent videos arrive later. The preparation
+dispatcher can be FCFS, priority ordered, statically reserved, or adaptive to
+request SLO slack. Prepared requests retain the same priority when submitted
+to one or more vLLM replicas using ``--scheduling-policy priority``.
 
 Unlike submitting every preparation task to ThreadPoolExecutor immediately,
 this runner keeps an explicit pending heap and admits at most ``--prep-workers``
@@ -219,6 +220,15 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         summary[f"mean_{field}"] = mean(values)
         summary[f"p50_{field}"] = percentile(values, 0.50)
         summary[f"p95_{field}"] = percentile(values, 0.95)
+    slo_rows = [row for row in rows if row.get("ttft_slo_s") is not None]
+    summary["ttft_slo_requests"] = len(slo_rows)
+    summary["ttft_slo_attained"] = sum(
+        bool(row.get("slo_attained")) for row in slo_rows
+    )
+    summary["ttft_slo_attainment_percent"] = (
+        100.0 * summary["ttft_slo_attained"] / len(slo_rows)
+        if slo_rows else None
+    )
     return summary
 
 
@@ -230,8 +240,17 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--port", type=int, default=9001)
     parser.add_argument(
+        "--ports", type=int, nargs="+",
+        help="vLLM replica ports; overrides --port when provided",
+    )
+    parser.add_argument(
+        "--replica-routing",
+        choices=["round_robin", "least_inflight"],
+        default="least_inflight",
+    )
+    parser.add_argument(
         "--prep-policy",
-        choices=["fcfs", "priority", "priority_reserved"],
+        choices=["fcfs", "priority", "priority_reserved", "slo_adaptive"],
         default="priority",
     )
     parser.add_argument("--background-requests", type=int, default=32)
@@ -251,6 +270,20 @@ def main() -> None:
             "priority_reserved. Defaults to prep-workers minus one."
         ),
     )
+    parser.add_argument(
+        "--urgent-prep-reserve", type=int, default=1,
+        help=("Slots protected while urgent work is pending under slo_adaptive; "
+              "capacity is work-conserving when no urgent work waits"),
+    )
+    parser.add_argument("--urgent-ttft-slo-s", type=float, default=30.0)
+    parser.add_argument("--background-ttft-slo-s", type=float, default=300.0)
+    parser.add_argument(
+        "--background-aging-s", type=float, default=120.0,
+        help="Promote background work after this preparation-queue wait",
+    )
+    parser.add_argument("--prep-fixed-cost-s", type=float, default=0.25)
+    parser.add_argument("--prep-seconds-per-frame", type=float, default=0.12)
+    parser.add_argument("--prep-cost-ewma-alpha", type=float, default=0.2)
     parser.add_argument("--vlm-concurrency", type=int, default=4)
     parser.add_argument("--prepared-queue-depth", type=int, default=32)
     parser.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
@@ -264,6 +297,16 @@ def main() -> None:
 
     if min(args.prep_workers, args.vlm_concurrency, args.prepared_queue_depth) < 1:
         parser.error("worker and queue counts must be positive")
+    if not 0 <= args.urgent_prep_reserve < args.prep_workers:
+        parser.error("--urgent-prep-reserve must be in [0, prep-workers)")
+    if min(args.urgent_ttft_slo_s, args.background_ttft_slo_s) <= 0:
+        parser.error("TTFT SLOs must be positive")
+    if args.background_aging_s <= 0:
+        parser.error("--background-aging-s must be positive")
+    if args.prep_fixed_cost_s < 0 or args.prep_seconds_per_frame <= 0:
+        parser.error("preparation cost estimates must be positive")
+    if not 0 < args.prep_cost_ewma_alpha <= 1:
+        parser.error("--prep-cost-ewma-alpha must be in (0, 1]")
     if args.background_prep_limit is None:
         args.background_prep_limit = max(1, args.prep_workers - 1)
     if not 1 <= args.background_prep_limit <= args.prep_workers:
@@ -295,14 +338,16 @@ def main() -> None:
 
     codec = import_path("mixed_priority_codec", CODEC_PATH)
     codec_args = make_codec_args(args)
-    base_url = f"http://127.0.0.1:{args.port}/v1"
-    readiness_client = OpenAI(
-        base_url=base_url,
-        api_key="EMPTY",
-        timeout=min(args.request_timeout_s, 30.0),
-        max_retries=0,
-    )
-    readiness_client.models.list()
+    ports = list(dict.fromkeys(args.ports or [args.port]))
+    base_urls = {port: f"http://127.0.0.1:{port}/v1" for port in ports}
+    for base_url in base_urls.values():
+        readiness_client = OpenAI(
+            base_url=base_url,
+            api_key="EMPTY",
+            timeout=min(args.request_timeout_s, 30.0),
+            max_retries=0,
+        )
+        readiness_client.models.list()
 
     args.output.mkdir(parents=True)
     results_path = args.output / "results.jsonl"
@@ -342,8 +387,13 @@ def main() -> None:
     pending: list[tuple[int, int, dict[str, Any]]] = []
     ready: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
     prep_futures: dict[Future, dict[str, Any]] = {}
-    vlm_futures: dict[Future, tuple[dict[str, Any], dict[str, Any]]] = {}
+    vlm_futures: dict[
+        Future, tuple[dict[str, Any], dict[str, Any], int]
+    ] = {}
     completed: list[dict[str, Any]] = []
+    prep_cost_ewma: dict[int, float] = {}
+    replica_inflight = {port: 0 for port in ports}
+    round_robin_cursor = 0
 
     def elapsed() -> float:
         return time.perf_counter() - started
@@ -351,17 +401,69 @@ def main() -> None:
     def scheduling_key(job: dict[str, Any]) -> int:
         return job["priority"] if args.prep_policy != "fcfs" else 0
 
+    def predicted_prep_service_s(job: dict[str, Any]) -> float:
+        frames = job["frame_count"]
+        return prep_cost_ewma.get(
+            frames,
+            args.prep_fixed_cost_s + args.prep_seconds_per_frame * frames,
+        )
+
+    def ttft_slo_s(job: dict[str, Any]) -> float:
+        if job["workload"] == "urgent":
+            return args.urgent_ttft_slo_s
+        return args.background_ttft_slo_s
+
+    def adaptive_key(job: dict[str, Any], now: float) -> tuple[float, int, int]:
+        wait_s = max(0.0, now - job["arrival_s"])
+        slack_s = (
+            job["arrival_s"] + ttft_slo_s(job) - now
+            - predicted_prep_service_s(job)
+        )
+        if job["workload"] == "background" and wait_s > args.background_aging_s:
+            slack_s -= 10.0 * (wait_s - args.background_aging_s)
+        return slack_s, job["priority"], job["sequence"]
+
+    def remove_pending(index: int) -> dict[str, Any]:
+        _, _, job = pending[index]
+        pending[index] = pending[-1]
+        pending.pop()
+        if pending:
+            heapq.heapify(pending)
+        return job
+
     def pop_pending_for_preparation() -> dict[str, Any] | None:
         if not pending:
             return None
 
+        active_background = sum(
+            job["workload"] == "background" for job in prep_futures.values()
+        )
+
+        if args.prep_policy == "slo_adaptive":
+            urgent_waiting = any(
+                job["workload"] == "urgent" for _, _, job in pending
+            )
+            background_limit = (
+                args.prep_workers - args.urgent_prep_reserve
+                if urgent_waiting else args.prep_workers
+            )
+            eligible = [
+                index for index, (_, _, job) in enumerate(pending)
+                if job["workload"] != "background"
+                or active_background < background_limit
+            ]
+            if not eligible:
+                return None
+            now = elapsed()
+            index = min(
+                eligible,
+                key=lambda item: adaptive_key(pending[item][2], now),
+            )
+            return remove_pending(index)
+
         if args.prep_policy != "priority_reserved":
             return heapq.heappop(pending)[2]
 
-        active_background = sum(
-            job["workload"] == "background"
-            for job in prep_futures.values()
-        )
         if active_background < args.background_prep_limit:
             return heapq.heappop(pending)[2]
 
@@ -372,14 +474,15 @@ def main() -> None:
         ]
         if not eligible:
             return None
+        return remove_pending(min(eligible)[2])
 
-        _, _, index = min(eligible)
-        _, _, job = pending[index]
-        pending[index] = pending[-1]
-        pending.pop()
-        if pending:
-            heapq.heapify(pending)
-        return job
+    def choose_replica() -> int:
+        nonlocal round_robin_cursor
+        if args.replica_routing == "round_robin":
+            port = ports[round_robin_cursor % len(ports)]
+            round_robin_cursor += 1
+            return port
+        return min(ports, key=lambda port: (replica_inflight[port], port))
 
     def event(name: str, job: dict[str, Any], **extra: Any) -> None:
         append_jsonl(
@@ -396,7 +499,7 @@ def main() -> None:
         )
 
     with ThreadPoolExecutor(max_workers=args.prep_workers) as prep_pool, ThreadPoolExecutor(
-        max_workers=args.vlm_concurrency
+        max_workers=args.vlm_concurrency * len(ports)
     ) as vlm_pool:
         while arrivals or pending or prep_futures or ready or vlm_futures:
             now = elapsed()
@@ -416,16 +519,37 @@ def main() -> None:
                 if job is None:
                     break
                 job["prep_started_s"] = elapsed()
-                event("prep_start", job, pending_depth=len(pending))
+                job["predicted_prep_service_s"] = predicted_prep_service_s(job)
+                job["ttft_slo_s"] = ttft_slo_s(job)
+                event(
+                    "prep_start", job,
+                    pending_depth=len(pending),
+                    predicted_prep_service_s=job["predicted_prep_service_s"],
+                    deadline_slack_s=adaptive_key(job, elapsed())[0],
+                    active_background=sum(
+                        item["workload"] == "background"
+                        for item in prep_futures.values()
+                    ),
+                )
                 prep_futures[prep_pool.submit(prepare_uniform, job, codec, codec_args)] = job
 
-            while ready and len(vlm_futures) < args.vlm_concurrency:
+            while ready and len(vlm_futures) < args.vlm_concurrency * len(ports):
                 _, _, job, prepared = heapq.heappop(ready)
+                replica_port = choose_replica()
+                replica_inflight[replica_port] += 1
+                job["replica_port"] = replica_port
                 job["vlm_submit_s"] = elapsed()
-                event("vlm_submit", job, ready_depth=len(ready))
+                event(
+                    "vlm_submit", job,
+                    ready_depth=len(ready),
+                    replica_port=replica_port,
+                    replica_inflight=dict(replica_inflight),
+                )
                 vlm_futures[
-                    vlm_pool.submit(call_vllm, job, prepared, args, base_url)
-                ] = (job, prepared)
+                    vlm_pool.submit(
+                        call_vllm, job, prepared, args, base_urls[replica_port]
+                    )
+                ] = (job, prepared, replica_port)
 
             futures = list(prep_futures) + list(vlm_futures)
             if not futures:
@@ -442,6 +566,11 @@ def main() -> None:
                     job["prep_ready_s"] = elapsed()
                     try:
                         prepared = future.result()
+                        observed = float(prepared["decode_service_s"])
+                        frames = job["frame_count"]
+                        previous = prep_cost_ewma.get(frames, observed)
+                        alpha = args.prep_cost_ewma_alpha
+                        prep_cost_ewma[frames] = alpha * observed + (1 - alpha) * previous
                     except Exception as exc:
                         result = {
                             "request_id": job["request_id"],
@@ -449,6 +578,9 @@ def main() -> None:
                             "qid": qid(job["row"]),
                             "priority": job["priority"],
                             "frame_count": job["frame_count"],
+                            "replica_port": None,
+                            "ttft_slo_s": job["ttft_slo_s"],
+                            "predicted_prep_service_s": job["predicted_prep_service_s"],
                             "arrival_s": job["arrival_s"],
                             "prep_started_s": job["prep_started_s"],
                             "prep_ready_s": job["prep_ready_s"],
@@ -460,6 +592,7 @@ def main() -> None:
                             "engine_to_first_token_s": None,
                             "end_to_end_ttft_s": None,
                             "end_to_end_s": job["prep_ready_s"] - job["arrival_s"],
+                            "slo_attained": False,
                         }
                         completed.append(result)
                         append_jsonl(results_path, result)
@@ -476,7 +609,8 @@ def main() -> None:
                         ),
                     )
                 else:
-                    job, prepared = vlm_futures.pop(future)
+                    job, prepared, replica_port = vlm_futures.pop(future)
+                    replica_inflight[replica_port] -= 1
                     job["completion_s"] = elapsed()
                     response = future.result()
                     first_token_s = (
@@ -499,6 +633,9 @@ def main() -> None:
                         "video": row.get("video"),
                         "priority": job["priority"],
                         "frame_count": job["frame_count"],
+                        "replica_port": job["replica_port"],
+                        "ttft_slo_s": job["ttft_slo_s"],
+                        "predicted_prep_service_s": job["predicted_prep_service_s"],
                         "arrival_s": job["arrival_s"],
                         "prep_started_s": job["prep_started_s"],
                         "prep_ready_s": job["prep_ready_s"],
@@ -515,6 +652,10 @@ def main() -> None:
                             else first_token_s - job["arrival_s"]
                         ),
                         "end_to_end_s": job["completion_s"] - job["arrival_s"],
+                        "slo_attained": (
+                            first_token_s is not None
+                            and first_token_s - job["arrival_s"] <= job["ttft_slo_s"]
+                        ),
                         "duration_s": prepared["duration_s"],
                         "selected_timestamps_s": prepared["timestamps"],
                         "prediction_label": prediction,
@@ -542,7 +683,10 @@ def main() -> None:
         "method": "mixed_end_to_end_video_priority",
         "prep_policy": args.prep_policy,
         "server_requirement": "--scheduling-policy priority",
-        "port": args.port,
+        "port": ports[0],
+        "ports": ports,
+        "replica_count": len(ports),
+        "replica_routing": args.replica_routing,
         "wall_time_s": wall_s,
         "total_requests": len(completed),
         "errors": sum(row.get("error") is not None for row in completed),
@@ -553,7 +697,12 @@ def main() -> None:
             if args.prep_policy == "priority_reserved"
             else None
         ),
-        "vlm_concurrency": args.vlm_concurrency,
+        "urgent_prep_reserve": (
+            args.urgent_prep_reserve
+            if args.prep_policy == "slo_adaptive" else None
+        ),
+        "vlm_concurrency_per_replica": args.vlm_concurrency,
+        "vlm_concurrency_total": args.vlm_concurrency * len(ports),
         "prepared_queue_depth": args.prepared_queue_depth,
         "background": summarize(by_workload["background"]),
         "urgent": summarize(by_workload["urgent"]),
@@ -573,6 +722,13 @@ def main() -> None:
             "urgent_frames": args.urgent_frames,
             "background_priority": args.background_priority,
             "urgent_priority": args.urgent_priority,
+            "urgent_ttft_slo_s": args.urgent_ttft_slo_s,
+            "background_ttft_slo_s": args.background_ttft_slo_s,
+            "background_aging_s": args.background_aging_s,
+            "prep_fixed_cost_s": args.prep_fixed_cost_s,
+            "prep_seconds_per_frame": args.prep_seconds_per_frame,
+            "prep_cost_ewma_alpha": args.prep_cost_ewma_alpha,
+            "learned_prep_cost_s_by_frame_count": prep_cost_ewma,
         },
     }
     (args.output / "summary.json").write_text(
