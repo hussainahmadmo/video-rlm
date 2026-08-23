@@ -78,6 +78,7 @@ run_trial() {
   echo "START shard=$SHARD_INDEX port=$PORT $name $policy $(date -u +%FT%TZ)"
   "$PY" "$RUNNER" --arrival-trace "$trace" --output "$out" \
     --port "$PORT" --prep-policy "$policy" --prep-workers 4 \
+    --background-prep-limit 3 \
     --vlm-concurrency 4 --prepared-queue-depth 32 \
     --request-timeout-s 1800 >"$log" 2>&1
   echo "DONE shard=$SHARD_INDEX port=$PORT $name $policy $(date -u +%FT%TZ)"
@@ -100,6 +101,7 @@ generate_and_run() {
   fi
   run_trial "$trace" "$name" fcfs
   run_trial "$trace" "$name" priority
+  run_trial "$trace" "$name" priority_reserved
 }
 
 if [ "$MODE" = full ]; then

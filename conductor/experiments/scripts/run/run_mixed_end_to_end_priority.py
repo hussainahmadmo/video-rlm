@@ -229,7 +229,11 @@ def main() -> None:
     parser.add_argument("--arrival-trace", type=Path, help="Per-request JSONL arrival trace")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--port", type=int, default=9001)
-    parser.add_argument("--prep-policy", choices=["fcfs", "priority"], default="priority")
+    parser.add_argument(
+        "--prep-policy",
+        choices=["fcfs", "priority", "priority_reserved"],
+        default="priority",
+    )
     parser.add_argument("--background-requests", type=int, default=32)
     parser.add_argument("--urgent-requests", type=int, default=16)
     parser.add_argument("--background-arrival-s", type=float, default=0.0)
@@ -239,6 +243,14 @@ def main() -> None:
     parser.add_argument("--background-priority", type=int, default=10)
     parser.add_argument("--urgent-priority", type=int, default=0)
     parser.add_argument("--prep-workers", type=int, default=4)
+    parser.add_argument(
+        "--background-prep-limit",
+        type=int,
+        help=(
+            "Maximum concurrent background preparations under "
+            "priority_reserved. Defaults to prep-workers minus one."
+        ),
+    )
     parser.add_argument("--vlm-concurrency", type=int, default=4)
     parser.add_argument("--prepared-queue-depth", type=int, default=32)
     parser.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
@@ -252,6 +264,12 @@ def main() -> None:
 
     if min(args.prep_workers, args.vlm_concurrency, args.prepared_queue_depth) < 1:
         parser.error("worker and queue counts must be positive")
+    if args.background_prep_limit is None:
+        args.background_prep_limit = max(1, args.prep_workers - 1)
+    if not 1 <= args.background_prep_limit <= args.prep_workers:
+        parser.error(
+            "--background-prep-limit must be between 1 and --prep-workers"
+        )
     if args.arrival_trace is None:
         if args.background_dataset is None or args.urgent_dataset is None:
             parser.error("provide --arrival-trace, or both dataset arguments")
@@ -331,7 +349,37 @@ def main() -> None:
         return time.perf_counter() - started
 
     def scheduling_key(job: dict[str, Any]) -> int:
-        return job["priority"] if args.prep_policy == "priority" else 0
+        return job["priority"] if args.prep_policy != "fcfs" else 0
+
+    def pop_pending_for_preparation() -> dict[str, Any] | None:
+        if not pending:
+            return None
+
+        if args.prep_policy != "priority_reserved":
+            return heapq.heappop(pending)[2]
+
+        active_background = sum(
+            job["workload"] == "background"
+            for job in prep_futures.values()
+        )
+        if active_background < args.background_prep_limit:
+            return heapq.heappop(pending)[2]
+
+        eligible = [
+            (key, sequence, index)
+            for index, (key, sequence, job) in enumerate(pending)
+            if job["workload"] != "background"
+        ]
+        if not eligible:
+            return None
+
+        _, _, index = min(eligible)
+        _, _, job = pending[index]
+        pending[index] = pending[-1]
+        pending.pop()
+        if pending:
+            heapq.heapify(pending)
+        return job
 
     def event(name: str, job: dict[str, Any], **extra: Any) -> None:
         append_jsonl(
@@ -364,7 +412,9 @@ def main() -> None:
                 and len(prep_futures) < args.prep_workers
                 and len(ready) + len(prep_futures) < args.prepared_queue_depth
             ):
-                _, _, job = heapq.heappop(pending)
+                job = pop_pending_for_preparation()
+                if job is None:
+                    break
                 job["prep_started_s"] = elapsed()
                 event("prep_start", job, pending_depth=len(pending))
                 prep_futures[prep_pool.submit(prepare_uniform, job, codec, codec_args)] = job
@@ -498,6 +548,11 @@ def main() -> None:
         "errors": sum(row.get("error") is not None for row in completed),
         "throughput_qps": len(completed) / wall_s if wall_s else 0.0,
         "prep_workers": args.prep_workers,
+        "background_prep_limit": (
+            args.background_prep_limit
+            if args.prep_policy == "priority_reserved"
+            else None
+        ),
         "vlm_concurrency": args.vlm_concurrency,
         "prepared_queue_depth": args.prepared_queue_depth,
         "background": summarize(by_workload["background"]),
