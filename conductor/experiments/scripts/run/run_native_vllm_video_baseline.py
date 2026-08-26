@@ -2,6 +2,7 @@
 """Evaluate native vLLM uniform video sampling without semantic retrieval."""
 
 import argparse
+import inspect
 import json
 import math
 import random
@@ -17,6 +18,26 @@ from pathlib import Path
 from openai import OpenAI
 
 LOCK = threading.Lock()
+
+
+def local_vllm_video_backends():
+    """Return video loaders registered in the runner's vLLM installation."""
+    try:
+        from vllm.multimodal.media import VIDEO_LOADER_REGISTRY
+    except Exception:
+        return None
+    return sorted(VIDEO_LOADER_REGISTRY.name2class)
+
+
+def local_vllm_backend_key():
+    """Handle both the legacy and current media_io_kwargs spelling."""
+    try:
+        from vllm.multimodal.media.video import VideoMediaIO
+
+        source = inspect.getsource(VideoMediaIO.__init__)
+    except Exception:
+        return "backend"
+    return "video_backend" if 'kwargs.pop("video_backend"' in source else "backend"
 
 
 def percentile(values, fraction):
@@ -129,7 +150,7 @@ def run_one(
             "max_duration": max(1, math.ceil(duration_s)),
         }
         if args.video_backend is not None:
-            video_io_kwargs["backend"] = args.video_backend
+            video_io_kwargs[args.video_backend_key] = args.video_backend
         video_io_kwargs.update(args.video_backend_kwargs)
         extra_body = {"media_io_kwargs": {"video": video_io_kwargs}}
         if args.max_pixels is not None:
@@ -175,6 +196,7 @@ def run_one(
         ),
         "uniform_frame_count": frame_count,
         "video_backend": args.video_backend or "server_default",
+        "video_backend_key": args.video_backend_key,
         "video_backend_kwargs": args.video_backend_kwargs,
         "max_pixels": args.max_pixels,
         "duration_s": duration_s, "sampling_fps": sampling_fps,
@@ -249,6 +271,21 @@ def main():
         ),
     )
     parser.add_argument(
+        "--video-backend-key",
+        choices=["auto", "backend", "video_backend"],
+        default="auto",
+        help=(
+            "Key used inside media_io_kwargs.video. auto detects the installed "
+            "vLLM API; current vLLM uses backend while older builds used "
+            "video_backend."
+        ),
+    )
+    parser.add_argument(
+        "--skip-local-backend-check",
+        action="store_true",
+        help="Allow a backend absent from the runner environment's vLLM registry.",
+    )
+    parser.add_argument(
         "--video-backend-kwargs", default="{}",
         help=(
             "JSON object forwarded inside media_io_kwargs.video, for example "
@@ -301,6 +338,26 @@ def main():
         parser.error("--video-backend-kwargs must decode to a JSON object")
     if "backend" in args.video_backend_kwargs:
         parser.error("set --video-backend instead of backend in --video-backend-kwargs")
+    if "video_backend" in args.video_backend_kwargs:
+        parser.error(
+            "set --video-backend instead of video_backend in "
+            "--video-backend-kwargs"
+        )
+    if args.video_backend_key == "auto":
+        args.video_backend_key = local_vllm_backend_key()
+    available_backends = local_vllm_video_backends()
+    if (
+        args.video_backend is not None
+        and available_backends is not None
+        and args.video_backend not in available_backends
+        and not args.skip_local_backend_check
+    ):
+        parser.error(
+            f"video backend {args.video_backend!r} is not registered in the "
+            f"runner's vLLM installation; available={available_backends}. "
+            "Upgrade vLLM or pass --skip-local-backend-check only when the "
+            "server intentionally uses a different environment."
+        )
     video_mappings = []
     for value in args.video_map:
         if "=" not in value:
@@ -517,6 +574,8 @@ def main():
         "ports": ports, "concurrency": args.concurrency,
         "request_timeout_s": args.request_timeout_s,
         "video_backend": args.video_backend or "server_default",
+        "video_backend_key": args.video_backend_key,
+        "locally_registered_video_backends": available_backends,
         "video_backend_kwargs": args.video_backend_kwargs,
         "video_root": str(args.video_root.resolve()),
         "video_base_url": args.video_base_url,

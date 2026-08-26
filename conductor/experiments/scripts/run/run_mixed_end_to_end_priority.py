@@ -20,6 +20,7 @@ import base64
 import heapq
 import importlib.util
 import json
+import os
 import re
 import sys
 import threading
@@ -39,6 +40,27 @@ CODEC_PATH = (
     / "conductor/experiments/scripts/run/run_codec_guided_vllm_baseline.py"
 )
 WRITE_LOCK = threading.Lock()
+
+
+def parse_cpu_set(value: str | None) -> set[int] | None:
+    if value is None:
+        return None
+    cpus: set[int] = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            start, end = int(start_text), int(end_text)
+            if start > end:
+                raise ValueError(f"invalid CPU range: {part}")
+            cpus.update(range(start, end + 1))
+        else:
+            cpus.add(int(part))
+    if not cpus:
+        raise ValueError("CPU set is empty")
+    return cpus
 
 
 def import_path(name: str, path: Path):
@@ -121,7 +143,7 @@ def prepare_uniform(
     started = time.perf_counter()
     duration_s = codec.probe_duration(video, codec_args.index_timeout_s)
     timestamps = codec.temporal_anchors(duration_s, job["frame_count"])
-    if codec_args.decode_backend == "batch_cpu":
+    if codec_args.decode_backend in ("batch_cpu", "batch_nvdec"):
         jpegs = codec_args.batch_decode(
             video, timestamps, codec_args.decode_max_side,
             codec_args.decode_timeout_s,
@@ -152,6 +174,23 @@ def prepare_uniform(
         "timestamps": timestamps,
         "decode_service_s": time.perf_counter() - started,
     }
+
+
+def prepare_with_affinity(
+    job: dict[str, Any], codec: Any, codec_args: SimpleNamespace,
+    cpu_sets: dict[str, set[int] | None],
+) -> dict[str, Any]:
+    """Prepare one request while optionally pinning its worker thread."""
+    requested = cpu_sets.get(job["workload"])
+    if requested is None:
+        return prepare_uniform(job, codec, codec_args)
+    original = os.sched_getaffinity(0)
+    os.sched_setaffinity(0, requested)
+    try:
+        # Decoder subprocesses inherit the calling worker thread's affinity.
+        return prepare_uniform(job, codec, codec_args)
+    finally:
+        os.sched_setaffinity(0, original)
 
 
 def call_vllm(
@@ -229,6 +268,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         summary[f"mean_{field}"] = mean(values)
         summary[f"p50_{field}"] = percentile(values, 0.50)
         summary[f"p95_{field}"] = percentile(values, 0.95)
+        summary[f"max_{field}"] = max(values) if values else None
     slo_rows = [row for row in rows if row.get("ttft_slo_s") is not None]
     summary["ttft_slo_requests"] = len(slo_rows)
     summary["ttft_slo_attained"] = sum(
@@ -254,12 +294,25 @@ def main() -> None:
     )
     parser.add_argument(
         "--replica-routing",
-        choices=["round_robin", "least_inflight"],
+        choices=["round_robin", "least_inflight", "workload_isolated"],
         default="least_inflight",
     )
     parser.add_argument(
+        "--background-ports", type=int, nargs="+",
+        help=("vLLM ports dedicated to background requests when "
+              "--replica-routing workload_isolated is selected"),
+    )
+    parser.add_argument(
+        "--urgent-ports", type=int, nargs="+",
+        help=("vLLM ports dedicated to urgent requests when "
+              "--replica-routing workload_isolated is selected"),
+    )
+    parser.add_argument(
         "--prep-policy",
-        choices=["fcfs", "priority", "priority_reserved", "slo_adaptive"],
+        choices=[
+            "fcfs", "priority", "priority_reserved", "slo_adaptive",
+            "static_isolation",
+        ],
         default="priority",
     )
     parser.add_argument("--background-requests", type=int, default=32)
@@ -272,7 +325,27 @@ def main() -> None:
     parser.add_argument("--urgent-priority", type=int, default=0)
     parser.add_argument("--prep-workers", type=int, default=4)
     parser.add_argument(
-        "--decode-backend", choices=["seek_cpu", "batch_cpu"],
+        "--background-prep-workers", type=int,
+        help=("preparation slots dedicated to background requests under "
+              "static_isolation"),
+    )
+    parser.add_argument(
+        "--urgent-prep-workers", type=int,
+        help=("preparation slots dedicated to urgent requests under "
+              "static_isolation"),
+    )
+    parser.add_argument(
+        "--background-cpu-set",
+        help=("optional Linux CPU list dedicated to background preparation "
+              "under static_isolation, for example 0-15,32-47"),
+    )
+    parser.add_argument(
+        "--urgent-cpu-set",
+        help=("optional Linux CPU list dedicated to urgent preparation under "
+              "static_isolation, for example 16-31,48-63"),
+    )
+    parser.add_argument(
+        "--decode-backend", choices=["seek_cpu", "batch_cpu", "batch_nvdec"],
         default="seek_cpu",
         help="External frame preparation backend",
     )
@@ -300,6 +373,16 @@ def main() -> None:
     parser.add_argument("--prep-cost-ewma-alpha", type=float, default=0.2)
     parser.add_argument("--vlm-concurrency", type=int, default=4)
     parser.add_argument("--prepared-queue-depth", type=int, default=32)
+    parser.add_argument(
+        "--background-prepared-queue-depth", type=int,
+        help=("handoff slots dedicated to background requests under "
+              "static_isolation"),
+    )
+    parser.add_argument(
+        "--urgent-prepared-queue-depth", type=int,
+        help=("handoff slots dedicated to urgent requests under "
+              "static_isolation"),
+    )
     parser.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--max-pixels", type=int, default=100352)
@@ -327,6 +410,72 @@ def main() -> None:
         parser.error(
             "--background-prep-limit must be between 1 and --prep-workers"
         )
+    if args.prep_policy == "static_isolation":
+        if (
+            args.background_prep_workers is None
+            or args.urgent_prep_workers is None
+        ):
+            parser.error(
+                "static_isolation requires --background-prep-workers and "
+                "--urgent-prep-workers"
+            )
+        if min(args.background_prep_workers, args.urgent_prep_workers) < 1:
+            parser.error("static-isolation preparation quotas must be positive")
+        if (
+            args.background_prep_workers + args.urgent_prep_workers
+            != args.prep_workers
+        ):
+            parser.error(
+                "static-isolation preparation quotas must sum to "
+                "--prep-workers"
+            )
+        if (
+            args.background_prepared_queue_depth is None
+            or args.urgent_prepared_queue_depth is None
+        ):
+            parser.error(
+                "static_isolation requires "
+                "--background-prepared-queue-depth and "
+                "--urgent-prepared-queue-depth"
+            )
+        if min(
+            args.background_prepared_queue_depth,
+            args.urgent_prepared_queue_depth,
+        ) < 1:
+            parser.error("static-isolation handoff quotas must be positive")
+        if (
+            args.background_prepared_queue_depth
+            + args.urgent_prepared_queue_depth
+            != args.prepared_queue_depth
+        ):
+            parser.error(
+                "static-isolation handoff quotas must sum to "
+                "--prepared-queue-depth"
+            )
+        try:
+            background_cpu_set = parse_cpu_set(args.background_cpu_set)
+            urgent_cpu_set = parse_cpu_set(args.urgent_cpu_set)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if (background_cpu_set is None) != (urgent_cpu_set is None):
+            parser.error(
+                "provide both --background-cpu-set and --urgent-cpu-set, "
+                "or neither"
+            )
+        if background_cpu_set is not None:
+            if background_cpu_set & urgent_cpu_set:
+                parser.error("background and urgent CPU sets must be disjoint")
+            allowed_cpus = os.sched_getaffinity(0)
+            if not (background_cpu_set | urgent_cpu_set) <= allowed_cpus:
+                parser.error(
+                    "requested CPU sets include CPUs outside this process's "
+                    f"allowed affinity: {sorted(allowed_cpus)}"
+                )
+    else:
+        if args.background_cpu_set or args.urgent_cpu_set:
+            parser.error("CPU-set isolation requires static_isolation")
+        background_cpu_set = None
+        urgent_cpu_set = None
     if args.arrival_trace is None:
         if args.background_dataset is None or args.urgent_dataset is None:
             parser.error("provide --arrival-trace, or both dataset arguments")
@@ -352,12 +501,39 @@ def main() -> None:
 
     codec = import_path("mixed_priority_codec", CODEC_PATH)
     codec_args = make_codec_args(args)
-    if args.decode_backend == "batch_cpu":
+    cpu_sets = {
+        "background": background_cpu_set,
+        "urgent": urgent_cpu_set,
+    }
+    if args.decode_backend in ("batch_cpu", "batch_nvdec"):
+        module_name = (
+            "batched_cpu_decode"
+            if args.decode_backend == "batch_cpu"
+            else "batched_nvdec_decode"
+        )
         batch_codec = import_path(
-            "batched_cpu_decode", CODEC_PATH.with_name("batched_cpu_decode.py")
+            module_name, CODEC_PATH.with_name(f"{module_name}.py")
         )
         codec_args.batch_decode = batch_codec.decode_jpegs_batch_cpu
     ports = list(dict.fromkeys(args.ports or [args.port]))
+    background_ports = list(dict.fromkeys(args.background_ports or []))
+    urgent_ports = list(dict.fromkeys(args.urgent_ports or []))
+    if args.replica_routing == "workload_isolated":
+        if not background_ports or not urgent_ports:
+            parser.error(
+                "workload_isolated requires --background-ports and "
+                "--urgent-ports"
+            )
+        if set(background_ports) & set(urgent_ports):
+            parser.error("background and urgent port sets must be disjoint")
+        isolated_ports = set(background_ports) | set(urgent_ports)
+        if not isolated_ports <= set(ports):
+            parser.error("isolated workload ports must also appear in --ports")
+    elif background_ports or urgent_ports:
+        parser.error(
+            "--background-ports/--urgent-ports require "
+            "--replica-routing workload_isolated"
+        )
     base_urls = {port: f"http://127.0.0.1:{port}/v1" for port in ports}
     for base_url in base_urls.values():
         readiness_client = OpenAI(
@@ -458,6 +634,52 @@ def main() -> None:
             job["workload"] == "background" for job in prep_futures.values()
         )
 
+        if args.prep_policy == "static_isolation":
+            active_by_workload = {
+                workload: sum(
+                    job["workload"] == workload
+                    for job in prep_futures.values()
+                )
+                for workload in ("background", "urgent")
+            }
+            limits = {
+                "background": args.background_prep_workers,
+                "urgent": args.urgent_prep_workers,
+            }
+            handoff_limits = {
+                "background": args.background_prepared_queue_depth,
+                "urgent": args.urgent_prepared_queue_depth,
+            }
+            admitted_by_workload = {
+                workload: (
+                    sum(
+                        job["workload"] == workload
+                        for job in prep_futures.values()
+                    )
+                    + sum(
+                        job["workload"] == workload
+                        for _, _, job, _ in ready
+                    )
+                )
+                for workload in ("background", "urgent")
+            }
+            eligible = [
+                index
+                for index, (_, _, job) in enumerate(pending)
+                if job["workload"] in limits
+                and active_by_workload[job["workload"]]
+                < limits[job["workload"]]
+                and admitted_by_workload[job["workload"]]
+                < handoff_limits[job["workload"]]
+            ]
+            if not eligible:
+                return None
+            index = min(
+                eligible,
+                key=lambda item: (pending[item][0], pending[item][1]),
+            )
+            return remove_pending(index)
+
         if args.prep_policy == "slo_adaptive":
             urgent_waiting = any(
                 job["workload"] == "urgent" for _, _, job in pending
@@ -495,13 +717,56 @@ def main() -> None:
             return None
         return remove_pending(min(eligible)[2])
 
-    def choose_replica() -> int:
+    def replica_candidates(job: dict[str, Any]) -> list[int]:
+        if args.replica_routing != "workload_isolated":
+            return ports
+        if job["workload"] == "urgent":
+            return urgent_ports
+        if job["workload"] == "background":
+            return background_ports
+        raise RuntimeError(
+            "workload_isolated supports only background and urgent requests; "
+            f"received {job['workload']!r}"
+        )
+
+    def choose_replica(job: dict[str, Any]) -> int | None:
         nonlocal round_robin_cursor
+        candidates = [
+            port for port in replica_candidates(job)
+            if replica_inflight[port] < args.vlm_concurrency
+        ]
+        if not candidates:
+            return None
         if args.replica_routing == "round_robin":
-            port = ports[round_robin_cursor % len(ports)]
+            port = candidates[round_robin_cursor % len(candidates)]
             round_robin_cursor += 1
             return port
-        return min(ports, key=lambda port: (replica_inflight[port], port))
+        return min(candidates, key=lambda port: (replica_inflight[port], port))
+
+    def remove_ready(index: int):
+        item = ready[index]
+        ready[index] = ready[-1]
+        ready.pop()
+        if ready:
+            heapq.heapify(ready)
+        return item
+
+    def pop_ready_for_vllm():
+        eligible = [
+            index
+            for index, (_, _, job, _) in enumerate(ready)
+            if any(
+                replica_inflight[port] < args.vlm_concurrency
+                for port in replica_candidates(job)
+            )
+        ]
+        if not eligible:
+            return None
+        index = min(
+            eligible,
+            key=lambda item: (ready[item][0], ready[item][1]),
+        )
+        return remove_ready(index)
 
     def event(name: str, job: dict[str, Any], **extra: Any) -> None:
         append_jsonl(
@@ -532,7 +797,11 @@ def main() -> None:
             while (
                 pending
                 and len(prep_futures) < args.prep_workers
-                and len(ready) + len(prep_futures) < args.prepared_queue_depth
+                and (
+                    args.prep_policy == "static_isolation"
+                    or len(ready) + len(prep_futures)
+                    < args.prepared_queue_depth
+                )
             ):
                 job = pop_pending_for_preparation()
                 if job is None:
@@ -550,11 +819,20 @@ def main() -> None:
                         for item in prep_futures.values()
                     ),
                 )
-                prep_futures[prep_pool.submit(prepare_uniform, job, codec, codec_args)] = job
+                prep_futures[
+                    prep_pool.submit(
+                        prepare_with_affinity, job, codec, codec_args, cpu_sets
+                    )
+                ] = job
 
             while ready and len(vlm_futures) < args.vlm_concurrency * len(ports):
-                _, _, job, prepared = heapq.heappop(ready)
-                replica_port = choose_replica()
+                ready_item = pop_ready_for_vllm()
+                if ready_item is None:
+                    break
+                _, _, job, prepared = ready_item
+                replica_port = choose_replica(job)
+                if replica_port is None:
+                    raise RuntimeError("eligible ready request has no replica capacity")
                 replica_inflight[replica_port] += 1
                 job["replica_port"] = replica_port
                 job["vlm_submit_s"] = elapsed()
@@ -700,6 +978,7 @@ def main() -> None:
         by_workload[row["workload"]].append(row)
     summary = {
         "method": "mixed_end_to_end_video_priority",
+        "model": args.model,
         "prep_policy": args.prep_policy,
         "server_requirement": "--scheduling-policy priority",
         "port": ports[0],
@@ -717,6 +996,29 @@ def main() -> None:
             if args.prep_policy == "priority_reserved"
             else None
         ),
+        "background_prep_workers": (
+            args.background_prep_workers
+            if args.prep_policy == "static_isolation" else None
+        ),
+        "urgent_prep_workers": (
+            args.urgent_prep_workers
+            if args.prep_policy == "static_isolation" else None
+        ),
+        "background_cpu_set": (
+            sorted(background_cpu_set)
+            if background_cpu_set is not None else None
+        ),
+        "urgent_cpu_set": (
+            sorted(urgent_cpu_set) if urgent_cpu_set is not None else None
+        ),
+        "background_ports": (
+            background_ports
+            if args.replica_routing == "workload_isolated" else None
+        ),
+        "urgent_ports": (
+            urgent_ports
+            if args.replica_routing == "workload_isolated" else None
+        ),
         "urgent_prep_reserve": (
             args.urgent_prep_reserve
             if args.prep_policy == "slo_adaptive" else None
@@ -724,6 +1026,14 @@ def main() -> None:
         "vlm_concurrency_per_replica": args.vlm_concurrency,
         "vlm_concurrency_total": args.vlm_concurrency * len(ports),
         "prepared_queue_depth": args.prepared_queue_depth,
+        "background_prepared_queue_depth": (
+            args.background_prepared_queue_depth
+            if args.prep_policy == "static_isolation" else None
+        ),
+        "urgent_prepared_queue_depth": (
+            args.urgent_prepared_queue_depth
+            if args.prep_policy == "static_isolation" else None
+        ),
         "background": summarize(by_workload["background"]),
         "urgent": summarize(by_workload["urgent"]),
         "configuration": {

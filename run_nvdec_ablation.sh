@@ -7,39 +7,19 @@ set -euo pipefail
 PORT=${PORT:-9000}
 SHARD_INDEX=${SHARD_INDEX:-0}
 NUM_SHARDS=${NUM_SHARDS:-1}
+NVDEC_GPU_ID=${NVDEC_GPU_ID:-0}
 TRACE_NAMES=${TRACE_NAMES:-"burst_urgent10-seed1 burst_urgent10-seed2 burst_urgent10-seed3 staggered_urgent10-seed1 staggered_urgent10-seed2 staggered_urgent10-seed3 poisson_rate0.5-urgent30-seed1 poisson_rate0.5-urgent30-seed2 poisson_rate0.5-urgent30-seed3"}
+BACKENDS=${BACKENDS:-"seek_cpu batch_cpu batch_nvdec"}
+POLICIES=${POLICIES:-"fcfs priority"}
 RUNNER="$VIDEO_RLM_ROOT/conductor/experiments/scripts/run/run_mixed_end_to_end_priority.py"
 STAMP=$(date +%Y%m%d_%H%M%S)
-if [[ "$VIDEO_RLM_ROOT" == /workspace/* ]]; then
-  OUT=${BATCH_CPU_OUT:-"$VIDEO_RLM_ROOT/conductor/experiments/large_sweeps/batched_cpu_ablation_$STAMP"}
-else
-  OUT=${BATCH_CPU_OUT:-"$VIDEO_RLM_ROOT/large_sweeps/batched_cpu_ablation_$STAMP"}
-fi
-LOGROOT=${BATCH_CPU_LOGROOT:-"$VIDEO_RLM_ROOT/logs/$(basename "$OUT")"}
+OUT=${NVDEC_OUT:-"$VIDEO_RLM_ROOT/large_sweeps/nvdec_ablation_$STAMP"}
+LOGROOT=${NVDEC_LOGROOT:-"$VIDEO_RLM_ROOT/logs/$(basename "$OUT")"}
 mkdir -p "$OUT/traces" "$LOGROOT"
-echo "$OUT" > "$VIDEO_RLM_ROOT/logs/latest_batched_cpu_ablation.path"
+echo "$OUT" > "$VIDEO_RLM_ROOT/logs/latest_nvdec_ablation.path"
 
-run_one() {
-  local trace=$1
-  local trace_name=$2
-  local backend=$3
-  local policy=$4
-  local name="${trace_name}/${backend}_${policy}"
-  echo "START $name $(date -u +%FT%TZ)"
-  VIDEO_RLM_FFMPEG_THREADS=1 "$VLLM_PYTHON" "$RUNNER" \
-    --arrival-trace "$trace" \
-    --output "$OUT/$name" \
-    --port "$PORT" \
-    --prep-policy "$policy" \
-    --decode-backend "$backend" \
-    --prep-workers 4 \
-    --vlm-concurrency 4 \
-    --prepared-queue-depth 32 \
-    --decode-timeout-s 600 \
-    --request-timeout-s 1800 \
-    >"$LOGROOT/${trace_name}-${backend}-${policy}.log" 2>&1
-  echo "DONE $name $(date -u +%FT%TZ)"
-}
+curl -fsS --max-time 10 -H 'Authorization: Bearer EMPTY' \
+  "http://127.0.0.1:$PORT/v1/models" >/dev/null
 
 if (( SHARD_INDEX < 0 || SHARD_INDEX >= NUM_SHARDS )); then
   echo "invalid shard $SHARD_INDEX/$NUM_SHARDS" >&2
@@ -58,11 +38,26 @@ for trace_name in $TRACE_NAMES; do
   test -f "$source_trace" || { echo "missing trace: $source_trace" >&2; exit 1; }
   jq -c 'select((.qid // .question_id // "") != "20520eff-abdf-4d4f-94ad-cc751a8960d0")' \
     "$source_trace" > "$clean_trace"
-  echo "$trace_name rows: source=$(wc -l < "$source_trace") clean=$(wc -l < "$clean_trace")"
-  run_one "$clean_trace" "$trace_name" seek_cpu fcfs
-  run_one "$clean_trace" "$trace_name" seek_cpu priority
-  run_one "$clean_trace" "$trace_name" batch_cpu fcfs
-  run_one "$clean_trace" "$trace_name" batch_cpu priority
+  for backend in $BACKENDS; do
+    for policy in $POLICIES; do
+      name="$trace_name/${backend}_${policy}"
+      echo "START $name $(date -u +%FT%TZ)"
+      VIDEO_RLM_FFMPEG_THREADS=1 VIDEO_RLM_NVDEC_GPU_ID="$NVDEC_GPU_ID" \
+        "$VLLM_PYTHON" "$RUNNER" \
+          --arrival-trace "$clean_trace" \
+          --output "$OUT/$name" \
+          --port "$PORT" \
+          --prep-policy "$policy" \
+          --decode-backend "$backend" \
+          --prep-workers 4 \
+          --vlm-concurrency 4 \
+          --prepared-queue-depth 32 \
+          --decode-timeout-s 600 \
+          --request-timeout-s 1800 \
+          >"$LOGROOT/$trace_name-${backend}-${policy}.log" 2>&1
+      echo "DONE $name $(date -u +%FT%TZ)"
+    done
+  done
 done
 
 echo "ALL_DONE"

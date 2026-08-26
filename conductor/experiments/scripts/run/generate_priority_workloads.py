@@ -48,14 +48,33 @@ def main():
     p.add_argument("--rate-qps", type=float, default=0.5)
     p.add_argument("--interval-s", type=float, default=2.0)
     p.add_argument("--urgent-arrival-s", type=float, default=30.0)
+    p.add_argument(
+        "--urgent-pattern",
+        choices=["burst", "staggered", "poisson"],
+        default="burst",
+        help="Arrival process for urgent requests after --urgent-arrival-s.",
+    )
+    p.add_argument("--urgent-interval-s", type=float, default=1.0)
+    p.add_argument("--urgent-rate-qps", type=float, default=1.0)
     p.add_argument("--background-frames", type=int, default=128)
     p.add_argument("--urgent-frames", type=int, default=8)
     p.add_argument("--mixed-frames", action="store_true")
+    p.add_argument(
+        "--exclude-qid",
+        action="append",
+        default=[],
+        help="Question ID to remove before sampling; may be repeated.",
+    )
     p.add_argument("--seed", type=int, required=True)
     args = p.parse_args()
 
     rng = random.Random(args.seed)
-    source = load(args.dataset)
+    excluded = set(args.exclude_qid)
+    source = [
+        row for row in load(args.dataset)
+        if str(row.get("qid") or row.get("question_id") or row.get("id"))
+        not in excluded
+    ]
     rng.shuffle(source)
 
     if args.pattern == "replay":
@@ -103,13 +122,31 @@ def main():
                 "frame_count": frame_budget(row, rng) if args.mixed_frames else args.background_frames,
             })
             trace.append(row)
+        if args.urgent_pattern == "burst":
+            urgent_arrivals = [args.urgent_arrival_s] * args.urgent_count
+        elif args.urgent_pattern == "staggered":
+            if args.urgent_interval_s <= 0:
+                p.error("--urgent-interval-s must be positive")
+            urgent_arrivals = [
+                args.urgent_arrival_s + index * args.urgent_interval_s
+                for index in range(args.urgent_count)
+            ]
+        else:
+            if args.urgent_rate_qps <= 0:
+                p.error("--urgent-rate-qps must be positive")
+            urgent_arrivals, now = [], args.urgent_arrival_s
+            for _ in range(args.urgent_count):
+                now += rng.expovariate(args.urgent_rate_qps)
+                urgent_arrivals.append(now)
+
         offset = args.background_count
-        for index, row in enumerate(source[offset:offset + args.urgent_count]):
+        urgent_rows = source[offset:offset + args.urgent_count]
+        for index, (row, arrival) in enumerate(zip(urgent_rows, urgent_arrivals)):
             row = dict(row)
             row.update({
                 "request_id": f"urgent-{index}",
                 "class": "urgent",
-                "arrival_s": args.urgent_arrival_s,
+                "arrival_s": arrival,
                 "priority": 0,
                 "frame_count": frame_budget(row, rng) if args.mixed_frames else args.urgent_frames,
             })

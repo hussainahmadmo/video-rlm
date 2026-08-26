@@ -15,6 +15,14 @@ import numpy as np
 
 
 POLICIES = ("fcfs", "priority", "priority_reserved")
+T975 = {
+    2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776, 6: 2.571,
+    7: 2.447, 8: 2.365, 9: 2.306, 10: 2.262, 11: 2.228,
+    12: 2.201, 13: 2.179, 14: 2.160, 15: 2.145, 16: 2.131,
+    17: 2.120, 18: 2.110, 19: 2.101, 20: 2.093, 21: 2.086,
+    22: 2.080, 23: 2.074, 24: 2.069, 25: 2.064, 26: 2.060,
+    27: 2.056, 28: 2.052, 29: 2.048, 30: 2.045,
+}
 LABELS = {
     "fcfs": "FCFS media prep",
     "priority": "Priority media prep",
@@ -81,10 +89,13 @@ def main() -> None:
         errors = []
         for group in order:
             samples = values[group][policy]
-            errors.append(
-                np.std(samples, ddof=1) / math.sqrt(len(samples))
-                if len(samples) > 1 else 0.0
-            )
+            if len(samples) > 1:
+                t_value = T975.get(len(samples), 1.96)
+                errors.append(
+                    t_value * np.std(samples, ddof=1) / math.sqrt(len(samples))
+                )
+            else:
+                errors.append(0.0)
         bars = ax.bar(
             x + (index - 1) * width,
             means,
@@ -101,7 +112,7 @@ def main() -> None:
     ax.set_ylabel("Urgent mean end-to-end TTFT (seconds)")
     ax.set_title(
         f"End-to-end media-preparation priority across arrival patterns\n"
-        f"{matched} matched traces; bars are means, error bars are SEM"
+        f"{matched} matched traces; bars are means, error bars are 95% CIs"
     )
     ax.grid(axis="y", alpha=0.25)
     ax.legend(frameon=True)
