@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 
 from vllm_media_priority_plugin import BoundedPriorityMediaScheduler
+from vllm_media_priority_plugin import extract_frame_budget
 
 
 async def _check_priority_and_non_preemption() -> None:
@@ -38,6 +39,11 @@ async def _check_priority_and_non_preemption() -> None:
 
 
 def main() -> None:
+    clean, frames = extract_frame_budget(
+        "http://127.0.0.1:8090/video.mp4?token=x&vllm_num_frames=128"
+    )
+    assert clean == "http://127.0.0.1:8090/video.mp4?token=x"
+    assert frames == 128
     asyncio.run(_check_priority_and_non_preemption())
     print("bounded priority scheduler: PASS")
 

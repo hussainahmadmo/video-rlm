@@ -57,6 +57,12 @@ def main() -> None:
     if custom.media_preparation_max_pending < 0:
         parser.error("--media-preparation-max-pending cannot be negative")
 
+    from vllm_media_priority_plugin import install_frame_budget_adapter
+
+    # The OpenAI schema does not accept per-request media_io_kwargs. Install a
+    # scheduling-neutral adapter so mixed-frame traces work for both policies.
+    install_frame_budget_adapter()
+
     if custom.media_preparation_policy == "priority":
         from vllm_media_priority_plugin import install
 

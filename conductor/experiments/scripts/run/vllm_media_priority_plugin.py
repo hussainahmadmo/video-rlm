@@ -20,6 +20,7 @@ import itertools
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 LOGGER = logging.getLogger("vllm.media_priority")
@@ -101,6 +102,113 @@ class BoundedPriorityMediaScheduler:
 
 _INSTALLED = False
 _SCHEDULER: BoundedPriorityMediaScheduler | None = None
+_FRAME_BUDGET_INSTALLED = False
+
+FRAME_BUDGET_QUERY_KEY = "vllm_num_frames"
+
+
+def extract_frame_budget(url: str) -> tuple[str, int | None]:
+    """Remove and return the opt-in per-request video frame budget."""
+    parts = urlsplit(url)
+    kept: list[tuple[str, str]] = []
+    values: list[str] = []
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        if key == FRAME_BUDGET_QUERY_KEY:
+            values.append(value)
+        else:
+            kept.append((key, value))
+
+    if not values:
+        return url, None
+    if len(values) != 1:
+        raise ValueError(f"{FRAME_BUDGET_QUERY_KEY} must occur exactly once")
+
+    try:
+        frame_budget = int(values[0])
+    except ValueError as exc:
+        raise ValueError(f"invalid {FRAME_BUDGET_QUERY_KEY}: {values[0]!r}") from exc
+    if frame_budget < 1:
+        raise ValueError(f"{FRAME_BUDGET_QUERY_KEY} must be positive")
+
+    clean_url = urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(kept), parts.fragment)
+    )
+    return clean_url, frame_budget
+
+
+def install_frame_budget_adapter() -> None:
+    """Allow an OpenAI video URL to select its own native frame budget.
+
+    vLLM 0.17 exposes ``--media-io-kwargs`` only as a server-wide setting; its
+    OpenAI request schema ignores a per-request ``media_io_kwargs`` field. The
+    experiment runner therefore carries ``vllm_num_frames`` as URL metadata.
+    This hook removes that metadata before fetching and constructs the video
+    loader with the requested budget. It does not change request ordering.
+    """
+    global _FRAME_BUDGET_INSTALLED
+    if _FRAME_BUDGET_INSTALLED:
+        return
+
+    from vllm import envs
+    from vllm.multimodal.media.connector import MediaConnector
+    from vllm.multimodal.media.image import ImageMediaIO
+    from vllm.multimodal.media.video import VideoMediaIO
+
+    original_fetch_video = MediaConnector.fetch_video
+    original_fetch_video_async = MediaConnector.fetch_video_async
+
+    def video_io(connector: Any, image_mode: str, frame_budget: int) -> Any:
+        image_io = ImageMediaIO(
+            image_mode=image_mode,
+            **connector.media_io_kwargs.get("image", {}),
+        )
+        kwargs = dict(connector.media_io_kwargs.get("video", {}))
+        kwargs["num_frames"] = frame_budget
+        return VideoMediaIO(image_io, **kwargs)
+
+    @functools.wraps(original_fetch_video)
+    def fetch_video_with_budget(
+        self: Any,
+        video_url: str,
+        *,
+        image_mode: str = "RGB",
+    ) -> Any:
+        clean_url, frame_budget = extract_frame_budget(video_url)
+        if frame_budget is None:
+            return original_fetch_video(self, video_url, image_mode=image_mode)
+        return self.load_from_url(
+            clean_url,
+            video_io(self, image_mode, frame_budget),
+            fetch_timeout=envs.VLLM_VIDEO_FETCH_TIMEOUT,
+        )
+
+    @functools.wraps(original_fetch_video_async)
+    async def fetch_video_async_with_budget(
+        self: Any,
+        video_url: str,
+        *,
+        image_mode: str = "RGB",
+    ) -> Any:
+        clean_url, frame_budget = extract_frame_budget(video_url)
+        if frame_budget is None:
+            return await original_fetch_video_async(
+                self,
+                video_url,
+                image_mode=image_mode,
+            )
+        return await self.load_from_url_async(
+            clean_url,
+            video_io(self, image_mode, frame_budget),
+            fetch_timeout=envs.VLLM_VIDEO_FETCH_TIMEOUT,
+        )
+
+    MediaConnector.fetch_video = fetch_video_with_budget
+    MediaConnector.fetch_video_async = fetch_video_async_with_budget
+    _FRAME_BUDGET_INSTALLED = True
+    LOGGER.warning(
+        "Enabled per-request video frame budgets via URL key %s",
+        FRAME_BUDGET_QUERY_KEY,
+    )
 
 
 def install(max_active_jobs: int, max_pending_jobs: int = 0) -> None:

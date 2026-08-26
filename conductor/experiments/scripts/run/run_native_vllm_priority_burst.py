@@ -18,11 +18,29 @@ import time
 import urllib.request
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from openai import AsyncOpenAI
 
 from run_native_vllm_video_baseline import make_video_url, parse_label, prompt, qid
+
+
+FRAME_BUDGET_QUERY_KEY = "vllm_num_frames"
+
+
+def add_frame_budget(url: str, frame_budget: int) -> str:
+    """Carry a per-request frame budget to the opt-in vLLM wrapper."""
+    parts = urlsplit(url)
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key != FRAME_BUDGET_QUERY_KEY
+    ]
+    query.append((FRAME_BUDGET_QUERY_KEY, str(frame_budget)))
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+    )
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -103,11 +121,10 @@ async def run_request(
     frames = int(frames_value) if frames_value is not None else None
     duration = duration_s(row)
 
-    # Enforce the trace's requested frame budget even when duration metadata
-    # is absent. Otherwise, native vLLM silently falls back to its default
-    # video frame count (currently 32).
+    # vLLM 0.17's OpenAI schema ignores per-request media_io_kwargs. The
+    # opt-in server wrapper consumes this URL metadata before fetching.
     if frames is not None:
-        video_kwargs["num_frames"] = frames
+        video_url = add_frame_budget(video_url, frames)
     if args.video_backend:
         video_kwargs[media_backend_key] = args.video_backend
     video_kwargs.update(args.video_backend_kwargs)
