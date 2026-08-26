@@ -5,7 +5,8 @@ This module deliberately does not modify vLLM's default behavior.  The
 ``install`` function monkey-patches the API-server process only when called by
 ``run_vllm_with_media_priority.py``.  It propagates the OpenAI request's
 ``priority`` field into native media loading and admits at most
-``max_active_jobs`` concurrent fetch/decode operations.
+``max_active_jobs`` concurrent media operations. The admission point can
+either cover fetching plus decoding or decoding alone.
 
 Smaller numeric values have higher priority, matching vLLM's priority
 scheduler.  Work that has already started remains non-preemptive.
@@ -211,16 +212,29 @@ def install_frame_budget_adapter() -> None:
     )
 
 
-def install(max_active_jobs: int, max_pending_jobs: int = 0) -> None:
+def install(
+    max_active_jobs: int,
+    max_pending_jobs: int = 0,
+    *,
+    admission_stage: str = "fetch_decode",
+) -> None:
     """Install the API-server hooks. Safe to call more than once."""
     global _INSTALLED, _SCHEDULER
     if _INSTALLED:
         return
+    if admission_stage not in {"fetch_decode", "decode"}:
+        raise ValueError(
+            "admission_stage must be either 'fetch_decode' or 'decode'"
+        )
 
     # Imports are intentionally delayed: importing this file alone must not
     # initialize vLLM or CUDA.
     from vllm.entrypoints.openai.engine.serving import OpenAIServing
+    from vllm import envs
     from vllm.multimodal.media.connector import MediaConnector
+    from vllm.multimodal.media.connector import global_thread_pool
+    from vllm.multimodal.media.video import VideoMediaIO
+    from urllib3.util import parse_url
 
     _SCHEDULER = BoundedPriorityMediaScheduler(
         max_active_jobs=max_active_jobs,
@@ -254,6 +268,31 @@ def install(max_active_jobs: int, max_pending_jobs: int = 0) -> None:
         assert _SCHEDULER is not None
         priority = _REQUEST_PRIORITY.get()
 
+        # Native vLLM overlaps HTTP downloads through async_get_bytes and
+        # performs CPU decoding in its global media thread pool. In decode-only
+        # mode, retain that asynchronous fetch path and place priority
+        # admission immediately before VideoMediaIO.load_bytes. Other media
+        # types and non-HTTP sources retain the combined admission path.
+        if admission_stage == "decode" and isinstance(media_io, VideoMediaIO):
+            url_spec = parse_url(url)
+            if url_spec.scheme and url_spec.scheme.startswith("http"):
+                self._assert_url_in_allowed_media_domains(url_spec)
+                data = await self.connection.async_get_bytes(
+                    url_spec.url,
+                    timeout=fetch_timeout,
+                    allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
+                )
+                loop = asyncio.get_running_loop()
+
+                async def decode_bytes() -> Any:
+                    return await loop.run_in_executor(
+                        global_thread_pool,
+                        media_io.load_bytes,
+                        data,
+                    )
+
+                return await _SCHEDULER.submit(priority, decode_bytes)
+
         async def fetch_and_decode() -> Any:
             return await original_load_from_url_async(
                 self,
@@ -269,7 +308,9 @@ def install(max_active_jobs: int, max_pending_jobs: int = 0) -> None:
     _INSTALLED = True
 
     LOGGER.warning(
-        "Enabled bounded native-media priority admission: active=%d pending=%s",
+        "Enabled bounded native-media priority admission: stage=%s "
+        "active=%d pending=%s",
+        admission_stage,
         max_active_jobs,
         "unbounded" if max_pending_jobs == 0 else max_pending_jobs,
     )

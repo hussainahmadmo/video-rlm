@@ -11,6 +11,12 @@ Examples:
       --media-preparation-policy priority \
       --media-preparation-workers 4 \
       serve MODEL --port 9000 --scheduling-policy priority
+
+  # Preserve asynchronous fetching and prioritize bounded CPU decoding only:
+  python run_vllm_with_media_priority.py \
+      --media-preparation-policy decode_priority \
+      --media-preparation-workers 4 \
+      serve MODEL --port 9000 --scheduling-policy priority
 """
 
 from __future__ import annotations
@@ -25,15 +31,18 @@ def _custom_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument(
         "--media-preparation-policy",
-        choices=("native", "priority"),
+        choices=("native", "priority", "decode_priority"),
         default="native",
-        help="native keeps stock vLLM; priority enables bounded priority admission",
+        help=(
+            "native keeps stock vLLM; priority bounds combined fetch/decode; "
+            "decode_priority preserves async fetching and bounds decoding only"
+        ),
     )
     parser.add_argument(
         "--media-preparation-workers",
         type=int,
         default=4,
-        help="maximum concurrent native media fetch/decode jobs (default: 4)",
+        help="maximum concurrent admitted media jobs (default: 4)",
     )
     parser.add_argument(
         "--media-preparation-max-pending",
@@ -63,12 +72,17 @@ def main() -> None:
     # scheduling-neutral adapter so mixed-frame traces work for both policies.
     install_frame_budget_adapter()
 
-    if custom.media_preparation_policy == "priority":
+    if custom.media_preparation_policy in {"priority", "decode_priority"}:
         from vllm_media_priority_plugin import install
 
         install(
             max_active_jobs=custom.media_preparation_workers,
             max_pending_jobs=custom.media_preparation_max_pending,
+            admission_stage=(
+                "decode"
+                if custom.media_preparation_policy == "decode_priority"
+                else "fetch_decode"
+            ),
         )
 
     # Hand all remaining arguments to the unmodified installed vLLM CLI.
