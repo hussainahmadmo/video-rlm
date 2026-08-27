@@ -1,0 +1,186 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="930" viewBox="0 0 1800 930">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#263238"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#0877b7"/>
+    </marker>
+    <marker id="arrowRed" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#c43d2f"/>
+    </marker>
+    <pattern id="fgA" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="10" height="10" fill="#c9ecfa"/>
+      <rect width="3" height="10" fill="#1687bd"/>
+    </pattern>
+    <pattern id="bgA" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="10" height="10" fill="#eaf7fc"/>
+      <rect width="2" height="10" fill="#75bad8"/>
+    </pattern>
+    <pattern id="fgB" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(-45)">
+      <rect width="10" height="10" fill="#ffe0bf"/>
+      <rect width="3" height="10" fill="#e47b24"/>
+    </pattern>
+    <pattern id="bgB" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(-45)">
+      <rect width="10" height="10" fill="#fff2e3"/>
+      <rect width="2" height="10" fill="#efae72"/>
+    </pattern>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-opacity="0.14"/>
+    </filter>
+    <style>
+      .title { font-family: Arial, Helvetica, sans-serif; font-size: 38px; font-weight: 700; fill: #172026; }
+      .panel { font-family: Arial, Helvetica, sans-serif; font-size: 27px; font-weight: 700; fill: #172026; }
+      .head { font-family: Arial, Helvetica, sans-serif; font-size: 23px; font-weight: 700; fill: #172026; }
+      .body { font-family: Arial, Helvetica, sans-serif; font-size: 20px; fill: #263238; }
+      .small { font-family: Arial, Helvetica, sans-serif; font-size: 17px; fill: #37474f; }
+      .tiny { font-family: Arial, Helvetica, sans-serif; font-size: 15px; fill: #455a64; }
+      .box { fill: #ffffff; stroke: #455a64; stroke-width: 2; rx: 10; filter: url(#shadow); }
+      .arrow { fill: none; stroke: #263238; stroke-width: 2.5; marker-end: url(#arrow); }
+      .feedback { fill: none; stroke: #0877b7; stroke-width: 2.4; stroke-dasharray: 8 6; marker-end: url(#arrowBlue); }
+      .danger { fill: none; stroke: #c43d2f; stroke-width: 2.5; stroke-dasharray: 8 6; marker-end: url(#arrowRed); }
+    </style>
+  </defs>
+
+  <rect width="1800" height="930" fill="#ffffff"/>
+  <text x="900" y="54" text-anchor="middle" class="title">Fairness and priority must begin before engine admission</text>
+
+  <!-- legend -->
+  <rect x="575" y="78" width="42" height="25" fill="url(#fgA)" stroke="#1687bd" stroke-width="1.5" rx="4"/>
+  <text x="628" y="98" class="small">Tenant A foreground</text>
+  <rect x="825" y="78" width="42" height="25" fill="url(#bgA)" stroke="#75bad8" stroke-width="1.5" rx="4"/>
+  <text x="878" y="98" class="small">Tenant A background</text>
+  <rect x="1085" y="78" width="42" height="25" fill="url(#fgB)" stroke="#e47b24" stroke-width="1.5" rx="4"/>
+  <text x="1138" y="98" class="small">Tenant B foreground</text>
+  <rect x="1337" y="78" width="42" height="25" fill="url(#bgB)" stroke="#efae72" stroke-width="1.5" rx="4"/>
+  <text x="1390" y="98" class="small">Tenant B background</text>
+
+  <!-- panels -->
+  <rect x="35" y="130" width="580" height="740" fill="#fbfcfd" stroke="#90a4ae" stroke-width="2" rx="14"/>
+  <rect x="645" y="130" width="1120" height="740" fill="#fbfcfd" stroke="#90a4ae" stroke-width="2" rx="14"/>
+  <text x="325" y="172" text-anchor="middle" class="panel">(a) Engine-local accounting</text>
+  <text x="1205" y="172" text-anchor="middle" class="panel">(b) Cross-stage hierarchical scheduling</text>
+
+  <!-- panel a input requests -->
+  <text x="75" y="220" class="head">Tenant requests</text>
+  <rect x="78" y="242" width="86" height="38" fill="url(#fgA)" stroke="#1687bd" stroke-width="2" rx="5"/>
+  <text x="121" y="267" text-anchor="middle" class="small">A-FG</text>
+  <rect x="172" y="242" width="86" height="38" fill="url(#bgA)" stroke="#75bad8" stroke-width="2" rx="5"/>
+  <text x="215" y="267" text-anchor="middle" class="small">A-BG</text>
+  <rect x="78" y="291" width="86" height="38" fill="url(#fgB)" stroke="#e47b24" stroke-width="2" rx="5"/>
+  <text x="121" y="316" text-anchor="middle" class="small">B-FG</text>
+  <rect x="172" y="291" width="86" height="38" fill="url(#bgB)" stroke="#efae72" stroke-width="2" rx="5"/>
+  <text x="215" y="316" text-anchor="middle" class="small">B-BG</text>
+
+  <path d="M270 285 L315 285" class="arrow"/>
+  <rect x="320" y="210" width="250" height="180" class="box"/>
+  <text x="445" y="244" text-anchor="middle" class="head">Async media preparation</text>
+  <text x="445" y="274" text-anchor="middle" class="body">Fetch · decode · resize</text>
+  <rect x="350" y="300" width="42" height="50" fill="#eceff1" stroke="#607d8b" rx="5"/>
+  <rect x="408" y="300" width="42" height="50" fill="#eceff1" stroke="#607d8b" rx="5"/>
+  <rect x="466" y="300" width="42" height="50" fill="#eceff1" stroke="#607d8b" rx="5"/>
+  <rect x="524" y="300" width="26" height="50" fill="#eceff1" stroke="#607d8b" rx="5"/>
+  <text x="450" y="377" text-anchor="middle" class="small">Implicit CPU contention</text>
+
+  <path d="M445 390 L445 445" class="arrow"/>
+  <text x="455" y="425" class="tiny">visible only after preparation</text>
+  <rect x="115" y="450" width="400" height="145" class="box"/>
+  <text x="315" y="482" text-anchor="middle" class="head">GPU-local virtual counters</text>
+  <text x="145" y="520" class="body">Tenant A</text>
+  <rect x="250" y="501" width="205" height="24" fill="#1687bd" rx="4"/>
+  <text x="145" y="561" class="body">Tenant B</text>
+  <rect x="250" y="542" width="132" height="24" fill="#e47b24" rx="4"/>
+  <text x="315" y="586" text-anchor="middle" class="tiny">select lowest token service</text>
+
+  <path d="M315 595 L315 645" class="arrow"/>
+  <rect x="165" y="650" width="300" height="105" class="box"/>
+  <text x="315" y="693" text-anchor="middle" class="head">vLLM execution engine</text>
+  <text x="315" y="724" text-anchor="middle" class="small">continuous batching + priority</text>
+  <path d="M465 700 C560 700 555 560 515 545" class="feedback"/>
+  <text x="518" y="635" class="tiny" fill="#0877b7">charge GPU tokens</text>
+
+  <path d="M90 405 L90 585" class="danger"/>
+  <text x="67" y="498" transform="rotate(-90 67 498)" text-anchor="middle" class="small" fill="#c43d2f">CPU service is unaccounted</text>
+  <rect x="90" y="788" width="450" height="52" fill="#fff3f1" stroke="#c43d2f" stroke-width="1.8" rx="8"/>
+  <text x="315" y="820" text-anchor="middle" class="body" fill="#9d2c23">GPU fairness does not imply end-to-end fairness</text>
+
+  <!-- panel b tenant queues -->
+  <text x="685" y="220" class="head">Per-tenant queues</text>
+  <rect x="685" y="240" width="245" height="105" class="box"/>
+  <text x="708" y="271" class="body" font-weight="700">Tenant A</text>
+  <rect x="708" y="286" width="84" height="36" fill="url(#fgA)" stroke="#1687bd" stroke-width="2" rx="5"/>
+  <text x="750" y="310" text-anchor="middle" class="tiny">FG</text>
+  <rect x="803" y="286" width="104" height="36" fill="url(#bgA)" stroke="#75bad8" stroke-width="2" rx="5"/>
+  <text x="855" y="310" text-anchor="middle" class="tiny">BG · BG</text>
+  <rect x="685" y="365" width="245" height="105" class="box"/>
+  <text x="708" y="396" class="body" font-weight="700">Tenant B</text>
+  <rect x="708" y="411" width="84" height="36" fill="url(#fgB)" stroke="#e47b24" stroke-width="2" rx="5"/>
+  <text x="750" y="435" text-anchor="middle" class="tiny">FG</text>
+  <rect x="803" y="411" width="104" height="36" fill="url(#bgB)" stroke="#efae72" stroke-width="2" rx="5"/>
+  <text x="855" y="435" text-anchor="middle" class="tiny">BG · BG</text>
+
+  <!-- prep counters -->
+  <rect x="985" y="205" width="330" height="150" class="box"/>
+  <text x="1150" y="238" text-anchor="middle" class="head">Preparation virtual service</text>
+  <text x="1012" y="278" class="body">A / w<tspan baseline-shift="sub" font-size="14">A</tspan></text>
+  <rect x="1088" y="258" width="166" height="24" fill="#1687bd" rx="4"/>
+  <text x="1012" y="319" class="body">B / w<tspan baseline-shift="sub" font-size="14">B</tspan></text>
+  <rect x="1088" y="299" width="105" height="24" fill="#e47b24" rx="4"/>
+  <text x="1150" y="345" text-anchor="middle" class="tiny">select least normalized service</text>
+  <path d="M930 335 C960 335 960 315 985 315" class="arrow"/>
+
+  <!-- hierarchy box -->
+  <rect x="985" y="385" width="330" height="105" fill="#eef8ed" stroke="#4d8b45" stroke-width="2.2" rx="10" filter="url(#shadow)"/>
+  <text x="1150" y="418" text-anchor="middle" class="head">Hierarchical selection</text>
+  <text x="1150" y="449" text-anchor="middle" class="body">1. least-served tenant</text>
+  <text x="1150" y="477" text-anchor="middle" class="body">2. foreground before background</text>
+  <path d="M1150 355 L1150 385" class="arrow"/>
+
+  <!-- CPU workers -->
+  <path d="M1315 438 L1370 438" class="arrow"/>
+  <rect x="1375" y="360" width="340" height="160" class="box"/>
+  <text x="1545" y="395" text-anchor="middle" class="head">Bounded CPU preparation</text>
+  <text x="1545" y="424" text-anchor="middle" class="small">non-preemptive active work</text>
+  <rect x="1415" y="448" width="55" height="44" fill="#dfe7eb" stroke="#607d8b" stroke-width="1.8" rx="5"/>
+  <text x="1442" y="476" text-anchor="middle" class="small">W1</text>
+  <rect x="1485" y="448" width="55" height="44" fill="#dfe7eb" stroke="#607d8b" stroke-width="1.8" rx="5"/>
+  <text x="1512" y="476" text-anchor="middle" class="small">W2</text>
+  <rect x="1555" y="448" width="55" height="44" fill="#dfe7eb" stroke="#607d8b" stroke-width="1.8" rx="5"/>
+  <text x="1582" y="476" text-anchor="middle" class="small">W3</text>
+  <rect x="1625" y="448" width="55" height="44" fill="#dfe7eb" stroke="#607d8b" stroke-width="1.8" rx="5"/>
+  <text x="1652" y="476" text-anchor="middle" class="small">W4</text>
+  <path d="M1545 360 C1545 285 1360 270 1315 285" class="feedback"/>
+  <text x="1405" y="262" text-anchor="middle" class="small" fill="#0877b7">charge observed preparation time</text>
+
+  <!-- bounded handoff -->
+  <path d="M1545 520 L1545 565" class="arrow"/>
+  <rect x="1375" y="570" width="340" height="75" class="box"/>
+  <text x="1545" y="602" text-anchor="middle" class="head">Bounded handoff queue</text>
+  <text x="1545" y="629" text-anchor="middle" class="small">prepared requests remain reorderable</text>
+
+  <!-- inference virtual service -->
+  <rect x="985" y="550" width="330" height="150" class="box"/>
+  <text x="1150" y="584" text-anchor="middle" class="head">Inference virtual service</text>
+  <text x="1012" y="624" class="body">A / w<tspan baseline-shift="sub" font-size="14">A</tspan></text>
+  <rect x="1088" y="604" width="128" height="24" fill="#1687bd" rx="4"/>
+  <text x="1012" y="665" class="body">B / w<tspan baseline-shift="sub" font-size="14">B</tspan></text>
+  <rect x="1088" y="645" width="124" height="24" fill="#e47b24" rx="4"/>
+  <text x="1150" y="691" text-anchor="middle" class="tiny">account again at inference admission</text>
+  <path d="M1375 608 L1315 608" class="arrow"/>
+
+  <!-- engine -->
+  <path d="M1150 700 L1150 735" class="arrow"/>
+  <rect x="985" y="740" width="330" height="95" class="box"/>
+  <text x="1150" y="779" text-anchor="middle" class="head">vLLM execution engine</text>
+  <text x="1150" y="810" text-anchor="middle" class="small">continuous batching + native priority</text>
+  <path d="M985 792 C900 792 905 665 985 655" class="feedback"/>
+  <text x="878" y="742" class="small" fill="#0877b7">charge observed</text>
+  <text x="878" y="764" class="small" fill="#0877b7">inference service</text>
+
+  <!-- take-away -->
+  <rect x="1375" y="700" width="340" height="135" fill="#eef8ed" stroke="#4d8b45" stroke-width="2" rx="10"/>
+  <text x="1545" y="739" text-anchor="middle" class="head" fill="#32672d">End-to-end contract</text>
+  <text x="1545" y="773" text-anchor="middle" class="body">tenant share across both stages</text>
+  <text x="1545" y="803" text-anchor="middle" class="body">priority within each tenant</text>
+  <text x="1545" y="829" text-anchor="middle" class="small">aging preserves background progress</text>
+</svg>
