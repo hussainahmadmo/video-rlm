@@ -144,7 +144,13 @@ Launcher:
 
 ### Full trace suite
 
-**Status: COMPLETE**
+**Status: COMPLETE (legacy external-preparation characterization; excluded
+from headline claims)**
+
+This sweep predates the corrected native-vLLM per-request frame-budget path.
+It remains useful for diagnosing how an explicit external FCFS queue scales,
+but its maximum speedup is not used as a system headline or as evidence for
+the native-vLLM integration.
 
 The completed suite contains 120 matched traces per policy and 1,920 urgent
 requests per policy. The table uses the derived results that exclude QID
@@ -196,7 +202,8 @@ over matched trace-level results.
 
 ### Background-backlog scaling
 
-**Status: COMPLETE**
+**Status: COMPLETE (legacy external-preparation stress test; excluded from
+headline claims)**
 
 Priority keeps urgent mean TTFT near 25--28 seconds while FCFS latency grows
 with the number of background videos.
@@ -207,11 +214,11 @@ with the number of background videos.
 | 16 | 86.16 s | 25.31 s | 3.40x |
 | 32 | 157.07 s | 28.37 s | 5.54x |
 | 64 | 289.09 s | 26.30 s | 10.99x |
-| 128 | 550.20 s | 26.89 s | **20.46x** |
+| 128 | 550.20 s | 26.89 s | excluded from corrected claims |
 
-At a backlog of 128, priority saves approximately 523 seconds and reduces
-urgent mean TTFT by 95.1%. This is the clearest demonstration of upstream
-priority inversion.
+The backlog trend demonstrates upstream priority inversion in the external
+preparation harness. Do not quote the 128-request point as the maximum gain of
+the corrected native-vLLM system.
 
 Cleaned results:
 [`large_sweeps/cleaned_priority_results_no_qid_20260823/backlog_scaling`](large_sweeps/cleaned_priority_results_no_qid_20260823/backlog_scaling)
@@ -599,6 +606,221 @@ existing image. Regenerate final publication figures from the cleaned summaries
 before submission so every displayed value, request count, and throughput
 matches the cleaned tables.
 
+## Multi-tenant priority and fairness
+
+### Matched equal-tenant validation
+
+**Status: COMPLETE (24/24 runs; four independent seeds)**
+
+This validation separates application priority from request cost and tenant
+fairness. Every tenant receives the same number of requests and the same mixed
+8/32/128-frame cost distribution. Each run uses four CPU preparation workers,
+four vLLM slots, a bounded prepared queue of 16, CPU seeking with one FFmpeg
+thread per preparation task, and equal tenant weights. All policies use the
+same trace for a seed, and all 24 summaries report zero request errors.
+
+| Policy | Foreground mean E2E | Foreground p95 E2E | E2E <=60 s | Peak CPU-service lead | Worst/best tenant slowdown | Throughput |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| FCFS | 176.12 s | 198.71 s | 0.0% | 201.0 s | 1.68x | 0.210 QPS |
+| Strict priority | 37.18 s | 62.39 s | 85.4% | 181.3 s | 2.52x | 0.215 QPS |
+| Shortest-job-first | 62.59 s | 192.49 s | 75.0% | 141.2 s | 1.27x | 0.213 QPS |
+| Tenant fairness | 176.00 s | 199.55 s | 0.0% | 64.2 s | 1.15x | 0.226 QPS |
+| Tenant-fair priority | 44.72 s | 74.21 s | 77.1% | 51.8 s | 1.19x | 0.230 QPS |
+| Fair slowdown | 63.43 s | 189.12 s | 75.0% | 72.7 s | 1.15x | 0.216 QPS |
+
+Tenant fairness alone does not protect foreground work: adding priority inside
+each tenant reduces foreground mean completion latency from 176.00 to 44.72
+seconds (3.94x faster, 74.6% lower) and increases throughput from 0.226 to
+0.230 QPS. Compared with globally strict priority, hierarchical tenant
+priority trades a 20.3% increase in foreground mean latency for substantially
+stronger isolation: the largest cumulative CPU-service lead while all tenants
+are backlogged falls from 181.3 to 51.8 seconds (71.4% lower), the preparation
+dispatch lead falls from 12.0 to 5.25 requests (56.3% lower), and the
+worst/best tenant-slowdown ratio falls from 2.52x to 1.19x (52.7% lower).
+
+These are empirical rather than theorem-level guarantees. Every one of the 24
+runs completes 100% of requests without error, so no observed foreground or
+background request starves. Tenant-fair priority's maximum background
+preparation wait is 160.6 seconds, 10.8% below globally strict priority, while
+throughput is 6.9% higher. CPU preparation service is measured directly from
+start and finish timestamps. Because the API does not expose per-request GPU
+occupancy under concurrent batching, engine-side isolation is reported using
+admission-count lead and per-tenant slowdown rather than incorrectly treating
+concurrent residence time as additive GPU service.
+
+The policy is VTC-inspired rather than a claim of a new fair-queueing
+primitive: it selects the least-served tenant using weighted virtual service,
+then applies application priority within that tenant at both preparation and
+inference admission. Background aging prevents an old background request from
+remaining behind newer foreground requests within its tenant. The paper's
+systems claim is that this ordering and isolation must cover media preparation
+as well as engine admission.
+
+Results and generated report:
+[`large_sweeps/multitenant_scheduling_20260826_104047`](large_sweeps/multitenant_scheduling_20260826_104047)
+
+Figure:
+[`large_sweeps/multitenant_scheduling_20260826_104047/figures/multitenant_scheduling_tradeoff.pdf`](large_sweeps/multitenant_scheduling_20260826_104047/figures/multitenant_scheduling_tradeoff.pdf)
+
+Cross-stage empirical report and figure:
+[`analysis/figures/cross_stage_fairness.md`](analysis/figures/cross_stage_fairness.md),
+[`analysis/figures/cross_stage_fairness.pdf`](analysis/figures/cross_stage_fairness.pdf)
+
+Reproducible analyzer:
+[`conductor/experiments/scripts/analyze/analyze_cross_stage_fairness.py`](conductor/experiments/scripts/analyze/analyze_cross_stage_fairness.py)
+
+### Sustained overload and noisy-neighbor validation
+
+**Status: READY; not started because no vLLM ports are currently available and
+Nature's NVIDIA driver is unavailable pending the requested reboot.**
+
+The follow-up suite uses continuous arrivals rather than a single closed burst.
+It includes an equal-tenant scenario and a noisy-neighbor scenario in which
+tenant A submits 36 background requests while tenants B and C submit nine
+each. All tenants still submit six foreground requests. The suite compares
+FCFS, globally strict priority, tenant fairness, and tenant-fair priority over
+three seeds (24 runs total). It reports foreground TTFT and completion SLO
+attainment, completion goodput, tenant fairness, worst-tenant slowdown,
+background progress while foreground requests are active, and maximum
+background preparation wait.
+
+Launchers:
+
+- [`run_multitenant_sustained_validation.sh`](run_multitenant_sustained_validation.sh)
+- [`run_multitenant_sustained_2shard.sh`](run_multitenant_sustained_2shard.sh)
+- [`run_multitenant_sustained_with_servers.sh`](run_multitenant_sustained_with_servers.sh)
+
+Once vLLM replicas are healthy on ports 9020 and 9021, start the complete
+two-GPU suite with:
+
+```bash
+cd /dataheart/hussainahmad/video-rlm
+nohup ./run_multitenant_sustained_2shard.sh \
+  > logs/multitenant_sustained_2shard_launcher.log 2>&1 &
+```
+
+After a machine reboot, when no vLLM replicas are already running, the recovery
+launcher can instead start both servers, run the suite, generate the report and
+figure, and release the two GPUs automatically:
+
+```bash
+cd /dataheart/hussainahmad/video-rlm
+nohup ./run_multitenant_sustained_with_servers.sh \
+  > logs/multitenant_sustained_with_servers.log 2>&1 &
+```
+
+### VTC-style cross-stage empirical validation
+
+**Status: READY; code and trace-generation smoke tests pass.**
+
+This suite adapts the empirical tests from Virtual Token Counter (VTC) to a
+multimodal pipeline. It does not equate a CPU second with a GPU token. Instead,
+it maintains and reports separate per-tenant virtual-service counters for
+media preparation and inference-engine residence. The matched baselines are:
+
+- `fcfs`: no tenant-aware ordering at either stage;
+- `engine_tenant_fair`: VTC-style tenant ordering only after requests become
+  model-ready, while media preparation remains FCFS;
+- `tenant_fair`: tenant virtual service controls admission at both media
+  preparation and inference.
+
+The nine scenarios test distinct empirical properties:
+
+1. `constant_overload`: two continuously backlogged tenants with unequal
+   request rates; tests whether service difference remains bounded.
+2. `work_conserving`: two under-share tenants and one overloaded tenant; tests
+   whether the overloaded tenant can consume otherwise idle capacity.
+3. `on_off_under_share`: one intermittent tenant below its fair share and one
+   continuously overloaded tenant; tests work conservation during OFF periods.
+4. `on_off_backlogged`: an intermittent tenant injects enough work to remain
+   backlogged during OFF periods; tests equal service between backlogged
+   tenants.
+5. `poisson_short_long`: stochastic arrivals with short-video versus
+   long-video tenants; tests heterogeneous preparation costs.
+6. `poisson_mixed_cost`: stochastic arrivals where each tenant has a different
+   mixture of frame budgets; tests robustness when request count is a poor
+   service metric.
+7. `noisy_neighbor_isolation`: one tenant's offered load increases over three
+   phases while another stays below share; tests latency isolation.
+8. `distribution_shift`: ON/OFF, equal-overload, and unequal-load phases in one
+   trace; tests counter behavior as the active demand distribution changes.
+9. `on_off_prep_heavy`: tenant A periodically bursts 128-frame requests while
+   tenant B continuously submits alternating 8- and 32-frame requests; tests
+   whether engine-only fairness can protect tenants when the dominant and
+   heterogeneous service demand occurs before engine admission.
+
+The analyzer reports cumulative preparation-service difference,
+inference-residence difference, rolling preparation service rate, rolling
+end-to-end latency, preparation utilization, throughput, mean/p95 completion
+latency, and noisy-neighbor isolation. The engine-residence value is explicitly
+labeled as residence rather than GPU compute time because vLLM does not expose
+per-request GPU occupancy in these result files.
+
+Files:
+
+- [`generate_vtc_multimodal_trace.py`](conductor/experiments/scripts/run/generate_vtc_multimodal_trace.py)
+- [`run_vtc_multimodal_validation.sh`](run_vtc_multimodal_validation.sh)
+- [`run_vtc_multimodal_2shard.sh`](run_vtc_multimodal_2shard.sh)
+- [`analyze_vtc_multimodal.py`](conductor/experiments/scripts/analyze/analyze_vtc_multimodal.py)
+
+With vLLM replicas ready on ports 9020 and 9021, run the full three-seed,
+two-GPU matrix (72 runs) with:
+
+```bash
+cd /dataheart/hussainahmad/video-rlm
+nohup ./run_vtc_multimodal_2shard.sh \
+  > logs/vtc_multimodal_2shard_launcher.log 2>&1 &
+```
+
+For a faster paper-development pass, use one seed and 120-second traces:
+
+```bash
+cd /dataheart/hussainahmad/video-rlm
+nohup env SEEDS=1 DURATION_S=120 ./run_vtc_multimodal_2shard.sh \
+  > logs/vtc_multimodal_pilot.log 2>&1 &
+```
+
+#### Preparation-heavy ON/OFF validation
+
+**Status: READY AND SMOKE-TESTED; blocked on the Nature NVIDIA driver reboot.**
+
+This focused follow-up combines the ON/OFF and heterogeneous-cost cases rather
+than testing them separately. Each matched run contains 61 requests: tenant A
+submits 21 128-frame requests over three ON periods, while tenant B submits 40
+continuous requests alternating between 8 and 32 frames. The corrupted EgoSchema
+QID is excluded. It compares FCFS, engine-only tenant fairness, and cross-stage
+tenant fairness over three seeds and preparation pools of two and four workers
+(18 runs total). Every policy sees the same arrivals, videos, and frame budgets
+within a worker point.
+
+Launchers:
+
+- [`run_prep_heavy_on_off_worker.sh`](run_prep_heavy_on_off_worker.sh)
+- [`run_prep_heavy_on_off_2gpu.sh`](run_prep_heavy_on_off_2gpu.sh)
+- [`run_prep_heavy_on_off_1gpu_with_server.sh`](run_prep_heavy_on_off_1gpu_with_server.sh)
+- [`run_prep_heavy_on_off_with_servers.sh`](run_prep_heavy_on_off_with_servers.sh)
+
+The two worker-count points execute sequentially even when two replicas are
+available. Running them concurrently would introduce cross-experiment CPU and
+memory-bandwidth contention and invalidate the worker-count comparison.
+
+Once vLLM replicas are healthy on ports 9020 and 9021:
+
+```bash
+cd /dataheart/hussainahmad/video-rlm
+nohup ./run_prep_heavy_on_off_2gpu.sh \
+  > logs/prep_heavy_on_off_2gpu_launcher.log 2>&1 &
+```
+
+After the requested Nature reboot, if no replicas are already running, use
+the self-contained launcher instead:
+
+```bash
+cd /dataheart/hussainahmad/video-rlm
+nohup ./run_prep_heavy_on_off_with_servers.sh \
+  > logs/prep_heavy_on_off_with_servers.log 2>&1 &
+```
+
 ## Experiment status and remaining work
 
 The decode experiments are split into two families so their conclusions are
@@ -624,6 +846,48 @@ appear faster than an externally bounded four-worker implementation. It does
 work is ordered by request priority, or that upstream contention has
 disappeared. Async execution specifies how work overlaps; priority scheduling
 specifies which waiting work should run first.
+
+Asynchrony is a strong baseline. It can overlap URL fetching, decoding,
+preprocessing, and GPU inference, avoid an unnecessarily serialized client
+pipeline, and use otherwise idle CPU or I/O capacity. This explains why native
+vLLM can deliver good aggregate throughput and competitive latency when the
+host has sufficient resources. The limitation is not that asynchronous media
+processing is inherently slow. The limitation is that concurrency alone does
+not bound admission or decide which waiting media job should receive scarce
+CPU/decoder capacity first during contention.
+
+### Corrected native-vLLM bounded-priority comparison
+
+**Status: COMPLETE; primary corrected result**
+
+The corrected experiment adds per-request frame budgets to native vLLM and
+verifies in server traces that requests actually use 8, 16, 32, 64, or 128
+frames. Both configurations retain native vLLM engine priority and native
+asynchronous raw-video processing. The control otherwise keeps native media
+admission. The treatment places a four-job bounded priority queue before URL
+fetching and decoding, allowing urgent requests to overtake queued background
+media jobs while leaving active jobs non-preemptive.
+
+| Metric | Native asynchronous vLLM | Bounded media priority | Change |
+| --- | ---: | ---: | ---: |
+| Successful requests | 79/79 | 79/79 | no errors |
+| Urgent mean TTFT | 53.88 s | 32.47 s | **39.7% lower; 1.66x faster** |
+| Urgent median TTFT | 31.31 s | 25.25 s | 19.4% lower |
+| Urgent requests meeting 30-s SLO | 25.0% | 87.5% | +62.5 percentage points |
+| Aggregate throughput | 0.1027 QPS | 0.1052 QPS | effectively unchanged |
+| Background mean TTFT | 122.35 s | 352.24 s | 187.9% higher |
+| Urgent accuracy | 56.25% | 56.25% | unchanged |
+
+The mechanism improves urgent latency because bounded admission prevents an
+unlimited set of background media operations from entering preparation ahead
+of later urgent work, and priority ordering selects urgent queued jobs first.
+The background-latency increase is the explicit cost of this strict policy:
+background work yields while urgent work is present. Consequently, the result
+supports end-to-end priority but also motivates aging, quotas, or a less
+aggressive reservation policy for production fairness.
+
+Results:
+[`large_sweeps/corrected_mixed_frames_20260825_211302`](large_sweeps/corrected_mixed_frames_20260825_211302)
 
 Consequently, native vLLM and external preparation are complementary controls,
 not a direct apples-to-apples performance comparison. The external experiments

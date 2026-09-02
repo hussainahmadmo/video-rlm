@@ -252,19 +252,26 @@ background progress, and (5) compatibility with an unmodified inference
 engine. Active preparation remains non-preemptive, so a foreground request
 may experience residual blocking from at most the tasks already running.
 
-\begin{figure}[t]
+\begin{figure*}[t]
     \centering
-    \includegraphics[width=\columnwidth]
-        {figures/cross_stage_virtual_service_minimal.pdf}
-    \caption{\textbf{Cross-stage virtual service.} Separate virtual-service
-    counters account for tenant service at media preparation and inference
-    admission. At each boundary, the scheduler first selects an underserved
-    tenant and then applies foreground priority within that tenant.}
-    \Description{A minimal block diagram shows tenant request queues feeding
-    a CPU media-preparation scheduler and a GPU inference scheduler. Both
-    schedulers consult per-tenant virtual-service counters.}
+    \includegraphics[width=\textwidth]
+        {figures/hierarchical_cross_stage_architecture_v2.pdf}
+    \caption{\textbf{Profiler-aware hierarchical cross-stage scheduling.}
+    An online profiler predicts each request's preparation and inference cost
+    from its decoding backend and video metadata. At each admission boundary,
+    the scheduler selects the tenant with the least normalized virtual service
+    and then prioritizes foreground work within that tenant. Predicted service
+    is charged at dispatch and reconciled against observed service at
+    completion. Separate preparation and engine counters avoid imposing an
+    arbitrary conversion between heterogeneous CPU and GPU service.}
+    \Description{Tenant applications submit video requests carrying tenant and
+    service-class metadata. An admission manager and online stage-cost profiler
+    feed a hierarchical preparation scheduler, bounded media workers, a
+    model-ready queue, and hierarchical VLM inference admission. Separate
+    per-tenant counters track predicted and observed preparation and inference
+    service.}
     \label{fig:cross-stage-service}
-\end{figure}
+\end{figure*}
 
 \subsection{Request Metadata and Ordering}
 

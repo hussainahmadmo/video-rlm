@@ -1,0 +1,48 @@
+{
+  "cpu_preparation": [
+    {
+      "frames": 32,
+      "runs": 15,
+      "service_s_mean": 7.367602678259638,
+      "service_s_stdev": 0.8524761396786249,
+      "capacity_requests_per_minute_per_worker": 8.14376163050273
+    },
+    {
+      "frames": 128,
+      "runs": 15,
+      "service_s_mean": 31.654181225474876,
+      "service_s_stdev": 5.3184241171045255,
+      "capacity_requests_per_minute_per_worker": 1.8954841880955928
+    }
+  ],
+  "gpu_decode": [
+    {
+      "concurrency": 1,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "amortized_service_s": 3.7757982620969415,
+      "amortized_service_s_stdev": 0.008936389889563544,
+      "aggregate_output_tokens_per_second": 33.90011624427027
+    },
+    {
+      "concurrency": 4,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "amortized_service_s": 0.9760636850260198,
+      "amortized_service_s_stdev": 0.0026112894223930846,
+      "aggregate_output_tokens_per_second": 131.13898402703896
+    },
+    {
+      "concurrency": 8,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "amortized_service_s": 0.49607510276837274,
+      "amortized_service_s_stdev": 0.0018569143456530822,
+      "aggregate_output_tokens_per_second": 258.0254467230655
+    }
+  ],
+  "notes": {
+    "cpu_capacity": "60 / mean worker-seconds per request",
+    "gpu_throughput": "output tokens / amortized batch service seconds"
+  }
+}

@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 
 from vllm_media_priority_plugin import BoundedPriorityMediaScheduler
+from vllm_media_priority_plugin import BoundedMaxMinMediaScheduler
 from vllm_media_priority_plugin import extract_frame_budget
 
 
@@ -73,6 +74,38 @@ async def _check_fetch_overlap_before_decode_priority() -> None:
     assert decoded == ["background-running", "urgent", "background-queued"]
 
 
+async def _check_max_min_selects_least_served_tenant() -> None:
+    scheduler = BoundedMaxMinMediaScheduler(max_active_jobs=1)
+    blocker_started = asyncio.Event()
+    release_blocker = asyncio.Event()
+    order: list[str] = []
+
+    async def blocker() -> str:
+        blocker_started.set()
+        await release_blocker.wait()
+        return "blocker"
+
+    async def operation(name: str) -> str:
+        order.append(name)
+        return name
+
+    running = asyncio.create_task(scheduler.submit("blocker", blocker))
+    await blocker_started.wait()
+    tenant_a = asyncio.create_task(
+        scheduler.submit("a", lambda: operation("a"))
+    )
+    tenant_b = asyncio.create_task(
+        scheduler.submit("b", lambda: operation("b"))
+    )
+    await asyncio.sleep(0)
+    # Model prior observed service: a has already consumed more preparation.
+    scheduler._service_s["a"] = 5.0
+    scheduler._service_s["b"] = 1.0
+    release_blocker.set()
+    await asyncio.gather(running, tenant_a, tenant_b)
+    assert order == ["b", "a"], order
+
+
 def main() -> None:
     clean, frames = extract_frame_budget(
         "http://127.0.0.1:8090/video.mp4?token=x&vllm_num_frames=128"
@@ -81,7 +114,8 @@ def main() -> None:
     assert frames == 128
     asyncio.run(_check_priority_and_non_preemption())
     asyncio.run(_check_fetch_overlap_before_decode_priority())
-    print("bounded priority scheduler: PASS")
+    asyncio.run(_check_max_min_selects_least_served_tenant())
+    print("bounded priority and max-min schedulers: PASS")
 
 
 if __name__ == "__main__":

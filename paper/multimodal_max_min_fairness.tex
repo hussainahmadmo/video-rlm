@@ -1,0 +1,438 @@
+\documentclass[sigplan,anonymous,review,nonacm]{acmart}
+
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{tabularx}
+\algnewcommand{\algorithmicwhen}{\textbf{when}}
+\algnewcommand{\When}[1]{\State \algorithmicwhen\ #1 \textbf{do}}
+\algnewcommand{\EndWhen}{}
+
+\title{End-to-End Max-Min Fairness for Multimodal LLM Serving}
+
+\begin{document}
+
+\begin{abstract}
+Multimodal LLM requests consume substantial service before they reach the
+inference engine. A video request may fetch media, parse its container, seek,
+decode and resize frames, and construct a model-ready prompt before consuming
+vision-encoder, prefill, and generation service. Existing LLM fairness
+mechanisms begin inside the inference engine and therefore cannot account for
+contention in this upstream preparation stage. Consequently, tenants that
+receive similar inference service can experience unequal end-to-end service,
+and a tenant with expensive videos can monopolize preparation capacity.
+
+We present an external, work-conserving scheduler that provides unweighted
+max-min fairness across tenants at both video preparation and inference
+admission. The scheduler maintains a separate virtual-service counter for
+each tenant at each stage, dispatches from the least-served backlogged tenant,
+and reconciles estimated request cost with observed service. Separate counters
+avoid inventing a conversion between CPU preparation seconds and GPU inference
+service. This design extends the fairness boundary from model-ready admission
+back to request arrival without modifying the model, video decoder, or GPU
+scheduler.
+\end{abstract}
+
+\maketitle
+
+\section{Introduction}
+
+Large multimodal models extend language-model serving to images, audio, and
+video, enabling applications such as video question answering, content search,
+assistive analysis, and long-form media understanding. This capability adds a
+substantial execution path before and alongside language-model inference.
+Serving a video request may require fetching the media, parsing its container,
+seeking to temporal positions, decoding and resizing frames, constructing
+visual inputs, running a vision encoder, prefilling the language model, and
+generating output tokens. Recent studies show that these additional stages can
+materially affect time to first token, memory use, throughput, and resource
+utilization~\cite{qiu2025efficient,singh2025epd,zhao2025flashcodec}.
+
+Production services multiplex this pipeline among multiple clients or
+tenants. A useful shared service must provide more than high aggregate
+throughput: it must isolate clients from one another. Without isolation, a
+tenant submitting many requests, or a small number of unusually expensive
+videos, can occupy preparation workers and delay every other tenant. This
+problem is not addressed by equal request counts. One request may sample eight
+frames from an easily seekable video, while another may decode 128 frames from
+a long, high-resolution stream with sparse keyframes. Giving both tenants the
+same number of completed requests can give them very different shares of the
+underlying resources.
+
+Fairness is important for three related reasons. First, it contains aggressive
+or misconfigured clients, so load from one tenant does not produce unbounded
+interference for others. Second, it provides a meaningful service contract:
+continuously backlogged tenants receive comparable shares of contended service
+rather than comparable request counts. Third, it preserves work conservation.
+When some tenants are idle, active tenants should use the spare capacity rather
+than being constrained by static per-client reservations or rate limits.
+
+Fair scheduling has recently been studied for text-only LLM inference. Virtual
+Token Counter (VTC) defines service using a cost function over processed input
+and output tokens and selects clients according to their accumulated virtual
+service~\cite{sheng2024vtc}. It integrates fairness with continuous batching,
+where requests can join a running batch as other requests finish. This is a
+significant improvement over requests-per-minute limits because it reflects
+heterogeneous inference cost and remains work-conserving. Systems such as Orca
+and vLLM similarly demonstrate why high-throughput generation relies on
+iteration-level or continuous batching rather than serial request
+execution~\cite{yu2022orca,kwon2023vllm}.
+
+Inference fairness, however, begins too late for multimodal requests. A video
+request is invisible to an inference scheduler until its media has been
+prepared and its model input is ready. Before that point, it may wait for and
+consume CPU cores, decoder contexts, storage bandwidth, memory bandwidth, or a
+GPU video decoder. A tenant can therefore look underserved to an inference
+scheduler while it is simultaneously consuming a disproportionate fraction of
+upstream preparation capacity. Conversely, two tenants can receive similar
+token service inside the model engine after having experienced substantially
+different preparation delays.
+
+This boundary mismatch means that inference fairness does not compose into
+end-to-end multimodal fairness. Consider two continuously backlogged tenants.
+Tenant $A$ submits inexpensive videos, while tenant $B$ submits videos with
+larger frame budgets and more expensive seeking and decoding. An
+inference-only scheduler can equalize their model service only after requests
+become model-ready. It cannot prevent $B$ from occupying the preparation tier,
+nor can it compensate $A$ for time spent waiting upstream. Adding faster GPUs
+does not resolve contention at the preparation tier, and adding preparation
+workers does not define how that capacity should be allocated under overload.
+
+Recent multimodal systems expose precisely why an end-to-end treatment is
+necessary. EPD disaggregation separates encoding, prefill, and decoding to
+improve resource allocation and interference management~\cite{singh2025epd}.
+FlashCodec accelerates video preprocessing through collaborative GPU decoding,
+while UnifiedServe coordinates vision and language-model stages through
+logical decoupling and physical resource sharing~\cite{zhao2025flashcodec}.
+These systems optimize stage placement, decoding latency, interference, and
+aggregate throughput. Their request-level decisions do not define how multiple
+tenants should share both media preparation and model inference. Conversely,
+VTC accounts for client service inside LLM inference but not the media work
+consumed before engine admission. The two lines of work leave an important
+gap: selecting the next waiting multimodal request according to tenant service
+across the complete serving path.
+
+We address this gap with stage-wise, unweighted max-min fairness. Whenever
+capacity becomes available at either preparation or inference admission, our
+scheduler selects the backlogged tenant with the least accumulated service at
+that stage and dispatches that tenant's oldest request. A costly video is not
+rejected or assigned a lower request class. Instead, its tenant is charged for
+the service it consumes and is selected less often until other continuously
+backlogged tenants catch up. Fairness therefore means equal resource service,
+not equal request completions or equal latency for heterogeneous requests.
+
+The design maintains separate preparation and inference counters. This choice
+is deliberate: CPU decoding time and GPU model service have no principled
+fixed exchange rate. Preparation cost depends on codec, keyframe placement,
+resolution, duration, frame selection, and host contention, whereas inference
+cost depends on visual tokens, prompt and output length, and batch composition.
+We estimate each request's stage cost at dispatch to avoid admitting many
+expensive requests concurrently, then reconcile the estimate with observed
+service after completion. The scheduler remains external to the model, media
+decoder, and GPU scheduler.
+
+This paper makes the following contributions:
+
+\begin{itemize}
+    \item It identifies the fairness boundary mismatch between multimodal
+    preparation and inference-only fair scheduling.
+    \item It formulates multimodal serving as unweighted max-min allocation at
+    two asynchronous stages with different service units.
+    \item It designs and implements a work-conserving scheduler with online
+    cost estimation and observed-cost reconciliation at both stages.
+\end{itemize}
+
+\section{Multimodal Serving Model}
+
+Let a request be
+\begin{equation}
+r = \langle id_r, u_r, a_r, v_r, x_r, f_r \rangle,
+\end{equation}
+where $u_r$ is the authenticated tenant, $a_r$ is the arrival time, $v_r$ is
+the video, $x_r$ is the text query, and $f_r$ is the requested frame budget.
+The fairness policy does not require an application-assigned request class.
+All requests belonging to a tenant share the same entitlement, and requests
+within the selected tenant are ordered by arrival time.
+
+A request passes through two contended stages:
+
+\begin{enumerate}
+    \item \textbf{Preparation ($P$):} media access, metadata parsing, frame
+    selection, seeking, decoding, resizing, and prompt construction.
+    \item \textbf{Inference ($I$):} vision encoding, language-model prefill,
+    and autoregressive generation after model-ready admission.
+\end{enumerate}
+
+Preparation and inference overlap across requests, but each has a finite
+admission capacity and its own waiting queue. End-to-end latency is
+\begin{equation}
+T_{\mathrm{E2E}}(r) =
+T^P_q(r) + T^P_s(r) + T^I_q(r) + T^I_s(r),
+\end{equation}
+where $T^s_q$ and $T^s_s$ are queueing and service time at stage $s$.
+Inference-only fairness controls only the final two terms.
+
+\section{Existing Fairness Approaches}
+
+\paragraph{Per-client rate limits.}
+Requests-per-minute, token-rate, and concurrency limits bound admission over a
+time window. They protect against overload but treat heterogeneous requests as
+equal and may leave capacity idle when some tenants are inactive. They do not
+determine which admitted request should receive the next preparation slot.
+
+\paragraph{Classical fair queueing.}
+Weighted Fair Queueing, Start-Time Fair Queueing, and Deficit Round Robin
+approximate fluid sharing by scheduling flows according to virtual service.
+They generally assume a known packet size, a single shared resource, or a
+preemptible service quantum. Multimodal requests instead consume uncertain
+amounts of service at multiple asynchronous stages.
+
+\paragraph{Max-min fairness.}
+Max-min fairness maximizes the smallest allocation among backlogged tenants;
+after that minimum is fixed, it maximizes the next smallest allocation, and so
+on. With equal tenant weights and equal demands, each backlogged tenant
+receives an equal share. If a tenant cannot use its share, the unused capacity
+is redistributed among active tenants, making the policy work-conserving.
+
+\paragraph{VTC and inference fairness.}
+VTC adapts fair queueing to LLM inference by maintaining a virtual token
+counter per client and charging processed input and output tokens using a
+customizable cost function~\cite{sheng2024vtc}. It addresses variable prompt and generation
+lengths within the inference engine. It does not charge video fetching,
+decoding, or transformation performed before engine admission.
+
+\paragraph{Multi-resource fairness.}
+Dominant Resource Fairness reasons about simultaneous shares of resources such
+as CPU and memory. Our pipeline differs because preparation and inference are
+ordered, asynchronously pipelined stages. A request cannot consume inference
+service until preparation completes. We therefore avoid treating CPU and GPU
+service as a simultaneous resource vector or combining them into one unit.
+
+\section{Why Existing Methods Do Not Apply Directly}
+
+\paragraph{There is no common service unit.}
+Preparation cost depends on codec, keyframe placement, duration, resolution,
+frame budget, storage behavior, and host contention. Inference cost depends on
+visual-token count, prompt length, output length, and batch composition. One
+CPU second is not naturally equivalent to a fixed number of model tokens.
+
+\paragraph{Request cost is initially uncertain.}
+The exact preparation cost is unknown before decoding, and output length is
+unknown before generation finishes. Algorithms that require an exact finish
+tag before dispatch cannot be used unchanged.
+
+\paragraph{Requests become visible at different times.}
+The inference scheduler cannot select a compressed video that is still being
+prepared. Equal GPU service therefore says nothing about how CPU preparation
+capacity was allocated.
+
+\paragraph{Preparation is coarse-grained and non-preemptive.}
+Interrupting active decoding may discard useful work and require decoder
+restart. Fairness decisions occur when a worker becomes available, so a new
+request can overtake queued work but cannot immediately displace active work.
+
+\paragraph{Continuous batching changes inference capacity.}
+The effective cost and throughput of inference depend on the current batch.
+Long prompts, visual tokens, and sequential output decoding do not consume
+capacity in the same way. A fixed requests-per-second entitlement is therefore
+not a stable measure of inference service.
+
+\section{Fairness Objective}
+
+Let $\mathcal{B}_s(t)$ be the set of tenants backlogged at stage
+$s\in\{P,I\}$ at time $t$. Let $W^s_u(t_1,t_2)$ be the observed service
+received by tenant $u$ at stage $s$ during $[t_1,t_2]$. We seek unweighted
+max-min fairness independently at each stage. In an ideal fluid server, two
+continuously backlogged tenants receive equal service:
+\begin{equation}
+W^s_u(t_1,t_2) = W^s_v(t_1,t_2),
+\quad u,v\in\mathcal{B}_s(t),\;t\in[t_1,t_2].
+\end{equation}
+
+With indivisible, non-preemptive requests, exact equality at every instant is
+impossible. The practical objective is bounded discrepancy:
+\begin{equation}
+\left|W^s_u(t_1,t_2)-W^s_v(t_1,t_2)\right| \leq \Delta_s,
+\label{eq:bounded-fairness}
+\end{equation}
+where $\Delta_s$ depends on stage concurrency, the largest non-preemptive
+service unit, and cost-estimation error, but should not grow with
+$t_2-t_1$.
+
+The scheduler must additionally be work-conserving:
+\begin{equation}
+\mathcal{B}_s(t)\neq\emptyset
+\Longrightarrow
+\text{no admissible slot at stage $s$ remains idle}.
+\end{equation}
+
+This definition equalizes consumed resource service, not completed request
+counts and not per-request latency. If tenant $A$ submits more expensive videos
+than tenant $B$, $A$ may complete fewer requests while receiving the same
+preparation share. This is intentional: allowing both tenants to complete the
+same number of requests would give $A$ more resource service.
+
+\section{Design}
+\label{sec:design}
+
+Our scheduler is an external frontend to the media-preparation workers and
+inference engine. It does not modify the model, video decoder, CUDA scheduler,
+or continuous-batching implementation. Instead, it controls which waiting
+request is admitted when capacity becomes available at either stage.
+
+\subsection{Separate Stage Counters}
+
+For every tenant $u$, the scheduler maintains
+\begin{equation}
+V^P_u \quad\text{and}\quad V^I_u,
+\end{equation}
+the accumulated virtual service at preparation and inference. Maintaining
+separate counters is essential: summing CPU seconds and GPU tokens would embed
+an arbitrary exchange rate and could hide unfairness at one stage behind
+service at the other.
+
+At stage $s$, the next tenant is
+\begin{equation}
+u^* = \arg\min_{u:Q^s_u\neq\emptyset} V^s_u.
+\label{eq:tenant-selection}
+\end{equation}
+The scheduler then selects the oldest request in $Q^s_{u^*}$. Tenant identity
+is retained across both stages, but each stage makes its selection from its
+own backlogged set and counter.
+
+\subsection{In-Flight Service Accounting}
+
+Max-min selection depends on an up-to-date view of the service received by
+each tenant. However, the true cost of a request becomes available only after
+the request completes. This delay matters when preparation workers or
+inference slots operate concurrently. If a running request contributes no
+service until completion, its tenant can continue to appear least served and
+may be assigned several additional slots before any of its work is reflected
+in the counter.
+
+Waiting until completion to charge service can dispatch several expensive
+requests from the same tenant concurrently. We therefore charge predicted
+cost $\widehat{c}_s(r)$ at dispatch:
+\begin{equation}
+V^s_{u(r)} \leftarrow V^s_{u(r)} + \widehat{c}_s(r).
+\end{equation}
+When the request completes, the prediction is replaced with observed service:
+\begin{equation}
+V^s_{u(r)} \leftarrow V^s_{u(r)}
+  + c_s(r)-\widehat{c}_s(r).
+\label{eq:reconcile}
+\end{equation}
+
+The preparation estimator groups observations using available metadata such
+as backend, frame count, duration bucket, resolution, and codec, and updates
+an exponentially weighted moving average. The inference estimator learns from
+observed request service and may use frame or visual-token count as a feature.
+Prediction affects short-term dispatch order, while reconciliation ensures
+that persistent accounting reflects observed rather than predicted cost.
+Thus, the estimate acts only as a reservation for unfinished work; fairness
+accounting ultimately uses measured service. With a single serial worker this
+reservation is unnecessary, but it prevents transient monopolization when
+multiple requests can be in flight.
+
+\begin{algorithm}[t]
+\caption{Stage-wise Unweighted Max-Min Scheduling}
+\label{alg:max-min}
+\begin{algorithmic}[1]
+\Require stage $s$, tenant queues $Q^s_u$, counters $V^s_u$
+\When{a slot becomes available at stage $s$}
+    \State $A \gets \{u\mid Q^s_u\neq\emptyset\}$
+    \If{$A\neq\emptyset$}
+        \State $u^* \gets \arg\min_{u\in A}(V^s_u,u)$
+        \State $r^* \gets \arg\min_{r\in Q^s_{u^*}}(a_r,id_r)$
+        \State $\widehat c \gets \Call{PredictCost}{s,r^*}$
+        \State $V^s_{u^*}\gets V^s_{u^*}+\widehat c$
+        \State dispatch $r^*$ at stage $s$
+    \EndIf
+\EndWhen
+\When{$r$ completes at stage $s$ with observed cost $c$}
+    \State $V^s_{u(r)}\gets V^s_{u(r)}+c-\widehat c_s(r)$
+    \State \Call{UpdateCostModel}{$s,r,c$}
+\EndWhen
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Tenant Activation}
+
+A newly active tenant should join at the current fair-service frontier rather
+than at a historical zero. Otherwise it could monopolize the server until its
+counter catches up with long-running tenants. On activation, its stage counter
+is initialized to at least the minimum counter among active tenants. An idle
+tenant does not accumulate credit, but unused capacity is immediately consumed
+by tenants that remain backlogged.
+
+\subsection{Bounded Admission}
+
+Preparation and inference use bounded concurrency. A bounded model-ready queue
+prevents one stage from producing an arbitrarily large backlog that fixes the
+downstream order too early. At every newly available slot, the scheduler can
+reconsider the least-served tenant using current counters and backlog state.
+
+\section{Evaluation Methodology}
+
+The main evaluation compares three policies on identical arrival traces:
+
+\begin{itemize}
+    \item \textbf{FCFS:} neither stage performs tenant-fair selection;
+    \item \textbf{Inference-only fairness:} preparation is FCFS, while
+    model-ready requests are ordered using per-tenant inference service; and
+    \item \textbf{Cross-stage max-min:} both preparation and inference select
+    the least-served backlogged tenant using separate service counters.
+\end{itemize}
+
+Traces should contain at least three tenants and heterogeneous media costs,
+including different frame budgets, codecs, durations, and resolutions. All
+policies must receive the same requests, videos, arrival times, random seeds,
+worker counts, and inference concurrency.
+
+We report the following metrics separately for preparation and inference:
+
+\begin{itemize}
+    \item service received by each tenant during continuously backlogged
+    intervals;
+    \item maximum pairwise service discrepancy and whether it grows with the
+    interval length;
+    \item Jain's fairness index over tenant service and tenant slowdown;
+    \item per-tenant queueing time, end-to-end latency, and throughput;
+    \item aggregate throughput and resource utilization to establish work
+    conservation; and
+    \item prediction error before and after online cost-model adaptation.
+\end{itemize}
+
+The key comparison is inference-only fairness versus cross-stage max-min.
+This isolates whether extending accounting to media preparation improves
+end-to-end isolation without materially reducing aggregate throughput.
+
+\section{Expected Claims and Non-Claims}
+
+The intended claim is that stage-wise service accounting prevents a tenant
+from obtaining an unbounded advantage at either preparation or inference while
+the tenants remain backlogged. The system aims to preserve work conservation
+and reduce cross-tenant disparity in end-to-end slowdown.
+
+The design does not claim that all requests have equal latency, that all
+tenants complete equal request counts, or that CPU and GPU service are
+interchangeable. It also does not provide instantaneous fairness when a large
+non-preemptive request is already executing. These distinctions are important
+for interpreting both the formulation and the measurements.
+
+\section{Conclusion}
+
+Fair LLM inference is not sufficient for fair multimodal serving. Video
+requests consume heterogeneous and contended service before the inference
+engine can observe them. We extend the fairness boundary to request arrival by
+applying unweighted max-min selection independently at preparation and
+inference admission. Separate virtual-service counters, online estimation,
+observed-cost reconciliation, and work-conserving dispatch make the approach
+compatible with an asynchronous CPU--GPU pipeline without modifying its media
+decoder or inference engine.
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{multimodal_max_min_fairness}
+
+\end{document}

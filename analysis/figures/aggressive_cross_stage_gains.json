@@ -1,0 +1,24 @@
+{
+  "runs_per_policy": {
+    "fcfs": 3,
+    "engine_tenant_fair": 3,
+    "max_min": 3
+  },
+  "mean_e2e_reduction_percent": {
+    "b": 80.73978605620252,
+    "c": 77.23358632143686
+  },
+  "p95_e2e_reduction_percent": {
+    "b": 81.99835579425195,
+    "c": 77.98904830880853
+  },
+  "mean_e2e_speedup_x": {
+    "b": 5.192050321549192,
+    "c": 4.392435339702188
+  },
+  "p95_e2e_speedup_x": {
+    "b": 5.555048130996242,
+    "c": 4.543192925184552
+  },
+  "throughput_change_percent": -1.8914420446062175
+}

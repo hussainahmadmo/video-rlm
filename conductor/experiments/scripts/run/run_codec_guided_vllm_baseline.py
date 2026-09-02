@@ -63,6 +63,8 @@ def parse_label(text, choice_count):
 
 
 def make_prompt(row):
+    if row.get("prompt_override"):
+        return str(row["prompt_override"])
     choices = "\n".join(
         f"{chr(ord('A') + index)}. {choice}"
         for index, choice in enumerate(row.get("choices") or [])

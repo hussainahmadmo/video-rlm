@@ -17,6 +17,12 @@ Examples:
       --media-preparation-policy decode_priority \
       --media-preparation-workers 4 \
       serve MODEL --port 9000 --scheduling-policy priority
+
+  # Use native vLLM decoding and max-min admission across OpenAI ``user`` IDs:
+  VLLM_MEDIA_LOADING_THREAD_COUNT=16 python run_vllm_with_media_priority.py \
+      --media-preparation-policy decode_max_min \
+      --media-preparation-workers 16 \
+      serve MODEL --port 9000
 """
 
 from __future__ import annotations
@@ -31,11 +37,14 @@ def _custom_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument(
         "--media-preparation-policy",
-        choices=("native", "priority", "decode_priority"),
+        choices=(
+            "native", "priority", "decode_priority", "max_min", "decode_max_min"
+        ),
         default="native",
         help=(
             "native keeps stock vLLM; priority bounds combined fetch/decode; "
-            "decode_priority preserves async fetching and bounds decoding only"
+            "decode_priority preserves async fetching and bounds decoding only; "
+            "max_min variants choose the least-served OpenAI user/tenant"
         ),
     )
     parser.add_argument(
@@ -49,6 +58,14 @@ def _custom_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="pending-media queue bound; 0 means unbounded (default: 0)",
+    )
+    parser.add_argument(
+        "--opencv-threads-per-job",
+        type=int,
+        help=(
+            "OpenCV decoder threads used inside each vLLM media-loading job. "
+            "Set to 1 to prevent nested CPU oversubscription."
+        ),
     )
     parser.add_argument("--help-media-priority", action="store_true")
     return parser
@@ -65,6 +82,16 @@ def main() -> None:
         parser.error("--media-preparation-workers must be at least 1")
     if custom.media_preparation_max_pending < 0:
         parser.error("--media-preparation-max-pending cannot be negative")
+    if (
+        custom.opencv_threads_per_job is not None
+        and custom.opencv_threads_per_job < 1
+    ):
+        parser.error("--opencv-threads-per-job must be at least 1")
+
+    if custom.opencv_threads_per_job is not None:
+        import cv2
+
+        cv2.setNumThreads(custom.opencv_threads_per_job)
 
     from vllm_media_priority_plugin import install_frame_budget_adapter
 
@@ -72,7 +99,7 @@ def main() -> None:
     # scheduling-neutral adapter so mixed-frame traces work for both policies.
     install_frame_budget_adapter()
 
-    if custom.media_preparation_policy in {"priority", "decode_priority"}:
+    if custom.media_preparation_policy != "native":
         from vllm_media_priority_plugin import install
 
         install(
@@ -80,8 +107,13 @@ def main() -> None:
             max_pending_jobs=custom.media_preparation_max_pending,
             admission_stage=(
                 "decode"
-                if custom.media_preparation_policy == "decode_priority"
+                if custom.media_preparation_policy.startswith("decode_")
                 else "fetch_decode"
+            ),
+            policy=(
+                "max_min"
+                if custom.media_preparation_policy.endswith("max_min")
+                else "priority"
             ),
         )
 

@@ -71,6 +71,16 @@ def workload(row: dict[str, Any]) -> str:
     return str(row.get("workload") or row.get("class") or "background")
 
 
+def tenant(row: dict[str, Any]) -> str:
+    """Tenant identity consumed by native max-min media admission."""
+    return str(
+        row.get("tenant")
+        or row.get("tenant_id")
+        or row.get("operator")
+        or "default"
+    )
+
+
 def backend_key() -> str:
     """Support both current and legacy vLLM media-IO keyword spellings."""
     try:
@@ -114,6 +124,7 @@ async def run_request(
     request_priority = (
         int(row.get("priority", 0)) if args.priority_mode == "trace" else 0
     )
+    request_tenant = tenant(row)
     video_url = make_video_url(row, video_mappings)
 
     video_kwargs: dict[str, Any] = {}
@@ -141,6 +152,7 @@ async def run_request(
     try:
         stream = await client.chat.completions.create(
             model=args.model,
+            user=request_tenant,
             messages=[
                 {
                     "role": "user",
@@ -176,6 +188,7 @@ async def run_request(
         "request_id": str(row.get("request_id") or qid(row)),
         "qid": qid(row),
         "workload": workload(row),
+        "tenant": request_tenant,
         "trace_priority": int(row.get("priority", 0)),
         "submitted_priority": request_priority,
         "priority_mode": args.priority_mode,
@@ -299,7 +312,7 @@ async def async_main(args: argparse.Namespace) -> None:
     summary: dict[str, Any] = {
         "method": "native_vllm_raw_video_priority_burst",
         "priority_mode": args.priority_mode,
-        "server_requirement": "--scheduling-policy priority",
+        "server_media_policy": args.server_media_policy,
         "port": args.port,
         "total_requests": len(results),
         "errors": sum(row["error"] is not None for row in results),
@@ -312,6 +325,10 @@ async def async_main(args: argparse.Namespace) -> None:
         summary[name] = summarize_group(
             [row for row in results if row["workload"] == name]
         )
+    summary["tenants"] = {
+        name: summarize_group([row for row in results if row["tenant"] == name])
+        for name in sorted({row["tenant"] for row in results})
+    }
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
 
@@ -327,6 +344,12 @@ def main() -> None:
         choices=["uniform", "trace"],
         required=True,
         help="uniform submits priority 0 for every request; trace uses each row's priority",
+    )
+    parser.add_argument(
+        "--server-media-policy",
+        choices=["native", "priority", "max_min"],
+        default="native",
+        help="Label the server-side native media admission policy in summary.json.",
     )
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--max-pixels", type=int, default=100352)
