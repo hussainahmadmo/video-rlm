@@ -50,6 +50,7 @@ CODEC_PATH = (
 WRITE_LOCK = threading.Lock()
 CROSS_STAGE_FAIR_POLICIES = frozenset({
     "max_min", "tenant_fair", "tenant_priority", "fair_slowdown",
+    "cross_stage",
 })
 PREPARATION_FAIR_POLICIES = frozenset({
     *CROSS_STAGE_FAIR_POLICIES, "prep_max_min",
@@ -529,6 +530,79 @@ def fair_tenant_choice(
     )
 
 
+def cross_stage_tenant_choice(
+    jobs: list[dict[str, Any]],
+    *,
+    tenant_prep_virtual_service: dict[str, float],
+    tenant_vlm_virtual_service: dict[str, float],
+    active_tenants: set[str],
+    tenant_pipeline_supply: dict[str, int],
+    debt_threshold_s: float,
+    max_boost_s: float,
+    unblock_target: int,
+) -> tuple[dict[str, Any], dict[str, float | int | bool]]:
+    """Choose a CPU tenant using bounded, readiness-aware GPU feedback.
+
+    The preparation counter remains the base score. A GPU-behind tenant gets
+    a bounded decrease in that score only while it lacks enough work between
+    preparation dispatch and GPU completion. Counting all of that released
+    work prevents parallel CPU workers from producing a downstream backlog.
+
+    This is an online coordination heuristic, not the offline fair reference.
+    """
+    if not jobs:
+        raise ValueError("cannot choose from an empty job list")
+    if debt_threshold_s < 0 or max_boost_s < 0:
+        raise ValueError("cross-stage debt and boost values must be non-negative")
+    if unblock_target < 1:
+        raise ValueError("cross-stage unblock target must be positive")
+
+    queued_tenants = {str(job["tenant"]) for job in jobs}
+    frontier_tenants = active_tenants | queued_tenants
+    gpu_frontier_s = max(
+        (
+            tenant_vlm_virtual_service.get(tenant, 0.0)
+            for tenant in frontier_tenants
+        ),
+        default=0.0,
+    )
+
+    decisions: dict[str, dict[str, float | int | bool]] = {}
+    for tenant in queued_tenants:
+        gpu_service_s = tenant_vlm_virtual_service.get(tenant, 0.0)
+        gpu_debt_s = max(0.0, gpu_frontier_s - gpu_service_s)
+        pipeline_supply = tenant_pipeline_supply.get(tenant, 0)
+        unblocking = (
+            gpu_debt_s > debt_threshold_s
+            and pipeline_supply < unblock_target
+        )
+        boost_s = min(gpu_debt_s, max_boost_s) if unblocking else 0.0
+        prep_service_s = tenant_prep_virtual_service.get(tenant, 0.0)
+        decisions[tenant] = {
+            "gpu_frontier_s": gpu_frontier_s,
+            "gpu_debt_s": gpu_debt_s,
+            "pipeline_supply": pipeline_supply,
+            "unblocking": unblocking,
+            "boost_s": boost_s,
+            "effective_prep_service_s": prep_service_s - boost_s,
+        }
+
+    tenant = min(
+        queued_tenants,
+        key=lambda item: (
+            float(decisions[item]["effective_prep_service_s"]),
+            tenant_prep_virtual_service.get(item, 0.0),
+            tenant_vlm_virtual_service.get(item, 0.0),
+            item,
+        ),
+    )
+    selected = min(
+        (job for job in jobs if str(job["tenant"]) == tenant),
+        key=lambda job: (float(job["arrival_s"]), int(job["sequence"])),
+    )
+    return selected, decisions[tenant]
+
+
 def fair_tenant_priority_choice(
     jobs: list[dict[str, Any]],
     *,
@@ -801,6 +875,7 @@ def call_vllm(
             "extra_body": {
                 "priority": engine_priority,
                 "mm_processor_kwargs": {"max_pixels": args.max_pixels},
+                "ignore_eos": args.ignore_eos,
             },
         }
         if args.engine_token_profile is not None:
@@ -907,7 +982,7 @@ def main() -> None:
             "fcfs", "priority", "priority_reserved", "slo_adaptive",
             "static_isolation", "sjf", "max_min", "prep_max_min",
             "tenant_round_robin", "tenant_fair", "tenant_priority",
-            "fair_slowdown", "engine_tenant_fair",
+            "fair_slowdown", "engine_tenant_fair", "cross_stage",
         ],
         default="priority",
     )
@@ -1037,6 +1112,21 @@ def main() -> None:
     parser.add_argument("--vlm-concurrency", type=int, default=4)
     parser.add_argument("--prepared-queue-depth", type=int, default=32)
     parser.add_argument(
+        "--cross-stage-debt-threshold-s", type=float, default=0.0,
+        help=("Minimum normalized GPU-service debt required before the "
+              "cross_stage policy boosts CPU preparation"),
+    )
+    parser.add_argument(
+        "--cross-stage-max-boost-s", type=float, default=4.0,
+        help=("Maximum normalized seconds subtracted from a tenant's CPU "
+              "virtual-service score by cross-stage unblocking"),
+    )
+    parser.add_argument(
+        "--cross-stage-unblock-target", type=int, default=1,
+        help=("Stop cross-stage boosting after this many requests for the "
+              "tenant are preparation-in-flight, GPU-ready, or GPU-in-flight"),
+    )
+    parser.add_argument(
         "--background-prepared-queue-depth", type=int,
         help=("handoff slots dedicated to background requests under "
               "static_isolation"),
@@ -1048,6 +1138,11 @@ def main() -> None:
     )
     parser.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
     parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument(
+        "--ignore-eos", action="store_true",
+        help=("Force every request to consume its complete max-token budget. "
+              "Useful for controlled decode-saturation experiments."),
+    )
     parser.add_argument("--max-pixels", type=int, default=100352)
     parser.add_argument("--decode-max-side", type=int, default=448)
     parser.add_argument("--index-timeout-s", type=float, default=120.0)
@@ -1078,6 +1173,12 @@ def main() -> None:
         parser.error("preparation cost estimates must be positive")
     if args.vlm_fixed_cost_s <= 0:
         parser.error("--vlm-fixed-cost-s must be positive")
+    if args.cross_stage_debt_threshold_s < 0:
+        parser.error("--cross-stage-debt-threshold-s must be non-negative")
+    if args.cross_stage_max_boost_s < 0:
+        parser.error("--cross-stage-max-boost-s must be non-negative")
+    if args.cross_stage_unblock_target < 1:
+        parser.error("--cross-stage-unblock-target must be positive")
     if not 0 < args.prep_cost_ewma_alpha <= 1:
         parser.error("--prep-cost-ewma-alpha must be in (0, 1]")
     if args.cost_profiler_min_samples < 1:
@@ -1459,6 +1560,17 @@ def main() -> None:
             heapq.heapify(pending)
         return job
 
+    def pipeline_supply_by_tenant() -> dict[str, int]:
+        """Count work already released from the pending CPU queue."""
+        supply: dict[str, int] = defaultdict(int)
+        for job in prep_futures.values():
+            supply[str(job["tenant"])] += 1
+        for _, _, job, _ in ready:
+            supply[str(job["tenant"])] += 1
+        for job, _, _ in vlm_futures.values():
+            supply[str(job["tenant"])] += 1
+        return dict(supply)
+
     def pop_pending_for_preparation() -> dict[str, Any] | None:
         if not pending:
             return None
@@ -1466,7 +1578,23 @@ def main() -> None:
         if args.prep_policy in PREPARATION_FAIR_POLICIES:
             now = elapsed()
             jobs = [job for _, _, job in pending]
-            if args.prep_policy == "fair_slowdown":
+            if args.prep_policy == "cross_stage":
+                selected, decision = cross_stage_tenant_choice(
+                    jobs,
+                    tenant_prep_virtual_service=tenant_prep_virtual_service,
+                    tenant_vlm_virtual_service=tenant_vlm_virtual_service,
+                    active_tenants={
+                        tenant
+                        for tenant, count in tenant_active_requests.items()
+                        if count > 0
+                    },
+                    tenant_pipeline_supply=pipeline_supply_by_tenant(),
+                    debt_threshold_s=args.cross_stage_debt_threshold_s,
+                    max_boost_s=args.cross_stage_max_boost_s,
+                    unblock_target=args.cross_stage_unblock_target,
+                )
+                selected["cross_stage_decision"] = decision
+            elif args.prep_policy == "fair_slowdown":
                 selected = fair_slowdown_choice(
                     jobs,
                     now_s=now,
@@ -1781,6 +1909,9 @@ def main() -> None:
                     tenant_virtual_service=tenant_prep_virtual_service.get(
                         job["tenant"], 0.0,
                     ),
+                    cross_stage_decision=job.pop(
+                        "cross_stage_decision", None,
+                    ),
                 )
                 prep_futures[
                     prep_pool.submit(
@@ -2085,6 +2216,8 @@ def main() -> None:
         "fairness_mode": (
             "unweighted_max_min"
             if args.prep_policy == "max_min"
+            else "readiness_aware_cross_stage"
+            if args.prep_policy == "cross_stage"
             else "preparation_only_unweighted_max_min"
             if args.prep_policy == "prep_max_min"
             else "tenant_round_robin"
@@ -2168,9 +2301,22 @@ def main() -> None:
             "urgent_frames": args.urgent_frames,
             "background_priority": args.background_priority,
             "urgent_priority": args.urgent_priority,
+            "ignore_eos": args.ignore_eos,
             "urgent_ttft_slo_s": args.urgent_ttft_slo_s,
             "background_ttft_slo_s": args.background_ttft_slo_s,
             "background_aging_s": args.background_aging_s,
+            "cross_stage_debt_threshold_s": (
+                args.cross_stage_debt_threshold_s
+                if args.prep_policy == "cross_stage" else None
+            ),
+            "cross_stage_max_boost_s": (
+                args.cross_stage_max_boost_s
+                if args.prep_policy == "cross_stage" else None
+            ),
+            "cross_stage_unblock_target": (
+                args.cross_stage_unblock_target
+                if args.prep_policy == "cross_stage" else None
+            ),
             "prep_fixed_cost_s": args.prep_fixed_cost_s,
             "prep_seconds_per_frame": args.prep_seconds_per_frame,
             "prep_cost_ewma_alpha": args.prep_cost_ewma_alpha,
