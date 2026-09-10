@@ -10,8 +10,8 @@ PY=${VLLM_PYTHON:-$(command -v python)}
 VLLM=${VLLM_BIN:-$(command -v vllm || true)}
 ACTION=${ACTION:-plan}
 GPU_COUNT=${GPU_COUNT:-4}
-PREP_VCPUS=${PREP_VCPUS:-8}
-ENGINE_VCPUS=${ENGINE_VCPUS:-8}
+PREP_CORES=${PREP_CORES:-8}
+ENGINE_CORES=${ENGINE_CORES:-8}
 BASE_PORT=${BASE_PORT:-9000}
 MODEL=${MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}
 SERVED_MODEL=${SERVED_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}
@@ -62,8 +62,8 @@ done
   echo "this launcher intentionally requires GPU_COUNT=4" >&2
   exit 2
 }
-[[ "$PREP_WORKERS" -le "$PREP_VCPUS" ]] || {
-  echo "PREP_WORKERS cannot exceed PREP_VCPUS" >&2
+[[ "$PREP_WORKERS" -le "$PREP_CORES" ]] || {
+  echo "PREP_WORKERS cannot exceed PREP_CORES" >&2
   exit 2
 }
 
@@ -71,7 +71,7 @@ mkdir -p "$STATE_ROOT" "$SERVER_LOGROOT" "$SERVER_PIDROOT"
 
 make_plan() {
   "$PY" "$PLANNER" --gpu-count "$GPU_COUNT" \
-    --prep-vcpus "$PREP_VCPUS" --engine-vcpus "$ENGINE_VCPUS" \
+    --prep-cores "$PREP_CORES" --engine-cores "$ENGINE_CORES" \
     --base-port "$BASE_PORT" --output "$TOPOLOGY_FILE"
   echo
   echo "Topology details:"
@@ -199,6 +199,7 @@ run_suite() {
     echo "patterns=$PATTERNS"; echo "loads=$LOADS"; echo "seeds=$SEEDS"
     echo "policies=$POLICIES"; echo "duration_s=$DURATION_S"
     echo "prep_workers=$PREP_WORKERS"; echo "vlm_concurrency=$VLM_CONCURRENCY"
+    echo "prep_physical_cores=$PREP_CORES"; echo "engine_physical_cores=$ENGINE_CORES"
     echo "source_trace=$SOURCE_TRACE"; echo "engine_token_profile=$ENGINE_TOKEN_PROFILE"
     echo "started=$(date -u +%FT%TZ)"
   } >"$OUT/manifest.txt"

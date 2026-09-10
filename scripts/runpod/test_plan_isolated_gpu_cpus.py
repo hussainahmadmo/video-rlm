@@ -30,13 +30,13 @@ class CpuPlannerTest(unittest.TestCase):
     def test_allocation_keeps_smt_siblings_together(self) -> None:
         cores = []
         for node in (0, 1):
-            for core in range(node * 16, node * 16 + 16):
+            for core in range(node * 32, node * 32 + 32):
                 cores.append(
                     self.planner.Core(
                         socket=node,
                         core=core,
                         node=node,
-                        cpus=(core, core + 32),
+                        cpus=(core, core + 64),
                     )
                 )
         plans = self.planner.allocate(cores, [0, 0, 1, 1], 8, 8)
@@ -45,16 +45,16 @@ class CpuPlannerTest(unittest.TestCase):
         for _, prep_text, engine_text, _ in plans:
             prep = self.planner.expand_cpu_list(prep_text)
             engine = self.planner.expand_cpu_list(engine_text)
-            self.assertEqual(len(prep), 8)
-            self.assertEqual(len(engine), 8)
+            self.assertEqual(len(prep), 16)
+            self.assertEqual(len(engine), 16)
             self.assertFalse(prep & engine)
             self.assertFalse(used & (prep | engine))
             used |= prep | engine
             for cpu in prep:
-                sibling = cpu + 32 if cpu < 32 else cpu - 32
+                sibling = cpu + 64 if cpu < 64 else cpu - 64
                 self.assertIn(sibling, prep)
             for cpu in engine:
-                sibling = cpu + 32 if cpu < 32 else cpu - 32
+                sibling = cpu + 64 if cpu < 64 else cpu - 64
                 self.assertIn(sibling, engine)
 
     def test_insufficient_cpu_capacity_fails(self) -> None:

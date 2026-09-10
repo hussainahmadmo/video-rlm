@@ -10,7 +10,8 @@ cat logs/isolated_4gpu/topology.tsv
 
 The planner keeps SMT siblings together, assigns disjoint physical cores, and
 prefers CPU cores on each GPU's NUMA node. Each experiment lane receives eight
-logical CPUs for preparation, eight for its vLLM server, and one GPU.
+physical cores for preparation, eight physical cores for vLLM, and one GPU.
+All SMT siblings of an assigned core remain in the same stage CPU set.
 
 Start the four isolated servers:
 

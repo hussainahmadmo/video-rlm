@@ -110,36 +110,29 @@ def discover_gpu_nodes(gpu_count: int) -> list[int]:
     return nodes
 
 
-def take_exact_logical_cpus(
+def take_physical_cores(
     available: list[Core], target: int
 ) -> tuple[list[Core], list[Core]]:
-    selected: list[Core] = []
-    total = 0
-    for core in available:
-        if total + len(core.cpus) > target:
-            continue
-        selected.append(core)
-        total += len(core.cpus)
-        if total == target:
-            selected_set = set(selected)
-            return selected, [core for core in available if core not in selected_set]
-    raise RuntimeError(
-        f"cannot allocate exactly {target} logical CPUs without splitting a physical core"
-    )
+    if len(available) < target:
+        raise RuntimeError(
+            f"need {target} physical cores but only {len(available)} remain"
+        )
+    selected = available[:target]
+    return selected, available[target:]
 
 
 def allocate(
-    cores: list[Core], gpu_nodes: list[int], prep_vcpus: int, engine_vcpus: int
+    cores: list[Core], gpu_nodes: list[int], prep_cores: int, engine_cores: int
 ) -> list[tuple[int, str, str, int]]:
-    if prep_vcpus <= 0 or engine_vcpus <= 0:
-        raise ValueError("stage CPU counts must be positive")
+    if prep_cores <= 0 or engine_cores <= 0:
+        raise ValueError("stage physical-core counts must be positive")
     remaining = list(cores)
     plans: list[tuple[int, str, str, int]] = []
     warned_remote = False
     for gpu, node in enumerate(gpu_nodes):
         local = [core for core in remaining if node >= 0 and core.node == node]
-        required = prep_vcpus + engine_vcpus
-        if sum(len(core.cpus) for core in local) >= required:
+        required = prep_cores + engine_cores
+        if len(local) >= required:
             candidates = local
         else:
             candidates = remaining
@@ -149,12 +142,12 @@ def allocate(
                     file=sys.stderr,
                 )
                 warned_remote = True
-        lane_cores, _ = take_exact_logical_cpus(candidates, required)
+        lane_cores, _ = take_physical_cores(candidates, required)
         lane_set = set(lane_cores)
         remaining = [core for core in remaining if core not in lane_set]
-        prep_cores, engine_cores = take_exact_logical_cpus(lane_cores, prep_vcpus)
-        prep = {cpu for core in prep_cores for cpu in core.cpus}
-        engine = {cpu for core in engine_cores for cpu in core.cpus}
+        prep_groups, engine_groups = take_physical_cores(lane_cores, prep_cores)
+        prep = {cpu for core in prep_groups for cpu in core.cpus}
+        engine = {cpu for core in engine_groups for cpu in core.cpus}
         lane_nodes = {core.node for core in lane_cores}
         effective_node = next(iter(lane_nodes)) if len(lane_nodes) == 1 else -1
         plans.append(
@@ -166,8 +159,8 @@ def allocate(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu-count", type=int, default=4)
-    parser.add_argument("--prep-vcpus", type=int, default=8)
-    parser.add_argument("--engine-vcpus", type=int, default=8)
+    parser.add_argument("--prep-cores", type=int, default=8)
+    parser.add_argument("--engine-cores", type=int, default=8)
     parser.add_argument("--base-port", type=int, default=9000)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--lscpu-file", type=Path)
@@ -191,7 +184,7 @@ def main() -> None:
     else:
         gpu_nodes = discover_gpu_nodes(args.gpu_count)
     try:
-        plans = allocate(cores, gpu_nodes, args.prep_vcpus, args.engine_vcpus)
+        plans = allocate(cores, gpu_nodes, args.prep_cores, args.engine_cores)
     except (RuntimeError, ValueError) as exc:
         raise SystemExit(f"cannot create isolated CPU plan: {exc}") from exc
     lines = ["gpu\tport\tprep_cpus\tengine_cpus\tcpu_numa_node"]
