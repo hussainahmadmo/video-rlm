@@ -36,6 +36,14 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--episodes", type=int, default=3)
+    parser.add_argument(
+        "--role-offset", type=int, default=0,
+        help="Rotate which tenant is the first episode's heavy leader",
+    )
+    parser.add_argument(
+        "--allow-unbalanced-episodes", action="store_true",
+        help="Allow fewer than three episodes; balance roles across separate traces",
+    )
     parser.add_argument("--episode-spacing-s", type=float, default=450.0)
     parser.add_argument("--leader-window-s", type=float, default=5.0)
     parser.add_argument("--followers-window-s", type=float, default=5.0)
@@ -44,7 +52,9 @@ def main() -> None:
     parser.add_argument("--light-requests", type=int, default=20)
     args = parser.parse_args()
 
-    if args.episodes % len(TENANTS):
+    if args.episodes <= 0:
+        parser.error("episodes must be positive")
+    if args.episodes % len(TENANTS) and not args.allow_unbalanced_episodes:
         parser.error("episodes must be divisible by three so tenant roles balance")
     if args.episode_spacing_s <= args.leader_window_s + args.followers_window_s:
         parser.error("episode spacing must exceed the two arrival windows")
@@ -63,13 +73,14 @@ def main() -> None:
 
     for episode in range(args.episodes):
         start = episode * args.episode_spacing_s
+        role = (args.role_offset + episode) % len(TENANTS)
         roles = {
-            TENANTS[episode % 3]: ("prep_heavy", args.prep_heavy_requests),
-            TENANTS[(episode + 1) % 3]: (
+            TENANTS[role]: ("prep_heavy", args.prep_heavy_requests),
+            TENANTS[(role + 1) % 3]: (
                 "inference_heavy",
                 args.inference_heavy_requests,
             ),
-            TENANTS[(episode + 2) % 3]: ("light", args.light_requests),
+            TENANTS[(role + 2) % 3]: ("light", args.light_requests),
         }
 
         for tenant, (request_type, count) in roles.items():
@@ -99,6 +110,7 @@ def main() -> None:
                         "arrival_pattern": "phase_shifted_burst",
                         "trace_seed": args.seed,
                         "episode": episode + 1,
+                        "role_offset": args.role_offset,
                     }
                 )
                 rows.append(row)
@@ -121,6 +133,7 @@ def main() -> None:
                 "tenants": dict(sorted(tenant_counts.items())),
                 "request_types": dict(sorted(type_counts.items())),
                 "episodes": args.episodes,
+                "role_offset": args.role_offset,
                 "requests_per_episode": len(rows) // args.episodes,
                 "episode_spacing_s": args.episode_spacing_s,
                 "leader_window_s": args.leader_window_s,
