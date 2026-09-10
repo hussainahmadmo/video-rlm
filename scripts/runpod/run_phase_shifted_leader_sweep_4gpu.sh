@@ -14,6 +14,7 @@ SEEDS=${SEEDS:-"1"}
 POLICIES=${POLICIES:-"fcfs max_min"}
 FOLLOWER_INFERENCE_REQUESTS=${FOLLOWER_INFERENCE_REQUESTS:-20}
 FOLLOWER_LIGHT_REQUESTS=${FOLLOWER_LIGHT_REQUESTS:-20}
+EPISODE_SPACING_S=${EPISODE_SPACING_S:-450}
 PREP_WORKERS=${PREP_WORKERS:-8}
 VLM_CONCURRENCY=${VLM_CONCURRENCY:-4}
 PREPARED_QUEUE_DEPTH=${PREPARED_QUEUE_DEPTH:-32}
@@ -58,6 +59,7 @@ cp "$TOPOLOGY_FILE" "$OUT/topology.tsv"
   echo "policies=$POLICIES"
   echo "follower_inference_requests=$FOLLOWER_INFERENCE_REQUESTS"
   echo "follower_light_requests=$FOLLOWER_LIGHT_REQUESTS"
+  echo "episode_spacing_s=$EPISODE_SPACING_S"
   echo "source_trace=$SOURCE_TRACE"
   echo "engine_token_profile=$ENGINE_TOKEN_PROFILE"
   echo "started=$(date -u +%FT%TZ)"
@@ -71,7 +73,8 @@ for seed in "${seed_list[@]}"; do
     "$PY" "$GENERATOR" --input "$SOURCE_TRACE" --output "$trace" \
       --seed "$seed" --prep-heavy-requests "$burst" \
       --inference-heavy-requests "$FOLLOWER_INFERENCE_REQUESTS" \
-      --light-requests "$FOLLOWER_LIGHT_REQUESTS"
+      --light-requests "$FOLLOWER_LIGHT_REQUESTS" \
+      --episode-spacing-s "$EPISODE_SPACING_S"
     cell_seeds+=("$seed")
     cell_bursts+=("$burst")
   done
