@@ -24,6 +24,7 @@ POLICY_ORDER = [
     "prep_max_min",
     "engine_tenant_fair",
     "max_min",
+    "cross_stage",
     "max_min_completion_only",
     "max_min_no_reconcile",
     "priority",
@@ -334,7 +335,13 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True, help="Output prefix (without extension)")
     args = parser.parse_args()
 
-    summary_paths = sorted(args.root.glob("*/*/summary.json"))
+    # Failed/restarted runs are retained by launchers as ``*.partial_*`` for
+    # debugging.  They must not be mixed into the matched-policy aggregates.
+    summary_paths = [
+        path
+        for path in sorted(args.root.glob("*/*/summary.json"))
+        if not any(".partial_" in part for part in path.parts)
+    ]
     if not summary_paths:
         raise SystemExit(f"No summaries found below {args.root}")
     run_rows = [analyze_run(path, args.root) for path in summary_paths]

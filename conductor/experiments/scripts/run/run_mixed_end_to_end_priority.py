@@ -4,11 +4,12 @@
 Background videos arrive first and urgent videos arrive later. The preparation
 dispatcher can be FCFS, priority ordered, shortest-job-first, statically
 reserved, adaptive to request SLO slack, max-min fair across tenants, hierarchical
-tenant-fair priority, or fair across tenants and slowdown-aware within a
-tenant.
+tenant-fair priority, fair across tenants and slowdown-aware within a tenant,
+or max-min fair with age-aware tail protection.
 Prepared requests retain the same priority when submitted to one or more vLLM
 replicas using ``--scheduling-policy priority``. The ``sjf``, ``max_min``, ``tenant_fair``,
-``tenant_priority``, ``fair_slowdown``, and ``engine_tenant_fair`` policies
+``tenant_priority``, ``fair_slowdown``, ``age_aware_max_min``, and
+``engine_tenant_fair`` policies
 instead submit a uniform engine priority because their external dispatcher
 owns the relevant admission ordering. ``engine_tenant_fair`` is a VTC-style
 engine-only baseline: preparation remains FCFS and tenant fairness starts only
@@ -50,7 +51,7 @@ CODEC_PATH = (
 WRITE_LOCK = threading.Lock()
 CROSS_STAGE_FAIR_POLICIES = frozenset({
     "max_min", "tenant_fair", "tenant_priority", "fair_slowdown",
-    "cross_stage",
+    "cross_stage", "age_aware_max_min",
 })
 PREPARATION_FAIR_POLICIES = frozenset({
     *CROSS_STAGE_FAIR_POLICIES, "prep_max_min",
@@ -530,6 +531,63 @@ def fair_tenant_choice(
     )
 
 
+def age_aware_fair_tenant_choice(
+    jobs: list[dict[str, Any]],
+    *,
+    now_s: float,
+    tenant_virtual_service: dict[str, float],
+    soft_threshold_s: float,
+    hard_threshold_s: float,
+) -> tuple[dict[str, Any], dict[str, float | str]]:
+    """Apply max-min sharing with two tiers of request-age protection.
+
+    Below the soft threshold this is ordinary per-tenant max-min selection.
+    Once any request crosses the soft threshold, selection remains max-min but
+    is restricted to tenants with aged requests. A request crossing the hard
+    threshold is selected globally by oldest original arrival time. Using the
+    same arrival timestamp at both stages prevents handoff from resetting age.
+    """
+    if not jobs:
+        raise ValueError("cannot choose from an empty job list")
+    if soft_threshold_s <= 0:
+        raise ValueError("soft age threshold must be positive")
+    if hard_threshold_s < soft_threshold_s:
+        raise ValueError("hard age threshold must be at least the soft threshold")
+
+    def age_s(job: dict[str, Any]) -> float:
+        return max(0.0, now_s - float(job["arrival_s"]))
+
+    hard_aged = [job for job in jobs if age_s(job) >= hard_threshold_s]
+    if hard_aged:
+        selected = min(
+            hard_aged,
+            key=lambda job: (float(job["arrival_s"]), int(job["sequence"])),
+        )
+        mode = "hard_oldest_request"
+    else:
+        soft_tenants = {
+            str(job["tenant"])
+            for job in jobs
+            if age_s(job) >= soft_threshold_s
+        }
+        candidates = (
+            [job for job in jobs if str(job["tenant"]) in soft_tenants]
+            if soft_tenants else jobs
+        )
+        selected = fair_tenant_choice(
+            candidates,
+            tenant_virtual_service=tenant_virtual_service,
+        )
+        mode = "soft_aged_tenant_max_min" if soft_tenants else "max_min"
+
+    return selected, {
+        "mode": mode,
+        "request_age_s": age_s(selected),
+        "soft_threshold_s": soft_threshold_s,
+        "hard_threshold_s": hard_threshold_s,
+    }
+
+
 def cross_stage_tenant_choice(
     jobs: list[dict[str, Any]],
     *,
@@ -983,6 +1041,7 @@ def main() -> None:
             "static_isolation", "sjf", "max_min", "prep_max_min",
             "tenant_round_robin", "tenant_fair", "tenant_priority",
             "fair_slowdown", "engine_tenant_fair", "cross_stage",
+            "age_aware_max_min",
         ],
         default="priority",
     )
@@ -995,8 +1054,8 @@ def main() -> None:
         "--tenant-weight", action="append", default=[], metavar="TENANT=WEIGHT",
         help=("Fair-share weight under tenant_fair, tenant_priority, "
               "fair_slowdown, or engine_tenant_fair; may be repeated and "
-              "defaults to 1 for unlisted tenants. max_min requires all "
-              "tenant weights to equal 1"),
+              "defaults to 1 for unlisted tenants. Unweighted max-min "
+              "policies require all tenant weights to equal 1"),
     )
     parser.add_argument("--background-requests", type=int, default=32)
     parser.add_argument("--urgent-requests", type=int, default=16)
@@ -1110,6 +1169,16 @@ def main() -> None:
               "replaced per frame count by online EWMA observations"),
     )
     parser.add_argument("--vlm-concurrency", type=int, default=4)
+    parser.add_argument(
+        "--age-soft-threshold-s", type=float, default=75.0,
+        help=("Under age_aware_max_min, restrict max-min selection to tenants "
+              "with requests at least this old"),
+    )
+    parser.add_argument(
+        "--age-hard-threshold-s", type=float, default=150.0,
+        help=("Under age_aware_max_min, select the globally oldest eligible "
+              "request after it reaches this age"),
+    )
     parser.add_argument("--prepared-queue-depth", type=int, default=32)
     parser.add_argument(
         "--cross-stage-debt-threshold-s", type=float, default=0.0,
@@ -1173,6 +1242,12 @@ def main() -> None:
         parser.error("preparation cost estimates must be positive")
     if args.vlm_fixed_cost_s <= 0:
         parser.error("--vlm-fixed-cost-s must be positive")
+    if args.age_soft_threshold_s <= 0:
+        parser.error("--age-soft-threshold-s must be positive")
+    if args.age_hard_threshold_s < args.age_soft_threshold_s:
+        parser.error(
+            "--age-hard-threshold-s must be at least --age-soft-threshold-s"
+        )
     if args.cross_stage_debt_threshold_s < 0:
         parser.error("--cross-stage-debt-threshold-s must be non-negative")
     if args.cross_stage_max_boost_s < 0:
@@ -1185,7 +1260,9 @@ def main() -> None:
         parser.error("--cost-profiler-min-samples must be positive")
     try:
         tenant_weights = parse_tenant_weights(args.tenant_weight)
-        if args.prep_policy in {"max_min", "prep_max_min"}:
+        if args.prep_policy in {
+            "max_min", "prep_max_min", "age_aware_max_min",
+        }:
             validate_max_min_tenant_weights(tenant_weights)
     except ValueError as exc:
         parser.error(str(exc))
@@ -1449,7 +1526,7 @@ def main() -> None:
             0
             if args.prep_policy in {
                 "fcfs", "max_min", "prep_max_min", "tenant_round_robin",
-                "engine_tenant_fair",
+                "engine_tenant_fair", "age_aware_max_min",
             }
             else job["priority"]
         )
@@ -1594,6 +1671,15 @@ def main() -> None:
                     unblock_target=args.cross_stage_unblock_target,
                 )
                 selected["cross_stage_decision"] = decision
+            elif args.prep_policy == "age_aware_max_min":
+                selected, decision = age_aware_fair_tenant_choice(
+                    jobs,
+                    now_s=now,
+                    tenant_virtual_service=tenant_prep_virtual_service,
+                    soft_threshold_s=args.age_soft_threshold_s,
+                    hard_threshold_s=args.age_hard_threshold_s,
+                )
+                selected["age_aware_prep_decision"] = decision
             elif args.prep_policy == "fair_slowdown":
                 selected = fair_slowdown_choice(
                     jobs,
@@ -1778,7 +1864,16 @@ def main() -> None:
             return None
         if args.prep_policy in INFERENCE_FAIR_POLICIES:
             jobs = [ready[index][2] for index in eligible]
-            if args.prep_policy == "fair_slowdown":
+            if args.prep_policy == "age_aware_max_min":
+                selected, decision = age_aware_fair_tenant_choice(
+                    jobs,
+                    now_s=elapsed(),
+                    tenant_virtual_service=tenant_vlm_virtual_service,
+                    soft_threshold_s=args.age_soft_threshold_s,
+                    hard_threshold_s=args.age_hard_threshold_s,
+                )
+                selected["age_aware_infer_decision"] = decision
+            elif args.prep_policy == "fair_slowdown":
                 selected = fair_slowdown_choice(
                     jobs,
                     now_s=elapsed(),
@@ -1912,6 +2007,9 @@ def main() -> None:
                     cross_stage_decision=job.pop(
                         "cross_stage_decision", None,
                     ),
+                    age_aware_decision=job.pop(
+                        "age_aware_prep_decision", None,
+                    ),
                 )
                 prep_futures[
                     prep_pool.submit(
@@ -1965,6 +2063,9 @@ def main() -> None:
                     ),
                     tenant_virtual_service=tenant_vlm_virtual_service.get(
                         job["tenant"], 0.0,
+                    ),
+                    age_aware_decision=job.pop(
+                        "age_aware_infer_decision", None,
                     ),
                 )
                 vlm_futures[
@@ -2214,7 +2315,9 @@ def main() -> None:
         "decode_backend": args.decode_backend,
         "tenant_weights": tenant_weights,
         "fairness_mode": (
-            "unweighted_max_min"
+            "unweighted_max_min_with_age_protection"
+            if args.prep_policy == "age_aware_max_min"
+            else "unweighted_max_min"
             if args.prep_policy == "max_min"
             else "readiness_aware_cross_stage"
             if args.prep_policy == "cross_stage"
@@ -2305,6 +2408,14 @@ def main() -> None:
             "urgent_ttft_slo_s": args.urgent_ttft_slo_s,
             "background_ttft_slo_s": args.background_ttft_slo_s,
             "background_aging_s": args.background_aging_s,
+            "age_soft_threshold_s": (
+                args.age_soft_threshold_s
+                if args.prep_policy == "age_aware_max_min" else None
+            ),
+            "age_hard_threshold_s": (
+                args.age_hard_threshold_s
+                if args.prep_policy == "age_aware_max_min" else None
+            ),
             "cross_stage_debt_threshold_s": (
                 args.cross_stage_debt_threshold_s
                 if args.prep_policy == "cross_stage" else None

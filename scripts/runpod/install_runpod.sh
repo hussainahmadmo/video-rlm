@@ -4,6 +4,7 @@ set -euo pipefail
 ENV_NAME="${ENV_NAME:-vllm-mm}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
 INSTALL_VLLM="${INSTALL_VLLM:-1}"
+VLLM_VERSION="${VLLM_VERSION:-}"
 INSTALL_YOLO="${INSTALL_YOLO:-0}"
 INSTALL_ZSH="${INSTALL_ZSH:-1}"
 INSTALL_ZSH_AUTOCOMPLETE="${INSTALL_ZSH_AUTOCOMPLETE:-1}"
@@ -25,6 +26,7 @@ if command -v apt-get >/dev/null 2>&1; then
       ffmpeg \
       git \
       git-lfs \
+      jq \
       libgl1 \
       libglib2.0-0 \
       libsm6 \
@@ -78,7 +80,11 @@ fi
 
 if [ "${INSTALL_VLLM}" = "1" ]; then
   echo "[runpod] installing vLLM"
-  python -m pip install vllm
+  if [ -n "${VLLM_VERSION}" ]; then
+    python -m pip install "vllm==${VLLM_VERSION}"
+  else
+    python -m pip install vllm
+  fi
 else
   echo "[runpod] skipping vLLM install because INSTALL_VLLM=${INSTALL_VLLM}"
 fi

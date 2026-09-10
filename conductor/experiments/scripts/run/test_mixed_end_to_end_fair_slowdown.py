@@ -439,6 +439,11 @@ class FairSlowdownTest(unittest.TestCase):
                 ("prep_max_min", [], "preparation_only_unweighted_max_min"),
                 ("tenant_round_robin", [], "tenant_round_robin"),
                 ("max_min", ["--completion-only-accounting"], "unweighted_max_min"),
+                (
+                    "age_aware_max_min",
+                    ["--age-soft-threshold-s", "1", "--age-hard-threshold-s", "2"],
+                    "unweighted_max_min_with_age_protection",
+                ),
             )
             for policy, extra, fairness_mode in cases:
                 output = root / policy
@@ -484,9 +489,20 @@ class FairSlowdownTest(unittest.TestCase):
                         set(summary["configuration"]["tenant_vlm_dispatches"].values()),
                         {1.0},
                     )
-                else:
+                elif policy == "max_min":
                     self.assertEqual(
                         summary["service_accounting_mode"], "completion_only"
+                    )
+                else:
+                    self.assertEqual(
+                        summary["service_accounting_mode"],
+                        "predicted_then_reconciled",
+                    )
+                    self.assertEqual(
+                        summary["configuration"]["age_soft_threshold_s"], 1.0
+                    )
+                    self.assertEqual(
+                        summary["configuration"]["age_hard_threshold_s"], 2.0
                     )
 
 

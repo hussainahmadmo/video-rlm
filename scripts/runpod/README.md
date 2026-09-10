@@ -6,7 +6,7 @@ Use this after cloning the repository on a fresh RunPod instance.
 cd /workspace
 git clone git@github.com:hussainahmadmo/video-rlm.git
 cd video-rlm
-bash scripts/runpod/install_runpod.sh
+VLLM_VERSION=0.17.0 bash scripts/runpod/install_runpod.sh
 ```
 
 If SSH is not configured on the pod:
@@ -50,6 +50,36 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate vllm-mm
 cd /workspace/video-rlm
 ```
+
+## A40 GPU-saturated fairness experiment
+
+Copy one ordinary MP4 to the pod. The experiment deliberately repeats that
+same video for both tenants so host preparation is matched and the only
+controlled difference is 512 versus 64 forced output tokens. The launcher
+profiles token-service cost on the A40 before running the matched policies;
+do not copy a profile measured on another GPU.
+
+```bash
+chmod +x run_gpu_saturated_fairness_with_server.sh \
+  scripts/runpod/run_gpu_saturated_fairness_a40.sh
+
+VIDEO_FILE=/workspace/data/gpu-fairness-source.mp4 \
+  scripts/runpod/run_gpu_saturated_fairness_a40.sh
+```
+
+The default run uses Qwen2.5-VL-7B-Instruct on one A40, five policies, three
+matched seeds, four concurrent vLLM requests, eight preparation workers, and
+a 30-second overloaded arrival window. A short smoke test is:
+
+```bash
+VIDEO_FILE=/workspace/data/gpu-fairness-source.mp4 \
+SEEDS=1 POLICIES='fcfs max_min' DURATION_S=10 \
+  scripts/runpod/run_gpu_saturated_fairness_a40.sh
+```
+
+Results are written below
+`large_sweeps/gpu_saturated_fairness_a40_qwen7b/`; server and GPU-monitor logs
+are written below `logs/gpu_saturated_fairness_a40_qwen7b/`.
 
 Check that the pushed caption caches are present:
 

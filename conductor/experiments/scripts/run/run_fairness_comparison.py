@@ -23,6 +23,7 @@ POLICIES = (
     "engine_tenant_fair",
     "prep_max_min",
     "max_min",
+    "age_aware_max_min",
     "cross_stage",
 )
 POLICY_HELP = {
@@ -31,6 +32,7 @@ POLICY_HELP = {
     "engine_tenant_fair": "FCFS preparation and fair inference admission",
     "prep_max_min": "fair preparation and FCFS inference admission",
     "max_min": "independent fair-service accounting at both stages",
+    "age_aware_max_min": "two-stage max-min with soft and hard age protection",
     "cross_stage": "two-stage accounting with bounded GPU-debt feedback",
 }
 
@@ -94,7 +96,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--list-methods",
         action="store_true",
-        help="print the six supported methods and exit",
+        help="print the supported methods and exit",
     )
     parser.add_argument(
         "runner_args",

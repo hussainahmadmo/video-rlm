@@ -19,6 +19,7 @@ POLICY_ORDER = (
     "fcfs", "tenant_round_robin", "prep_max_min",
     "engine_tenant_fair", "max_min",
     "completion_only", "fixed_reservation", "profiled_reconciled",
+    "profiled_no_reconcile", "request_count",
 )
 LABELS = {
     "fcfs": "FCFS",
@@ -29,6 +30,8 @@ LABELS = {
     "completion_only": "Completion-only",
     "fixed_reservation": "Fixed reservation",
     "profiled_reconciled": "Profiled + reconciled",
+    "profiled_no_reconcile": "Profiled, no reconciliation",
+    "request_count": "Request-count accounting",
 }
 COLORS = {
     "fcfs": "#D55E00",
@@ -39,6 +42,8 @@ COLORS = {
     "completion_only": "#D55E00",
     "fixed_reservation": "#E69F00",
     "profiled_reconciled": "#009E73",
+    "profiled_no_reconcile": "#56B4E9",
+    "request_count": "#CC79A7",
 }
 
 
