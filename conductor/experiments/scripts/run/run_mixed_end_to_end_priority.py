@@ -994,7 +994,9 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         values = [float(row[field]) for row in rows if row.get(field) is not None]
         summary[f"mean_{field}"] = mean(values)
         summary[f"p50_{field}"] = percentile(values, 0.50)
+        summary[f"p90_{field}"] = percentile(values, 0.90)
         summary[f"p95_{field}"] = percentile(values, 0.95)
+        summary[f"p99_{field}"] = percentile(values, 0.99)
         summary[f"max_{field}"] = max(values) if values else None
     slo_rows = [row for row in rows if row.get("ttft_slo_s") is not None]
     summary["ttft_slo_requests"] = len(slo_rows)
