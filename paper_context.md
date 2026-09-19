@@ -258,3 +258,20 @@ fair policy's latency cost. Mean preparation-queue waiting remains 33.11 seconds
 under min-two versus 17.88 under placement-only FCFS, pointing to fair selection
 and admission order as the next mechanism to isolate. Do not claim that the
 minimum-width change makes full Conductor latency-competitive from this pilot.
+
+### Preparation noisy-neighbor pilot
+
+The L40S pilot in `large_sweeps/noisy_neighbor_fairness_l40s_20260919/` uses
+one shared CPU preparation pool. Tenant A bursts twelve 128-frame requests just
+before B/C submit twelve combined one/16-frame requests. Relative to FCFS,
+two-stage max-min reduces B/C median E2E by 45.1%, B/C p95 by 26.1%, mean B/C
+preparation wait by 52.8%, and median model-ready time by 45.6%. Inference-only
+fairness is effectively identical to FCFS, demonstrating that inference policy
+cannot help requests still blocked in preparation.
+
+The tradeoff is material: A's p95 rises from 69.44 to 101.77 seconds, overall
+p95 rises 14.8%, and throughput falls 4.5%. Preparation-only and two-stage
+results are almost identical because this trace is preparation-dominated with
+equal output budgets. Treat this as a one-video, one-order mechanism result.
+Exact configuration, metrics, and validation requirements are in
+`docs/noisy_neighbor_fairness_l40s_20260919.md`.
