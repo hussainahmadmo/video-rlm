@@ -29,18 +29,27 @@ import base64
 import heapq
 import importlib.util
 import json
+import math
 import os
 import re
 import sys
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 from openai import OpenAI
+from preparation_placement import choose_preparation_backend, predicted_remaining_service
+from joint_preparation_allocation import JointPreparationAllocator
+from online_capacity_adaptation import (
+    CapacityEpochAccumulator,
+    OnlineCapacityController,
+    host_memory_pressure,
+)
+from functools import partial
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -60,7 +69,7 @@ INFERENCE_FAIR_POLICIES = frozenset({
     *CROSS_STAGE_FAIR_POLICIES, "engine_tenant_fair",
 })
 SCHEDULER_OWNED_POLICIES = frozenset({
-    "sjf", *PREPARATION_FAIR_POLICIES, *INFERENCE_FAIR_POLICIES,
+    "sjf", "prep_sjf", "prep_sjf_aging", *PREPARATION_FAIR_POLICIES, *INFERENCE_FAIR_POLICIES,
     "tenant_round_robin",
 })
 
@@ -150,13 +159,22 @@ class OnlineStageCostProfiler:
         metadata = metadata or job.get("profile_metadata") or {}
         frames = int(job["frame_count"])
         output_budget = int(job.get("max_tokens", 0))
+        load_context = job.get("profile_context") or {}
+        load_key = None
+        if self.stage == "prep" and load_context:
+            load_key = (
+                "frames_load", frames,
+                int(load_context.get("gpu_jobs", 0)),
+                int(load_context.get("gpu_lanes_used", 0)),
+                str(load_context.get("inference_occupancy", "unknown")),
+            )
         if self.mode == "frame_ewma":
             if self.stage == "engine":
                 return [
                     ("frames_output", frames, output_budget),
                     ("frames", frames),
                 ]
-            return [("frames", frames)]
+            return ([load_key] if load_key is not None else []) + [("frames", frames)]
 
         duration = self._first(
             metadata, ("duration_s", "video_duration_s", "duration")
@@ -182,6 +200,7 @@ class OnlineStageCostProfiler:
         # Ordered from most to least specific. Duplicate projections are
         # removed while retaining their fallback order.
         candidates = [
+            *([load_key] if load_key is not None else []),
             detailed,
             *(
                 [("backend_frames_output", self.backend, frames, output_budget)]
@@ -713,6 +732,19 @@ def shortest_job_choice(jobs: list[dict[str, Any]], service_s) -> dict[str, Any]
     )
 
 
+def preparation_sjf_choice(jobs, service_s, *, now_s, aging_s=None):
+    """Predicted preparation cost only; optionally serve oldest overdue work."""
+    if not jobs:
+        raise ValueError("cannot choose from an empty job list")
+    if aging_s is not None:
+        if aging_s <= 0:
+            raise ValueError("aging threshold must be positive")
+        overdue = [j for j in jobs if now_s - float(j["arrival_s"]) >= aging_s]
+        if overdue:
+            return min(overdue, key=lambda j: (float(j["arrival_s"]), int(j["sequence"])))
+    return min(jobs, key=lambda j: (float(service_s(j)), float(j["arrival_s"]), int(j["sequence"])))
+
+
 def import_path(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
@@ -844,16 +876,24 @@ def prepare_uniform(
             "timestamps": [],
             "decode_service_s": time.perf_counter() - started,
         }
+    if row.get("image_paths") is not None:
+        from multi_image_preparation import prepare_images
+        if len(row["image_paths"]) != job["frame_count"]:
+            raise ValueError("Image count differs from declared input size")
+        return prepare_images(row["image_paths"], codec.make_prompt(row), codec_args.decode_max_side)
     video = Path(row["video"])
     started = time.perf_counter()
     duration_s = codec.probe_duration(video, codec_args.index_timeout_s)
     timestamps = codec.temporal_anchors(duration_s, job["frame_count"])
+    preparation_profile = {"probe_sampling_s": time.perf_counter() - started}
+    decode_profile: dict[str, Any] = {}
     if codec_args.decode_backend in (
-        "batch_cpu", "batch_nvdec", "indexed_nvdec"
+        "batch_cpu", "batch_nvdec", "indexed_nvdec", "parallel_nvdec", "flashstyle_nvdec"
     ):
         jpegs = codec_args.batch_decode(
             video, timestamps, codec_args.decode_max_side,
             codec_args.decode_timeout_s,
+            **({"metrics": decode_profile} if codec_args.decode_backend == "batch_cpu" else {}),
         )
     else:
         jpegs = [
@@ -863,6 +903,8 @@ def prepare_uniform(
             )
             for timestamp in timestamps
         ]
+    serialization_started = time.perf_counter()
+    preparation_profile.update(decode_profile)
     content: list[dict[str, Any]] = []
     for jpeg in jpegs:
         content.append(
@@ -875,11 +917,13 @@ def prepare_uniform(
             }
         )
     content.append({"type": "text", "text": codec.make_prompt(row)})
+    preparation_profile["base64_content_s"] = time.perf_counter() - serialization_started
     return {
         "content": content,
         "duration_s": duration_s,
         "timestamps": timestamps,
         "decode_service_s": time.perf_counter() - started,
+        "preparation_profile": preparation_profile,
     }
 
 
@@ -936,7 +980,9 @@ def call_vllm(
                 "ignore_eos": args.ignore_eos,
             },
         }
-        if args.engine_token_profile is not None:
+        if os.environ.get("VIDEO_RLM_MM_MIN_PIXELS"):
+            request_options["extra_body"]["mm_processor_kwargs"]["min_pixels"] = int(os.environ["VIDEO_RLM_MM_MIN_PIXELS"])
+        if args.engine_token_profile is not None or getattr(args, "include_stream_usage", False):
             request_options["stream_options"] = {"include_usage": True}
         stream = client.chat.completions.create(
             **request_options,
@@ -1040,7 +1086,7 @@ def main() -> None:
         "--prep-policy",
         choices=[
             "fcfs", "priority", "priority_reserved", "slo_adaptive",
-            "static_isolation", "sjf", "max_min", "prep_max_min",
+            "static_isolation", "sjf", "prep_sjf", "prep_sjf_aging", "max_min", "prep_max_min",
             "tenant_round_robin", "tenant_fair", "tenant_priority",
             "fair_slowdown", "engine_tenant_fair", "cross_stage",
             "age_aware_max_min",
@@ -1069,6 +1115,30 @@ def main() -> None:
     parser.add_argument("--urgent-priority", type=int, default=0)
     parser.add_argument("--prep-workers", type=int, default=4)
     parser.add_argument(
+        "--capacity-adaptation", choices=["fixed", "online"], default="fixed",
+        help=("Adapt active CPU preparation and handoff admission limits. "
+              "--prep-workers and --prepared-queue-depth remain hard maxima."),
+    )
+    parser.add_argument("--capacity-control-interval-s", type=float, default=10.0)
+    parser.add_argument("--capacity-initial-prep-workers", type=int)
+    parser.add_argument("--capacity-min-prep-workers", type=int, default=1)
+    parser.add_argument("--capacity-initial-handoff", type=int)
+    parser.add_argument("--capacity-min-handoff", type=int)
+    parser.add_argument("--capacity-worker-step", type=int, default=1)
+    parser.add_argument("--capacity-handoff-step", type=int, default=4)
+    parser.add_argument("--capacity-hysteresis-epochs", type=int, default=2)
+    parser.add_argument("--capacity-cooldown-epochs", type=int, default=1)
+    parser.add_argument("--capacity-starvation-threshold", type=float, default=0.05)
+    parser.add_argument("--capacity-busy-threshold", type=float, default=0.8)
+    parser.add_argument("--capacity-handoff-full-threshold", type=float, default=0.2)
+    parser.add_argument("--capacity-memory-high-watermark", type=float, default=0.9)
+    parser.add_argument("--capacity-throughput-plateau-epsilon", type=float, default=0.03)
+    parser.add_argument("--capacity-latency-growth-threshold", type=float, default=0.2)
+    parser.add_argument(
+        "--cpu-decoder-threads", type=int,
+        help="Positive FFmpeg decoder threads per request; overrides VIDEO_RLM_FFMPEG_THREADS. Tune jointly with preparation workers and CPU affinity.",
+    )
+    parser.add_argument(
         "--background-prep-workers", type=int,
         help=("preparation slots dedicated to background requests under "
               "static_isolation"),
@@ -1090,10 +1160,39 @@ def main() -> None:
     )
     parser.add_argument(
         "--decode-backend",
-        choices=["seek_cpu", "batch_cpu", "batch_nvdec", "indexed_nvdec"],
+        choices=["seek_cpu", "batch_cpu", "batch_nvdec", "indexed_nvdec", "parallel_nvdec", "flashstyle_nvdec"],
         default="seek_cpu",
         help="External frame preparation backend",
     )
+    parser.add_argument("--prep-placement", choices=["fixed", "frame_threshold", "adaptive", "joint"], default="fixed")
+    parser.add_argument("--gpu-prep-backend", choices=["batch_nvdec", "indexed_nvdec", "parallel_nvdec", "flashstyle_nvdec"], default="indexed_nvdec")
+    parser.add_argument("--gpu-prep-limit", type=int, default=1)
+    parser.add_argument("--gpu-decoder-budget", type=int, default=4)
+    parser.add_argument("--joint-allocation-order", choices=["fair", "fcfs"], default="fair")
+    parser.add_argument("--joint-fixed-lanes", type=int, default=0)
+    parser.add_argument("--joint-fixed-routing", action="store_true")
+    parser.add_argument("--joint-conservative-routing", action="store_true",
+                        help="Use the calibrated static route unless an alternative wins by a confidence margin")
+    parser.add_argument("--joint-preferred-gpu-frame-threshold", type=int, default=32,
+                        help="Static fallback routes this many frames or more to GPU")
+    parser.add_argument("--joint-switch-margin-s", type=float, default=2.0,
+                        help="Minimum absolute predicted-readiness gain required to override the fallback route")
+    parser.add_argument("--joint-switch-margin-ratio", type=float, default=0.2,
+                        help="Minimum relative predicted-readiness gain required to override the fallback route")
+    parser.add_argument("--joint-bypass-heavy", action="store_true",
+                        help="Consider each tenant's oldest light and heavy requests separately.")
+    parser.add_argument("--joint-lane-profile", type=Path)
+    parser.add_argument("--joint-profile-light-s", type=float, default=0,
+                        help="Enable within-tenant light bypass using predicted CPU preparation cost")
+    parser.add_argument("--joint-cpu-light-reserve", type=int, default=0,
+                        help="CPU slots unavailable to profiled-expensive work, including before light arrivals")
+    parser.add_argument("--joint-light-bypass-age-s", type=float, default=5,
+                        help="Queue age after which expensive work regains within-tenant precedence")
+    parser.add_argument("--gpu-prep-frame-threshold", type=int, default=32)
+    parser.add_argument("--gpu-prep-inference-guard", type=float, default=0.75,
+                        help="Do not offload when occupied inference-slot fraction reaches this value")
+    parser.add_argument("--gpu-prep-fixed-cost-s", type=float, default=0.75)
+    parser.add_argument("--gpu-prep-seconds-per-frame", type=float, default=0.025)
     parser.add_argument(
         "--background-prep-limit",
         type=int,
@@ -1113,6 +1212,7 @@ def main() -> None:
         "--background-aging-s", type=float, default=120.0,
         help="Promote background work after this preparation-queue wait",
     )
+    parser.add_argument("--sjf-aging-s", type=float, default=30.0, help="Oldest-first override after this preparation wait for prep_sjf_aging")
     parser.add_argument("--prep-fixed-cost-s", type=float, default=0.25)
     parser.add_argument("--prep-seconds-per-frame", type=float, default=0.12)
     parser.add_argument("--prep-cost-ewma-alpha", type=float, default=0.2)
@@ -1135,6 +1235,7 @@ def main() -> None:
         choices=["frame_ewma", "metadata_ewma"],
         help="Inference-admission profiler; defaults to --cost-profiler",
     )
+    parser.add_argument("--include-stream-usage", action="store_true", help="Request token counts in the final streaming response")
     parser.add_argument(
         "--engine-token-profile",
         type=Path,
@@ -1220,6 +1321,10 @@ def main() -> None:
     parser.add_argument("--decode-timeout-s", type=float, default=60.0)
     parser.add_argument("--request-timeout-s", type=float, default=1800.0)
     args = parser.parse_args()
+    if args.cpu_decoder_threads is not None:
+        if args.cpu_decoder_threads < 1:
+            parser.error("--cpu-decoder-threads must be positive")
+        os.environ["VIDEO_RLM_FFMPEG_THREADS"] = str(args.cpu_decoder_threads)
     prep_cost_profiler_mode = args.prep_cost_profiler or args.cost_profiler
     engine_cost_profiler_mode = args.engine_cost_profiler or args.cost_profiler
 
@@ -1234,6 +1339,94 @@ def main() -> None:
 
     if min(args.prep_workers, args.vlm_concurrency, args.prepared_queue_depth) < 1:
         parser.error("worker and queue counts must be positive")
+    if args.capacity_adaptation == "online":
+        if args.prep_policy in {"static_isolation", "priority_reserved", "slo_adaptive"}:
+            parser.error(
+                "online capacity adaptation does not support workload-specific "
+                "preparation quotas"
+            )
+        if args.capacity_control_interval_s <= 0:
+            parser.error("--capacity-control-interval-s must be positive")
+        if min(
+            args.capacity_min_prep_workers,
+            args.capacity_worker_step,
+            args.capacity_handoff_step,
+            args.capacity_hysteresis_epochs,
+        ) < 1:
+            parser.error("capacity minima, steps, and hysteresis must be positive")
+        if args.capacity_cooldown_epochs < 0:
+            parser.error("--capacity-cooldown-epochs must be non-negative")
+        for name in (
+            "capacity_starvation_threshold",
+            "capacity_busy_threshold",
+            "capacity_handoff_full_threshold",
+            "capacity_memory_high_watermark",
+        ):
+            if not 0 <= getattr(args, name) <= 1:
+                parser.error(f"--{name.replace('_', '-')} must be in [0, 1]")
+        if min(
+            args.capacity_throughput_plateau_epsilon,
+            args.capacity_latency_growth_threshold,
+        ) < 0:
+            parser.error("capacity plateau and latency thresholds must be non-negative")
+        if args.capacity_initial_prep_workers is None:
+            args.capacity_initial_prep_workers = max(1, args.prep_workers // 2)
+        if args.capacity_initial_handoff is None:
+            args.capacity_initial_handoff = max(
+                args.capacity_initial_prep_workers,
+                max(1, args.prepared_queue_depth // 2),
+            )
+        if args.capacity_min_handoff is None:
+            args.capacity_min_handoff = args.capacity_initial_prep_workers
+        try:
+            OnlineCapacityController(
+                initial_prep_workers=args.capacity_initial_prep_workers,
+                min_prep_workers=args.capacity_min_prep_workers,
+                max_prep_workers=args.prep_workers,
+                initial_handoff=args.capacity_initial_handoff,
+                min_handoff=args.capacity_min_handoff,
+                max_handoff=args.prepared_queue_depth,
+                worker_step=args.capacity_worker_step,
+                handoff_step=args.capacity_handoff_step,
+                starvation_threshold=args.capacity_starvation_threshold,
+                busy_threshold=args.capacity_busy_threshold,
+                handoff_full_threshold=args.capacity_handoff_full_threshold,
+                memory_high_watermark=args.capacity_memory_high_watermark,
+                plateau_epsilon=args.capacity_throughput_plateau_epsilon,
+                latency_growth=args.capacity_latency_growth_threshold,
+                hysteresis_epochs=args.capacity_hysteresis_epochs,
+                cooldown_epochs=args.capacity_cooldown_epochs,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.prep_placement != "fixed" and args.decode_backend not in ("seek_cpu", "batch_cpu"):
+        parser.error("adaptive/threshold placement requires a CPU --decode-backend")
+    if args.prep_placement != "fixed" and args.prep_policy in ("static_isolation", "priority_reserved", "slo_adaptive"):
+        parser.error("CPU/GPU placement does not yet support workload-specific preparation quotas")
+    if args.prep_placement == "joint":
+        if args.gpu_prep_backend not in ("parallel_nvdec", "flashstyle_nvdec") or args.prep_policy not in ("fcfs", "prep_max_min", "max_min"):
+            parser.error("joint allocation requires a parallel GPU decoder and fcfs, prep_max_min, or max_min")
+        if args.gpu_decoder_budget < 1 or not 0 <= args.joint_fixed_lanes <= args.gpu_decoder_budget:
+            parser.error("invalid decoder budget or fixed lane count")
+        if (not math.isfinite(args.joint_profile_light_s) or args.joint_profile_light_s < 0
+                or not 0 <= args.joint_cpu_light_reserve <= args.prep_workers
+                or not math.isfinite(args.joint_light_bypass_age_s) or args.joint_light_bypass_age_s <= 0
+                or (args.joint_cpu_light_reserve and not args.joint_profile_light_s)
+                or args.joint_preferred_gpu_frame_threshold < 1
+                or not math.isfinite(args.joint_switch_margin_s)
+                or args.joint_switch_margin_s < 0
+                or not math.isfinite(args.joint_switch_margin_ratio)
+                or not 0 <= args.joint_switch_margin_ratio < 1):
+            parser.error("invalid profiled-light threshold, CPU reserve or bypass age")
+    elif args.joint_profile_light_s or args.joint_cpu_light_reserve:
+        parser.error("profiled-light selection requires --prep-placement joint")
+    if min(args.gpu_prep_limit, args.gpu_prep_frame_threshold) < 1:
+        parser.error("GPU preparation limit and frame threshold must be positive")
+    if not 0 < args.gpu_prep_inference_guard <= 1:
+        parser.error("GPU preparation inference guard must be in (0, 1]")
+    if (not math.isfinite(args.gpu_prep_fixed_cost_s) or args.gpu_prep_fixed_cost_s < 0
+            or not math.isfinite(args.gpu_prep_seconds_per_frame) or args.gpu_prep_seconds_per_frame <= 0):
+        parser.error("GPU preparation estimates must be finite and positive")
     if not 0 <= args.urgent_prep_reserve < args.prep_workers:
         parser.error("--urgent-prep-reserve must be in [0, prep-workers)")
     if min(args.urgent_ttft_slo_s, args.background_ttft_slo_s) <= 0:
@@ -1258,6 +1451,8 @@ def main() -> None:
         parser.error("--cross-stage-unblock-target must be positive")
     if not 0 < args.prep_cost_ewma_alpha <= 1:
         parser.error("--prep-cost-ewma-alpha must be in (0, 1]")
+    if args.sjf_aging_s <= 0:
+        parser.error("--sjf-aging-s must be positive")
     if args.cost_profiler_min_samples < 1:
         parser.error("--cost-profiler-min-samples must be positive")
     try:
@@ -1375,17 +1570,40 @@ def main() -> None:
         "background": background_cpu_set,
         "urgent": urgent_cpu_set,
     }
-    if args.decode_backend in ("batch_cpu", "batch_nvdec", "indexed_nvdec"):
+    if args.decode_backend in ("batch_cpu", "batch_nvdec", "indexed_nvdec", "parallel_nvdec", "flashstyle_nvdec"):
         module_name = {
             "batch_cpu": "batched_cpu_decode",
             "batch_nvdec": "batched_nvdec_decode",
             "indexed_nvdec": "indexed_nvdec_decode",
+            "parallel_nvdec": "parallel_nvdec_decode",
+            "flashstyle_nvdec": "flashstyle_nvdec_decode",
         }[args.decode_backend]
         batch_codec = import_path(
             module_name, CODEC_PATH.with_name(f"{module_name}.py")
         )
         codec_args.batch_decode = batch_codec.decode_jpegs_batch_cpu
+    codec_args_by_backend = {args.decode_backend: codec_args}
+    if args.prep_placement != "fixed":
+        gpu_codec_args = SimpleNamespace(**vars(codec_args))
+        gpu_codec_args.decode_backend = args.gpu_prep_backend
+        module_name = {"batch_nvdec": "batched_nvdec_decode", "indexed_nvdec": "indexed_nvdec_decode", "parallel_nvdec": "parallel_nvdec_decode", "flashstyle_nvdec": "flashstyle_nvdec_decode"}[args.gpu_prep_backend]
+        try:
+            gpu_codec = import_path(module_name, CODEC_PATH.with_name(f"{module_name}.py"))
+        except ImportError as exc:
+            parser.error(f"GPU preparation backend unavailable: {exc}")
+        gpu_codec_args.batch_decode = gpu_codec.decode_jpegs_batch_cpu
+        if args.prep_placement == "joint" and args.gpu_prep_backend == "flashstyle_nvdec":
+            capacity = gpu_codec.scheduler().capacity
+            if args.gpu_decoder_budget > capacity:
+                parser.error(
+                    f"--gpu-decoder-budget {args.gpu_decoder_budget} exceeds flashstyle "
+                    f"worker capacity {capacity}; configure VIDEO_RLM_FLASH_GPU_IDS and "
+                    "VIDEO_RLM_FLASH_WORKERS_PER_GPU to match the reservation budget"
+                )
+        codec_args_by_backend[args.gpu_prep_backend] = gpu_codec_args
     ports = list(dict.fromkeys(args.ports or [args.port]))
+    if args.prep_placement != "fixed" and len(ports) != 1:
+        parser.error("CPU/GPU placement currently supports one inference replica per run")
     background_ports = list(dict.fromkeys(args.background_ports or []))
     urgent_ports = list(dict.fromkeys(args.urgent_ports or []))
     if args.replica_routing == "workload_isolated":
@@ -1505,6 +1723,15 @@ def main() -> None:
         alpha=args.prep_cost_ewma_alpha,
         min_samples=args.cost_profiler_min_samples,
     )
+    prep_profilers = {args.decode_backend: prep_cost_profiler}
+    if args.prep_placement != "fixed":
+        prep_profilers[args.gpu_prep_backend] = OnlineStageCostProfiler(
+            stage="prep", mode=prep_cost_profiler_mode, backend=args.gpu_prep_backend,
+            alpha=args.prep_cost_ewma_alpha, min_samples=args.cost_profiler_min_samples,
+        )
+    joint_lane_profile = json.loads(args.joint_lane_profile.read_text()) if args.joint_lane_profile else {}
+    joint_allocator = JointPreparationAllocator(args.prep_workers, args.gpu_decoder_budget, args.gpu_prep_limit, args.gpu_prep_frame_threshold)
+    lane_profilers = {lanes: OnlineStageCostProfiler(stage="prep", mode=prep_cost_profiler_mode, backend=f"parallel_nvdec_{lanes}", alpha=args.prep_cost_ewma_alpha, min_samples=args.cost_profiler_min_samples) for lanes in (1, 2, 4)}
     vlm_cost_profiler = OnlineStageCostProfiler(
         stage="engine",
         mode=engine_cost_profiler_mode,
@@ -1523,24 +1750,106 @@ def main() -> None:
     def elapsed() -> float:
         return time.perf_counter() - started
 
+    capacity_controller: OnlineCapacityController | None = None
+    capacity_epoch: CapacityEpochAccumulator | None = None
+    capacity_history: list[dict[str, Any]] = []
+    current_prep_capacity = args.prep_workers
+    current_handoff_capacity = args.prepared_queue_depth
+    if args.capacity_adaptation == "online":
+        capacity_controller = OnlineCapacityController(
+            initial_prep_workers=args.capacity_initial_prep_workers,
+            min_prep_workers=args.capacity_min_prep_workers,
+            max_prep_workers=args.prep_workers,
+            initial_handoff=args.capacity_initial_handoff,
+            min_handoff=args.capacity_min_handoff,
+            max_handoff=args.prepared_queue_depth,
+            worker_step=args.capacity_worker_step,
+            handoff_step=args.capacity_handoff_step,
+            starvation_threshold=args.capacity_starvation_threshold,
+            busy_threshold=args.capacity_busy_threshold,
+            handoff_full_threshold=args.capacity_handoff_full_threshold,
+            memory_high_watermark=args.capacity_memory_high_watermark,
+            plateau_epsilon=args.capacity_throughput_plateau_epsilon,
+            latency_growth=args.capacity_latency_growth_threshold,
+            hysteresis_epochs=args.capacity_hysteresis_epochs,
+            cooldown_epochs=args.capacity_cooldown_epochs,
+        )
+        current_prep_capacity = capacity_controller.prep_workers
+        current_handoff_capacity = capacity_controller.handoff
+        capacity_epoch = CapacityEpochAccumulator(elapsed())
+
     def scheduling_key(job: dict[str, Any]) -> int:
         return (
             0
             if args.prep_policy in {
-                "fcfs", "max_min", "prep_max_min", "tenant_round_robin",
+                "fcfs", "prep_sjf", "prep_sjf_aging", "max_min", "prep_max_min", "tenant_round_robin",
                 "engine_tenant_fair", "age_aware_max_min",
             }
             else job["priority"]
         )
 
+    def backend_prep_estimate(job: dict[str, Any], backend: str) -> float:
+        gpu = backend != args.decode_backend
+        default_s = ((args.gpu_prep_fixed_cost_s + args.gpu_prep_seconds_per_frame * job["frame_count"])
+                     if gpu else (args.prep_fixed_cost_s + args.prep_seconds_per_frame * job["frame_count"]))
+        if args.prep_placement == "joint" and not gpu:
+            default_s = float(joint_lane_profile.get("cpu", {}).get(str(job["frame_count"]), default_s))
+        return prep_profilers[backend].predict(job, default_s=default_s)
+
+    def gpu_lane_estimate(job, lanes):
+        base = args.gpu_prep_fixed_cost_s + args.gpu_prep_seconds_per_frame * job["frame_count"]
+        calibrated = joint_lane_profile.get(str(job["frame_count"]), {}).get(str(lanes))
+        profile_job = dict(job, profile_context=gpu_profile_context())
+        return lane_profilers[lanes].predict(profile_job, default_s=float(calibrated) if calibrated is not None else base / min(lanes, 2) + 0.25 * lanes)
+
+    def gpu_profile_context() -> dict[str, Any]:
+        gpu_jobs = [job for job in prep_futures.values()
+                    if job.get("prep_backend") == args.gpu_prep_backend]
+        inference_used = len(vlm_futures)
+        inference_capacity = args.vlm_concurrency * len(ports)
+        if inference_used == 0:
+            occupancy = "idle"
+        elif inference_used / inference_capacity < args.gpu_prep_inference_guard:
+            occupancy = "below_guard"
+        else:
+            occupancy = "at_guard"
+        return {
+            "gpu_jobs": len(gpu_jobs),
+            "gpu_lanes_used": sum(job.get("prep_gpu_lanes", 0) for job in gpu_jobs),
+            "inference_occupancy": occupancy,
+            "inference_slots_used": inference_used,
+            "inference_slots_total": inference_capacity,
+        }
+
     def predicted_prep_service_s(job: dict[str, Any]) -> float:
-        frames = job["frame_count"]
-        return prep_cost_profiler.predict(
-            job,
-            default_s=(
-                args.prep_fixed_cost_s + args.prep_seconds_per_frame * frames
-            ),
+        if args.prep_placement == "joint":
+            return job["joint_decision"]["predicted_service_s"]
+        return backend_prep_estimate(job, job.get("prep_backend", args.decode_backend))
+
+    def assign_preparation_backend(job: dict[str, Any]) -> bool:
+        if args.prep_placement == "joint":
+            return True
+        job["prep_backend"] = args.decode_backend
+        if args.prep_placement == "fixed":
+            return True
+        now = elapsed()
+        cpu_jobs = [j for j in prep_futures.values() if j.get("prep_backend") == args.decode_backend]
+        gpu_jobs = [j for j in prep_futures.values() if j.get("prep_backend") == args.gpu_prep_backend]
+        decision = choose_preparation_backend(
+            mode=args.prep_placement, modality=job["modality"], frames=job["frame_count"],
+            cpu_backend=args.decode_backend, gpu_backend=args.gpu_prep_backend,
+            cpu_service_s=backend_prep_estimate(job, args.decode_backend),
+            gpu_service_s=backend_prep_estimate(job, args.gpu_prep_backend),
+            cpu_remaining_s=predicted_remaining_service(cpu_jobs, now),
+            gpu_remaining_s=predicted_remaining_service(gpu_jobs, now),
+            prep_workers=args.prep_workers, gpu_prep_limit=args.gpu_prep_limit,
+            inference_active=len(vlm_futures), inference_capacity=args.vlm_concurrency * len(ports),
+            inference_guard=args.gpu_prep_inference_guard, frame_threshold=args.gpu_prep_frame_threshold,
+            ready_requests=len(ready),
         )
+        job["prep_backend"] = decision.backend
+        job["prep_placement_decision"] = vars(decision)
+        return decision.dispatch_now
 
     def engine_profile_concurrency(job: dict[str, Any]) -> int:
         replica_port = job.get("replica_port")
@@ -1654,6 +1963,19 @@ def main() -> None:
         if not pending:
             return None
 
+        if args.prep_placement == "joint":
+            choice = joint_allocator.choose([job for _, _, job in pending], list(prep_futures.values()), args.decode_backend, args.gpu_prep_backend, lambda job: backend_prep_estimate(job, args.decode_backend), gpu_lane_estimate, allow_gpu=len(vlm_futures) / (args.vlm_concurrency * len(ports)) < args.gpu_prep_inference_guard, order=args.joint_allocation_order, fixed_lanes=args.joint_fixed_lanes, fixed_routing=args.joint_fixed_routing, now_s=elapsed(), bypass_heavy=args.joint_bypass_heavy, profile_light_s=args.joint_profile_light_s, cpu_light_reserve=args.joint_cpu_light_reserve, light_bypass_age_s=args.joint_light_bypass_age_s, cpu_limit=current_prep_capacity, conservative_routing=args.joint_conservative_routing, preferred_gpu_frame_threshold=args.joint_preferred_gpu_frame_threshold, switch_margin_s=args.joint_switch_margin_s, switch_margin_ratio=args.joint_switch_margin_ratio)
+            if choice is None:
+                return None
+            selected, decision = choice
+            selected["joint_decision"] = decision
+            selected["prep_backend"] = decision["backend"]
+            selected["prep_gpu_lanes"] = decision["lanes"]
+            if decision["lanes"]:
+                selected["profile_context"] = gpu_profile_context()
+                decision.update(selected["profile_context"])
+            return remove_pending(next(index for index, (_, _, job) in enumerate(pending) if job is selected))
+
         if args.prep_policy in PREPARATION_FAIR_POLICIES:
             now = elapsed()
             jobs = [job for _, _, job in pending]
@@ -1721,6 +2043,14 @@ def main() -> None:
                 if job is selected
             )
             return remove_pending(index)
+
+        if args.prep_policy in {"prep_sjf", "prep_sjf_aging"}:
+            selected = preparation_sjf_choice(
+                [job for _, _, job in pending], predicted_prep_service_s,
+                now_s=elapsed(),
+                aging_s=args.sjf_aging_s if args.prep_policy == "prep_sjf_aging" else None,
+            )
+            return remove_pending(next(i for i, (_, _, job) in enumerate(pending) if job is selected))
 
         if args.prep_policy == "sjf":
             selected = shortest_job_choice(
@@ -1941,11 +2271,70 @@ def main() -> None:
             },
         )
 
+    def capacity_event(name: str, **extra: Any) -> None:
+        append_jsonl(
+            events_path,
+            {
+                "event": name,
+                "time_s": elapsed(),
+                **extra,
+            },
+        )
+
+    if capacity_controller is not None:
+        capacity_event(
+            "capacity_controller_start",
+            prep_workers=current_prep_capacity,
+            handoff_capacity=current_handoff_capacity,
+            max_prep_workers=args.prep_workers,
+            max_handoff_capacity=args.prepared_queue_depth,
+            interval_s=args.capacity_control_interval_s,
+        )
+
     with ThreadPoolExecutor(max_workers=args.prep_workers) as prep_pool, ThreadPoolExecutor(
+        max_workers=args.gpu_prep_limit
+    ) as gpu_prep_pool, ThreadPoolExecutor(
         max_workers=args.vlm_concurrency * len(ports)
     ) as vlm_pool:
         while arrivals or pending or prep_futures or ready or vlm_futures:
             now = elapsed()
+            if capacity_controller is not None and capacity_epoch is not None:
+                capacity_epoch.observe(
+                    now,
+                    active_preparations=(
+                        sum(job.get("prep_backend") == args.decode_backend
+                            for job in prep_futures.values())
+                        if args.prep_placement == "joint"
+                        else len(prep_futures)
+                    ),
+                    prep_worker_limit=current_prep_capacity,
+                    committed_preparations=len(prep_futures) + len(ready),
+                    handoff_limit=current_handoff_capacity,
+                    pending_preparations=bool(pending),
+                    ready_depth=len(ready),
+                    active_inference=len(vlm_futures),
+                    inference_limit=args.vlm_concurrency * len(ports),
+                )
+                if (
+                    capacity_epoch.elapsed_s(now)
+                    >= args.capacity_control_interval_s
+                ):
+                    observation = capacity_epoch.finish(
+                        now,
+                        prep_worker_limit=current_prep_capacity,
+                        memory_pressure_fraction=host_memory_pressure(),
+                    )
+                    decision = capacity_controller.update(observation)
+                    current_prep_capacity = capacity_controller.prep_workers
+                    current_handoff_capacity = capacity_controller.handoff
+                    record = {
+                        "time_s": now,
+                        "observation": observation.to_dict(),
+                        "decision": decision.to_dict(),
+                    }
+                    capacity_history.append(record)
+                    capacity_event("capacity_update", **record)
+                    capacity_epoch = CapacityEpochAccumulator(now)
             while arrivals and arrivals[0][0] <= now:
                 _, _, job = heapq.heappop(arrivals)
                 initialize_tenant_virtual_service(job)
@@ -1956,18 +2345,29 @@ def main() -> None:
 
             while (
                 pending
-                and len(prep_futures) < args.prep_workers
+                and (
+                    args.prep_placement == "joint"
+                    or len(prep_futures) < current_prep_capacity
+                )
                 and (
                     args.prep_policy == "static_isolation"
                     or len(ready) + len(prep_futures)
-                    < args.prepared_queue_depth
+                    < current_handoff_capacity
                 )
             ):
                 job = pop_pending_for_preparation()
                 if job is None:
                     break
+                if not assign_preparation_backend(job):
+                    # Keep fair ordering and do not charge service before dispatch.
+                    heapq.heappush(pending, (scheduling_key(job), job["sequence"], job))
+                    event("prep_placement_deferred", job,
+                          prep_placement_decision=job.get("prep_placement_decision"))
+                    break
                 job["prep_started_s"] = elapsed()
                 job["predicted_prep_service_s"] = predicted_prep_service_s(job)
+                if args.prep_placement == "joint":
+                    joint_allocator.reserve(job, args.decode_backend)
                 job["predicted_vlm_service_s"] = predicted_vlm_service_s(job)
                 job["predicted_solo_service_s"] = predicted_solo_service_s(job)
                 job["ttft_slo_s"] = ttft_slo_s(job)
@@ -1988,6 +2388,8 @@ def main() -> None:
                     )
                 event(
                     "prep_start", job,
+                    prep_backend=job["prep_backend"],
+                    prep_placement_decision=job.get("prep_placement_decision"),
                     pending_depth=len(pending),
                     predicted_prep_service_s=job["predicted_prep_service_s"],
                     deadline_slack_s=adaptive_key(job, elapsed())[1],
@@ -2013,9 +2415,15 @@ def main() -> None:
                         "age_aware_prep_decision", None,
                     ),
                 )
+                selected_prep_pool = (gpu_prep_pool if args.prep_placement != "fixed"
+                                      and job["prep_backend"] == args.gpu_prep_backend else prep_pool)
+                selected_codec_args = codec_args_by_backend[job["prep_backend"]]
+                if args.prep_placement == "joint" and job["prep_backend"] == args.gpu_prep_backend:
+                    selected_codec_args = SimpleNamespace(**vars(selected_codec_args))
+                    selected_codec_args.batch_decode = partial(selected_codec_args.batch_decode, parallel_workers=job["prep_gpu_lanes"])
                 prep_futures[
-                    prep_pool.submit(
-                        prepare_with_affinity, job, codec, codec_args, cpu_sets
+                    selected_prep_pool.submit(
+                        prepare_with_affinity, job, codec, selected_codec_args, cpu_sets
                     )
                 ] = job
 
@@ -2089,10 +2497,18 @@ def main() -> None:
                 if future in prep_futures:
                     job = prep_futures.pop(future)
                     job["prep_ready_s"] = elapsed()
-                    if args.prep_policy in PREPARATION_FAIR_POLICIES:
-                        observed_prep_service_s = (
-                            job["prep_ready_s"] - job["prep_started_s"]
+                    observed_prep_service_s = (
+                        job["prep_ready_s"] - job["prep_started_s"]
+                    )
+                    if (capacity_epoch is not None
+                            and (args.prep_placement != "joint"
+                                 or job.get("prep_backend") == args.decode_backend)):
+                        capacity_epoch.record_prep_completion(
+                            observed_prep_service_s
                         )
+                    if args.prep_placement == "joint":
+                        joint_allocator.reconcile(job, job["prep_ready_s"] - job["prep_started_s"], args.decode_backend)
+                    if args.prep_policy in PREPARATION_FAIR_POLICIES:
                         if args.completion_only_accounting:
                             charge_virtual_service(
                                 tenant_prep_virtual_service,
@@ -2109,7 +2525,9 @@ def main() -> None:
                     try:
                         prepared = future.result()
                         observed = float(prepared["decode_service_s"])
-                        prep_cost_profiler.observe(
+                        if args.prep_placement == "joint" and job["prep_gpu_lanes"]:
+                            lane_profilers[job["prep_gpu_lanes"]].observe(job, observed_s=observed, predicted_s=job["predicted_prep_service_s"], metadata=prepared)
+                        prep_profilers[job["prep_backend"]].observe(
                             job,
                             observed_s=observed,
                             predicted_s=job["predicted_prep_service_s"],
@@ -2145,6 +2563,10 @@ def main() -> None:
                             "correct": False,
                             "prep_queue_wait_s": job["prep_started_s"] - job["arrival_s"],
                             "prep_service_s": job["prep_ready_s"] - job["prep_started_s"],
+                        "prep_gpu_lanes": job.get("prep_gpu_lanes", 0),
+                        "prep_cpu_worker_s": job.get("prep_cpu_worker_s"),
+                        "prep_gpu_reserved_lane_s": job.get("prep_gpu_reserved_lane_s"),
+                        "joint_decision": job.get("joint_decision"),
                             "prepared_queue_wait_s": None,
                             "engine_to_first_token_s": None,
                             "end_to_end_ttft_s": None,
@@ -2232,6 +2654,8 @@ def main() -> None:
                         "video": row.get("video"),
                         "priority": job["priority"],
                         "engine_priority": response["engine_priority"],
+                        "prep_backend": job["prep_backend"],
+                        "prep_placement_decision": job.get("prep_placement_decision"),
                         "frame_count": job["frame_count"],
                         "max_tokens": job["max_tokens"],
                         "modality": job["modality"],
@@ -2251,6 +2675,10 @@ def main() -> None:
                         "completion_s": job["completion_s"],
                         "prep_queue_wait_s": job["prep_started_s"] - job["arrival_s"],
                         "prep_service_s": job["prep_ready_s"] - job["prep_started_s"],
+                        "prep_gpu_lanes": job.get("prep_gpu_lanes", 0),
+                        "prep_cpu_worker_s": job.get("prep_cpu_worker_s"),
+                        "prep_gpu_reserved_lane_s": job.get("prep_gpu_reserved_lane_s"),
+                        "joint_decision": job.get("joint_decision"),
                         "prepared_queue_wait_s": job["vlm_submit_s"] - job["prep_ready_s"],
                         "vlm_service_s": vlm_wall_s,
                         "inference_accounted_service_s": observed_vlm_service_s,
@@ -2276,6 +2704,7 @@ def main() -> None:
                         ),
                         "duration_s": prepared["duration_s"],
                         "selected_timestamps_s": prepared["timestamps"],
+                        "preparation_profile": prepared.get("preparation_profile"),
                         "prediction_label": prediction,
                         "prediction_text": response["text"],
                         "answer_label": gold,
@@ -2314,7 +2743,62 @@ def main() -> None:
         "errors": sum(row.get("error") is not None for row in completed),
         "throughput_qps": len(completed) / wall_s if wall_s else 0.0,
         "prep_workers": args.prep_workers,
+        "capacity_adaptation": args.capacity_adaptation,
+        "capacity_initial_prep_workers": (
+            args.capacity_initial_prep_workers
+            if capacity_controller is not None else args.prep_workers
+        ),
+        "capacity_final_prep_workers": current_prep_capacity,
+        "capacity_initial_handoff": (
+            args.capacity_initial_handoff
+            if capacity_controller is not None else args.prepared_queue_depth
+        ),
+        "capacity_final_handoff": current_handoff_capacity,
+        "capacity_control_interval_s": (
+            args.capacity_control_interval_s
+            if capacity_controller is not None else None
+        ),
+        "capacity_controller_configuration": (
+            {
+                "min_prep_workers": args.capacity_min_prep_workers,
+                "max_prep_workers": args.prep_workers,
+                "min_handoff": args.capacity_min_handoff,
+                "max_handoff": args.prepared_queue_depth,
+                "worker_step": args.capacity_worker_step,
+                "handoff_step": args.capacity_handoff_step,
+                "hysteresis_epochs": args.capacity_hysteresis_epochs,
+                "cooldown_epochs": args.capacity_cooldown_epochs,
+                "starvation_threshold": args.capacity_starvation_threshold,
+                "busy_threshold": args.capacity_busy_threshold,
+                "handoff_full_threshold": args.capacity_handoff_full_threshold,
+                "memory_high_watermark": args.capacity_memory_high_watermark,
+                "throughput_plateau_epsilon": (
+                    args.capacity_throughput_plateau_epsilon
+                ),
+                "latency_growth_threshold": (
+                    args.capacity_latency_growth_threshold
+                ),
+            }
+            if capacity_controller is not None else None
+        ),
+        "capacity_history": capacity_history,
         "decode_backend": args.decode_backend,
+        "prep_placement": args.prep_placement,
+        "gpu_decoder_budget": args.gpu_decoder_budget,
+        "joint_cpu_service": joint_allocator.cpu_service,
+        "joint_gpu_reserved_lane_service": joint_allocator.gpu_service,
+        "prep_total_slots": args.prep_workers + (args.gpu_prep_limit if args.prep_placement != "fixed" else 0),
+        "gpu_prep_backend": args.gpu_prep_backend if args.prep_placement != "fixed" else None,
+        "gpu_prep_limit": args.gpu_prep_limit,
+        "gpu_prep_inference_guard": args.gpu_prep_inference_guard,
+        "gpu_prep_frame_threshold": args.gpu_prep_frame_threshold,
+        "joint_conservative_routing": args.joint_conservative_routing,
+        "joint_preferred_gpu_frame_threshold": args.joint_preferred_gpu_frame_threshold,
+        "joint_switch_margin_s": args.joint_switch_margin_s,
+        "joint_switch_margin_ratio": args.joint_switch_margin_ratio,
+        "gpu_prep_fixed_cost_s": args.gpu_prep_fixed_cost_s,
+        "gpu_prep_seconds_per_frame": args.gpu_prep_seconds_per_frame,
+        "prep_backend_counts": dict(Counter(r.get("prep_backend", args.decode_backend) for r in completed)),
         "tenant_weights": tenant_weights,
         "fairness_mode": (
             "unweighted_max_min_with_age_protection"
@@ -2456,6 +2940,8 @@ def main() -> None:
                 vlm_cost_profiler.frame_estimates()
             ),
             "prep_cost_profile": prep_cost_profiler.snapshot(),
+            "prep_cost_profiles_by_backend": {backend: profiler.snapshot() for backend, profiler in prep_profilers.items()},
+            "gpu_lane_cost_profiles": {str(lanes): profiler.snapshot() for lanes, profiler in lane_profilers.items()},
             "engine_cost_profile": vlm_cost_profiler.snapshot(),
             "tenant_prep_virtual_service": tenant_prep_virtual_service,
             "tenant_vlm_virtual_service": tenant_vlm_virtual_service,

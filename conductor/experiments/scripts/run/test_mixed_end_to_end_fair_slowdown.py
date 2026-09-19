@@ -102,6 +102,35 @@ class FairSlowdownTest(unittest.TestCase):
         profiler.observe(job, observed_s=2.0, predicted_s=6.0)
         self.assertEqual(profiler.predict(job, default_s=2.0), 4.0)
 
+    def test_frame_profiler_prefers_matching_load_context(self) -> None:
+        runner = load_runner()
+        profiler = runner.OnlineStageCostProfiler(
+            stage="prep", mode="frame_ewma", backend="gpu_2", alpha=1.0,
+        )
+        idle = {
+            "frame_count": 128, "row": {},
+            "profile_context": {
+                "gpu_jobs": 0, "gpu_lanes_used": 0,
+                "inference_occupancy": "idle",
+            },
+        }
+        busy = {
+            "frame_count": 128, "row": {},
+            "profile_context": {
+                "gpu_jobs": 1, "gpu_lanes_used": 2,
+                "inference_occupancy": "below_guard",
+            },
+        }
+        profiler.observe(idle, observed_s=4.0, predicted_s=5.0)
+        profiler.observe(busy, observed_s=12.0, predicted_s=5.0)
+        self.assertEqual(profiler.predict(idle, default_s=5.0), 4.0)
+        self.assertEqual(profiler.predict(busy, default_s=5.0), 12.0)
+        unseen = dict(busy, profile_context={
+            "gpu_jobs": 1, "gpu_lanes_used": 4,
+            "inference_occupancy": "below_guard",
+        })
+        self.assertEqual(profiler.predict(unseen, default_s=5.0), 12.0)
+
     def test_metadata_profiler_falls_back_when_metadata_is_missing(self) -> None:
         runner = load_runner()
         profiler = runner.OnlineStageCostProfiler(
@@ -369,12 +398,10 @@ class FairSlowdownTest(unittest.TestCase):
                 "--tenant-weight", "b=1",
                 "--tenant-weight", "c=1",
             ]
-            with (
-                mock.patch.object(runner, "OpenAI", FakeOpenAI),
-                mock.patch.object(runner, "prepare_uniform", fake_prepare),
-                mock.patch.object(runner, "import_path", return_value=object()),
-                mock.patch.object(sys, "argv", argv),
-            ):
+            with mock.patch.object(runner, "OpenAI", FakeOpenAI), \
+                    mock.patch.object(runner, "prepare_uniform", fake_prepare), \
+                    mock.patch.object(runner, "import_path", return_value=object()), \
+                    mock.patch.object(sys, "argv", argv):
                 runner.main()
 
             results = [
@@ -458,13 +485,11 @@ class FairSlowdownTest(unittest.TestCase):
                     "--prepared-queue-depth", "4",
                     *extra,
                 ]
-                with (
-                    mock.patch.object(runner, "OpenAI", FakeOpenAI),
-                    mock.patch.object(runner, "prepare_uniform", fake_prepare),
-                    mock.patch.object(runner, "import_path", return_value=object()),
-                    mock.patch.object(sys, "argv", argv),
-                    redirect_stdout(io.StringIO()),
-                ):
+                with mock.patch.object(runner, "OpenAI", FakeOpenAI), \
+                        mock.patch.object(runner, "prepare_uniform", fake_prepare), \
+                        mock.patch.object(runner, "import_path", return_value=object()), \
+                        mock.patch.object(sys, "argv", argv), \
+                        redirect_stdout(io.StringIO()):
                     runner.main()
                 summary = json.loads((output / "summary.json").read_text())
                 self.assertEqual(summary["fairness_mode"], fairness_mode)
