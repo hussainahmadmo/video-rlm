@@ -131,3 +131,31 @@ eight, six, and one requests at widths one, two, and four. Their MAPE values wer
 16.9%, 36.7%, and 25.7%, respectively. Load-aware keys provide the intended
 fallback hierarchy, but one run does not validate prediction accuracy for each
 load context. Multi-seed, rotated-order experiments remain required.
+
+## Minimum-two-lane ablation
+
+A focused three-policy run tested whether one-lane allocation caused the full
+policy's slowdown. The bundle is
+`large_sweeps/minimum_lane_ablation_l40s_20260919/`. All policies use the same
+conservative placement rule. Placement-only FCFS fixes width at two;
+`full_conductor_min1` permits one/two/four lanes; `full_conductor_min2` permits
+two/four lanes. All 180 measured requests completed without errors.
+
+| Policy | Mean E2E (s) | Median E2E (s) | p95 E2E (s) | Throughput (req/s) |
+|---|---:|---:|---:|---:|
+| Placement-only FCFS | 27.91 | 18.75 | 80.61 | 0.602 |
+| Full Conductor, min 1 lane | 51.97 | 49.65 | 100.72 | 0.489 |
+| Full Conductor, min 2 lanes | 43.18 | 45.68 | 81.59 | 0.610 |
+
+The minimum-two-lane rule reduces full Conductor's mean by 16.9%, median by
+8.0%, and p95 by 19.0%, while increasing throughput by 24.7%. It routes 14 of
+15 large requests at two lanes and one at four lanes; the min-one control routes
+12 at one lane, two at two lanes, and one at four lanes.
+
+The width change does not close the latency gap to placement-only FCFS. Mean
+preparation-queue waiting falls from 41.36 to 33.11 seconds, but remains 15.22
+seconds above placement-only FCFS. The remaining problem is therefore fair
+request ordering and admission, rather than backend placement or one-lane width
+alone. Reserved GPU-lane shares remain similar between the two fair variants in
+the reported overlap window. This is still a one-video, one-seed, fixed-order
+diagnostic and needs order rotation before becoming a paper result.

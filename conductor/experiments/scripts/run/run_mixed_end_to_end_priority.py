@@ -1170,6 +1170,8 @@ def main() -> None:
     parser.add_argument("--gpu-decoder-budget", type=int, default=4)
     parser.add_argument("--joint-allocation-order", choices=["fair", "fcfs"], default="fair")
     parser.add_argument("--joint-fixed-lanes", type=int, default=0)
+    parser.add_argument("--joint-min-gpu-lanes", type=int, default=1,
+                        help="Minimum width considered by dynamic GPU lane allocation")
     parser.add_argument("--joint-fixed-routing", action="store_true")
     parser.add_argument("--joint-conservative-routing", action="store_true",
                         help="Use the calibrated static route unless an alternative wins by a confidence margin")
@@ -1406,7 +1408,11 @@ def main() -> None:
     if args.prep_placement == "joint":
         if args.gpu_prep_backend not in ("parallel_nvdec", "flashstyle_nvdec") or args.prep_policy not in ("fcfs", "prep_max_min", "max_min"):
             parser.error("joint allocation requires a parallel GPU decoder and fcfs, prep_max_min, or max_min")
-        if args.gpu_decoder_budget < 1 or not 0 <= args.joint_fixed_lanes <= args.gpu_decoder_budget:
+        if (args.gpu_decoder_budget < 1 or
+                not 0 <= args.joint_fixed_lanes <= args.gpu_decoder_budget or
+                not 1 <= args.joint_min_gpu_lanes <= args.gpu_decoder_budget or
+                (args.joint_fixed_lanes and
+                 args.joint_fixed_lanes < args.joint_min_gpu_lanes)):
             parser.error("invalid decoder budget or fixed lane count")
         if (not math.isfinite(args.joint_profile_light_s) or args.joint_profile_light_s < 0
                 or not 0 <= args.joint_cpu_light_reserve <= args.prep_workers
@@ -1964,7 +1970,7 @@ def main() -> None:
             return None
 
         if args.prep_placement == "joint":
-            choice = joint_allocator.choose([job for _, _, job in pending], list(prep_futures.values()), args.decode_backend, args.gpu_prep_backend, lambda job: backend_prep_estimate(job, args.decode_backend), gpu_lane_estimate, allow_gpu=len(vlm_futures) / (args.vlm_concurrency * len(ports)) < args.gpu_prep_inference_guard, order=args.joint_allocation_order, fixed_lanes=args.joint_fixed_lanes, fixed_routing=args.joint_fixed_routing, now_s=elapsed(), bypass_heavy=args.joint_bypass_heavy, profile_light_s=args.joint_profile_light_s, cpu_light_reserve=args.joint_cpu_light_reserve, light_bypass_age_s=args.joint_light_bypass_age_s, cpu_limit=current_prep_capacity, conservative_routing=args.joint_conservative_routing, preferred_gpu_frame_threshold=args.joint_preferred_gpu_frame_threshold, switch_margin_s=args.joint_switch_margin_s, switch_margin_ratio=args.joint_switch_margin_ratio)
+            choice = joint_allocator.choose([job for _, _, job in pending], list(prep_futures.values()), args.decode_backend, args.gpu_prep_backend, lambda job: backend_prep_estimate(job, args.decode_backend), gpu_lane_estimate, allow_gpu=len(vlm_futures) / (args.vlm_concurrency * len(ports)) < args.gpu_prep_inference_guard, order=args.joint_allocation_order, fixed_lanes=args.joint_fixed_lanes, fixed_routing=args.joint_fixed_routing, now_s=elapsed(), bypass_heavy=args.joint_bypass_heavy, profile_light_s=args.joint_profile_light_s, cpu_light_reserve=args.joint_cpu_light_reserve, light_bypass_age_s=args.joint_light_bypass_age_s, cpu_limit=current_prep_capacity, conservative_routing=args.joint_conservative_routing, preferred_gpu_frame_threshold=args.joint_preferred_gpu_frame_threshold, switch_margin_s=args.joint_switch_margin_s, switch_margin_ratio=args.joint_switch_margin_ratio, min_gpu_lanes=args.joint_min_gpu_lanes)
             if choice is None:
                 return None
             selected, decision = choice
@@ -2796,6 +2802,7 @@ def main() -> None:
         "joint_preferred_gpu_frame_threshold": args.joint_preferred_gpu_frame_threshold,
         "joint_switch_margin_s": args.joint_switch_margin_s,
         "joint_switch_margin_ratio": args.joint_switch_margin_ratio,
+        "joint_min_gpu_lanes": args.joint_min_gpu_lanes,
         "gpu_prep_fixed_cost_s": args.gpu_prep_fixed_cost_s,
         "gpu_prep_seconds_per_frame": args.gpu_prep_seconds_per_frame,
         "prep_backend_counts": dict(Counter(r.get("prep_backend", args.decode_backend) for r in completed)),

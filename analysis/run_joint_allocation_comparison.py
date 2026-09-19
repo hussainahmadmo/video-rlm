@@ -115,6 +115,8 @@ def main():
     parser.add_argument('--routing-ablation', action='store_true')
     parser.add_argument('--mechanism-ablation', action='store_true',
                         help='Isolate fairness, CPU/GPU placement, and GPU lane width')
+    parser.add_argument('--minimum-lane-ablation', action='store_true',
+                        help='Compare placement FCFS and fair allocation with minimum GPU widths one and two')
     parser.add_argument('--adaptive-all-frame-counts', action='store_true',
                         help='Allow adaptive policies to consider GPU preparation below the static routing threshold')
     parser.add_argument('--conservative-placement', action='store_true',
@@ -145,6 +147,7 @@ def main():
     if args.max_handoff < 8 or args.max_handoff < args.max_cpu_workers:
         parser.error('max-handoff must cover eight fixed slots and max-cpu-workers')
     if sum(map(bool, [args.routing_ablation, args.mechanism_ablation,
+                      args.minimum_lane_ablation,
                       args.profiled_light_ablation, args.integrated_ablation,
                       args.bypass_ablation])) > 1:
         parser.error('choose only one ablation')
@@ -205,6 +208,22 @@ def main():
                                 '--joint-fixed-routing']),
             ('adaptive_fcfs',['--prep-policy','fcfs','--joint-allocation-order','fcfs'] + adaptive_eligibility + conservative),
             ('full_conductor',['--prep-policy','prep_max_min'] + adaptive_eligibility + conservative)]]
+    if args.minimum_lane_ablation:
+        adaptive = [
+            '--gpu-prep-frame-threshold','1',
+            '--joint-conservative-routing',
+            '--joint-preferred-gpu-frame-threshold','32',
+            '--joint-switch-margin-s','2',
+            '--joint-switch-margin-ratio','.2',
+        ]
+        runs=[dict(variant=name,command=command(name,trace,flags)) for name,flags in [
+            ('placement_only_fcfs',['--prep-policy','fcfs',
+                                    '--joint-allocation-order','fcfs',
+                                    '--joint-fixed-lanes','2'] + adaptive),
+            ('full_conductor_min1',['--prep-policy','prep_max_min'] + adaptive),
+            ('full_conductor_min2',['--prep-policy','prep_max_min',
+                                    '--joint-min-gpu-lanes','2'] + adaptive),
+        ]]
     if args.integrated_ablation:
         online = [
             '--capacity-adaptation','online',
@@ -298,6 +317,17 @@ def main():
             (' Adaptive policies retain that calibrated route unless another option '
              'improves predicted readiness by at least two seconds and 20%.'
              if args.conservative_placement else '')
+        )
+    if args.minimum_lane_ablation:
+        manifest['description'] = (
+            f'Three-policy minimum-lane ablation on the identical 60-request trace '
+            f'with {args.cpu_workers} CPU workers, two GPU preparation jobs, four '
+            'decoder lanes, four inference slots, and handoff capacity eight. All '
+            'policies use conservative load-aware CPU/GPU placement. Placement-only '
+            'FCFS fixes GPU width at two lanes. Full Conductor min1 uses fair tenant '
+            'selection with dynamic widths one/two/four; min2 uses the same policy '
+            'but restricts dynamic widths to two/four. The comparison isolates the '
+            'effect of allowing one-lane execution in the fair allocator.'
         )
     if args.integrated_ablation:
         manifest['description'] = (

@@ -242,3 +242,19 @@ lane shares are more balanced, but the current fair width cap causes a major
 latency cost. Do not use the revised run as a full-Conductor latency win. The
 detailed comparison and profiler limits are in
 `docs/variable_frame_placement_l40s_20260919.md`.
+
+### Minimum-two-lane ablation
+
+The focused L40S comparison in
+`large_sweeps/minimum_lane_ablation_l40s_20260919/` measures the proposed width
+fix. Restricting full Conductor to two/four lanes reduces mean E2E from 51.97 to
+43.18 seconds (16.9%), median from 49.65 to 45.68 seconds (8.0%), and p95 from
+100.72 to 81.59 seconds (19.0%); throughput rises from 0.489 to 0.610 requests/s.
+The min-two policy uses two lanes for 14 of 15 large requests and four for one.
+
+Placement-only FCFS still records 27.91 seconds mean and 18.75 seconds median.
+The width restriction fixes a real inefficiency but does not explain most of the
+fair policy's latency cost. Mean preparation-queue waiting remains 33.11 seconds
+under min-two versus 17.88 under placement-only FCFS, pointing to fair selection
+and admission order as the next mechanism to isolate. Do not claim that the
+minimum-width change makes full Conductor latency-competitive from this pilot.

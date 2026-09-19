@@ -166,6 +166,16 @@ class JointTest(unittest.TestCase):
                            switch_margin_s=2,switch_margin_ratio=.2)
         self.assertIsNone(choice)
 
+    def test_minimum_gpu_lanes_excludes_one_lane_choice(self):
+        allocator=JointPreparationAllocator(2,4,2,frame_threshold=1)
+        _, decision=allocator.choose(
+            [job('a',0)], [], 'cpu', 'gpu',
+            lambda j:30, lambda j,n:{1:3,2:4,4:8}[n],
+            min_gpu_lanes=2,
+        )
+        self.assertEqual(decision['backend'],'gpu')
+        self.assertEqual(decision['lanes'],2)
+
 
 if __name__ == '__main__':
     unittest.main()

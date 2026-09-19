@@ -30,9 +30,12 @@ class JointPreparationAllocator:
                profile_light_s=0, cpu_light_reserve=0, light_bypass_age_s=5,
                cpu_limit=None, conservative_routing=False,
                preferred_gpu_frame_threshold=32, switch_margin_s=0,
-               switch_margin_ratio=0):
+               switch_margin_ratio=0, min_gpu_lanes=1):
         cpu_limit = self.cpu_capacity if cpu_limit is None else int(cpu_limit)
-        if order not in ('fair', 'fcfs') or fixed_lanes < 0 or fixed_lanes > self.gpu_capacity:
+        if (order not in ('fair', 'fcfs') or fixed_lanes < 0 or
+                fixed_lanes > self.gpu_capacity or min_gpu_lanes < 1 or
+                min_gpu_lanes > self.gpu_capacity or
+                (fixed_lanes and fixed_lanes < min_gpu_lanes)):
             raise ValueError('invalid allocation settings')
         if not 1 <= cpu_limit <= self.cpu_capacity:
             raise ValueError('CPU limit must be within configured capacity')
@@ -94,7 +97,9 @@ class JointPreparationAllocator:
                 # Fixed-lane baselines retain their width; dynamic allocation
                 # caps per-tenant concurrent reservations under contention.
                 available = self.gpu_capacity - used_lanes
-                widths = [fixed_lanes] if fixed_lanes else [n for n in (1, 2, 4) if n <= cap - held]
+                widths = ([fixed_lanes] if fixed_lanes else
+                          [n for n in (1, 2, 4)
+                           if min_gpu_lanes <= n <= cap - held])
                 for lanes in widths:
                     if 0 < lanes <= available:
                         choices.append((float(gpu_estimate(job, lanes)), gpu_backend, lanes))
@@ -103,7 +108,9 @@ class JointPreparationAllocator:
                 # ready sooner after a near-term GPU release. Retain it in
                 # the fair queue, but allow other feasible tenants to proceed.
                 if not fixed_routing and allow_gpu and heavy and not light(job) and gpu_active:
-                    future_widths = [fixed_lanes] if fixed_lanes else [n for n in (1, 2, 4) if n <= cap]
+                    future_widths = ([fixed_lanes] if fixed_lanes else
+                                     [n for n in (1, 2, 4)
+                                      if min_gpu_lanes <= n <= cap])
                     releases = sorted((max(.05, j['predicted_prep_service_s'] - (now_s-j['prep_started_s'])), j['prep_gpu_lanes'], str(j['tenant']))
                                       for j in gpu_active if 'prep_started_s' in j and 'predicted_prep_service_s' in j)
                     future_ready = float('inf')
@@ -139,7 +146,8 @@ class JointPreparationAllocator:
                         if not allow_gpu or not gpu_active:
                             continue
                         future_widths = ([fixed_lanes] if fixed_lanes else
-                                         [n for n in (1, 2, 4) if n <= cap])
+                                         [n for n in (1, 2, 4)
+                                          if min_gpu_lanes <= n <= cap])
                         releases = sorted(
                             (max(.05, j['predicted_prep_service_s'] -
                                  (now_s-j['prep_started_s'])),
@@ -212,6 +220,7 @@ class JointPreparationAllocator:
                     preferred_backend=(gpu_backend if prefers_gpu else cpu_backend),
                     switch_margin_s=switch_margin_s,
                     switch_margin_ratio=switch_margin_ratio,
+                    min_gpu_lanes=min_gpu_lanes,
                 )
         if not candidates:
             return None
