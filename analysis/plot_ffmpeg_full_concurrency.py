@@ -32,7 +32,7 @@ def main():
                          'axes.spines.top': False, 'axes.spines.right': False})
     # Keep the motivation figure legible at one-column width. Throughput shows
     # where useful parallelism ends; active latency shows the contention cost.
-    fig, axes = plt.subplots(2, 1, figsize=(3.33, 2.65), sharex=True)
+    fig, axes = plt.subplots(2, 1, figsize=(3.33, 2.30), sharex=True)
     x = list(range(len(rows))); labels = [row['workers'] for row in rows]
     metrics = [
         ('throughput_rps', 'Throughput', 'Videos completed per second'),
@@ -56,7 +56,7 @@ def main():
     axes[1].text(5.0, .77, 'Each video gets slower', transform=axes[1].get_xaxis_transform(),
                  fontsize=8, ha='center', color='#9a4700')
     axes[-1].set_xlabel('Concurrent decodes')
-    fig.subplots_adjust(top=.96, bottom=.19, left=.20, right=.97, hspace=.50)
+    fig.subplots_adjust(top=.95, bottom=.21, left=.20, right=.97, hspace=.54)
     for extension in ('png', 'pdf'):
         fig.savefig(OUT / ('ffmpeg_full_concurrency.' + extension), dpi=240,
                     bbox_inches='tight')

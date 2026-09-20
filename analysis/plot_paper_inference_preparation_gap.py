@@ -19,7 +19,7 @@ runs = load_runs([f'{gpu}={year}={ROOT}/large_sweeps/{path}' for gpu, year, path
 parts = [('prep_queue_s', 'Waiting before preparation', '#6baed6'),
          ('later_work_s', 'All later work', '#d9d9d9')]
 plt.rcParams.update({'font.size': 10.5, 'pdf.fonttype': 42, 'ps.fonttype': 42})
-fig, axes = plt.subplots(3, 1, figsize=(3.33, 3.65), sharex=True)
+fig, axes = plt.subplots(3, 1, figsize=(3.33, 3.05), sharex=True)
 rows = []
 for ax, run in zip(axes, runs):
     bottom = [0.0] * 3
@@ -46,7 +46,7 @@ axes[-1].set_xlim(0, 300)
 fig.legend(*axes[0].get_legend_handles_labels(), loc='upper center',
            bbox_to_anchor=(.5, 1), ncol=1, frameon=False, columnspacing=.8,
            handlelength=1.0, handletextpad=.4)
-fig.subplots_adjust(left=.27, right=.96, bottom=.13, top=.78, hspace=.55)
+fig.subplots_adjust(left=.27, right=.96, bottom=.15, top=.74, hspace=.50)
 OUT.mkdir(parents=True, exist_ok=True)
 for ext in ['pdf', 'png']:
     fig.savefig(OUT / f'inference_preparation_gap.{ext}', dpi=220)
