@@ -35,8 +35,8 @@ def main():
     fig, axes = plt.subplots(2, 1, figsize=(3.33, 2.65), sharex=True)
     x = list(range(len(rows))); labels = [row['workers'] for row in rows]
     metrics = [
-        ('throughput_rps', 'Videos/s', 'Videos completed per second'),
-        ('mean_decode_s', 'Seconds', 'Time to decode one video'),
+        ('throughput_rps', 'Throughput', 'Videos completed per second'),
+        ('mean_decode_s', 'Time/video', 'Time to decode one video'),
     ]
     for ax, (key, ylabel, title) in zip(axes, metrics):
         mean_key = key if key == 'child_cpu_s_per_request' else key + '_mean'
@@ -48,14 +48,14 @@ def main():
         ax.axvline(2, color='#555555', linestyle='--', linewidth=1)
         ax.set_title(title, loc='left', fontsize=10.5)
         ax.set_ylabel(ylabel)
-        ax.set_xticks(x, labels); ax.set_ylim(bottom=0); ax.grid(axis='y', alpha=.25)
-    axes[0].text(2.08, .08, '16 decodes', transform=axes[0].get_xaxis_transform(),
-                 fontsize=8, color='#444444')
+        ax.set_xticks([0, 2, 7], ['Low', '16', 'High'])
+        ax.set_yticks([])
+        ax.set_ylim(bottom=0)
     axes[0].text(4.9, .82, 'No more throughput', transform=axes[0].get_xaxis_transform(),
                  fontsize=8, ha='center', color='#9a4700')
     axes[1].text(5.0, .77, 'Each video gets slower', transform=axes[1].get_xaxis_transform(),
                  fontsize=8, ha='center', color='#9a4700')
-    axes[-1].set_xlabel('Videos decoded at once')
+    axes[-1].set_xlabel('Concurrent decodes')
     fig.subplots_adjust(top=.96, bottom=.19, left=.20, right=.97, hspace=.50)
     for extension in ('png', 'pdf'):
         fig.savefig(OUT / ('ffmpeg_full_concurrency.' + extension), dpi=240,
