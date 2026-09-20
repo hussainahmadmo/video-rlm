@@ -7,12 +7,28 @@ import math
 
 
 class JointPreparationAllocator:
-    def __init__(self, cpu_capacity, gpu_capacity, gpu_jobs, frame_threshold=32):
+    def __init__(self, cpu_capacity, gpu_capacity, gpu_jobs, frame_threshold=32,
+                 gpu_widths=None):
         if min(cpu_capacity, gpu_capacity, gpu_jobs, frame_threshold) < 1:
             raise ValueError('positive capacities required')
+        if gpu_widths is None:
+            gpu_widths = [width for width in (1, 2, 4)
+                          if width <= gpu_capacity]
+        try:
+            supplied_widths = tuple(gpu_widths)
+        except TypeError:
+            raise ValueError('GPU widths must be positive integers') from None
+        if any(isinstance(width, bool) or not isinstance(width, int)
+               for width in supplied_widths):
+            raise ValueError('GPU widths must be positive integers')
+        normalized_widths = tuple(sorted(set(supplied_widths)))
+        if (not normalized_widths or
+                any(width < 1 or width > gpu_capacity for width in normalized_widths)):
+            raise ValueError('GPU widths must be within configured lane capacity')
         self.cpu_capacity = cpu_capacity
         self.gpu_capacity = gpu_capacity
         self.gpu_jobs = gpu_jobs
+        self.gpu_widths = normalized_widths
         self.frame_threshold = frame_threshold
         self.cpu_service = {}
         self.gpu_service = {}
@@ -35,7 +51,8 @@ class JointPreparationAllocator:
         if (order not in ('fair', 'fcfs') or fixed_lanes < 0 or
                 fixed_lanes > self.gpu_capacity or min_gpu_lanes < 1 or
                 min_gpu_lanes > self.gpu_capacity or
-                (fixed_lanes and fixed_lanes < min_gpu_lanes)):
+                (fixed_lanes and fixed_lanes < min_gpu_lanes) or
+                (fixed_lanes and fixed_lanes not in self.gpu_widths)):
             raise ValueError('invalid allocation settings')
         if not 1 <= cpu_limit <= self.cpu_capacity:
             raise ValueError('CPU limit must be within configured capacity')
@@ -98,7 +115,7 @@ class JointPreparationAllocator:
                 # caps per-tenant concurrent reservations under contention.
                 available = self.gpu_capacity - used_lanes
                 widths = ([fixed_lanes] if fixed_lanes else
-                          [n for n in (1, 2, 4)
+                          [n for n in self.gpu_widths
                            if min_gpu_lanes <= n <= cap - held])
                 for lanes in widths:
                     if 0 < lanes <= available:
@@ -109,7 +126,7 @@ class JointPreparationAllocator:
                 # the fair queue, but allow other feasible tenants to proceed.
                 if not fixed_routing and allow_gpu and heavy and not light(job) and gpu_active:
                     future_widths = ([fixed_lanes] if fixed_lanes else
-                                     [n for n in (1, 2, 4)
+                                     [n for n in self.gpu_widths
                                       if min_gpu_lanes <= n <= cap])
                     releases = sorted((max(.05, j['predicted_prep_service_s'] - (now_s-j['prep_started_s'])), j['prep_gpu_lanes'], str(j['tenant']))
                                       for j in gpu_active if 'prep_started_s' in j and 'predicted_prep_service_s' in j)
@@ -146,7 +163,7 @@ class JointPreparationAllocator:
                         if not allow_gpu or not gpu_active:
                             continue
                         future_widths = ([fixed_lanes] if fixed_lanes else
-                                         [n for n in (1, 2, 4)
+                                         [n for n in self.gpu_widths
                                           if min_gpu_lanes <= n <= cap])
                         releases = sorted(
                             (max(.05, j['predicted_prep_service_s'] -

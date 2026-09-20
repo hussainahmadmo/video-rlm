@@ -1168,6 +1168,8 @@ def main() -> None:
     parser.add_argument("--gpu-prep-backend", choices=["batch_nvdec", "indexed_nvdec", "parallel_nvdec", "flashstyle_nvdec"], default="indexed_nvdec")
     parser.add_argument("--gpu-prep-limit", type=int, default=1)
     parser.add_argument("--gpu-decoder-budget", type=int, default=4)
+    parser.add_argument("--joint-gpu-widths", type=int, nargs="+",
+                        help="Configured legal GPU decoder widths; defaults to 1, 2, and 4 within the lane budget")
     parser.add_argument("--joint-allocation-order", choices=["fair", "fcfs"], default="fair")
     parser.add_argument("--joint-fixed-lanes", type=int, default=0)
     parser.add_argument("--joint-min-gpu-lanes", type=int, default=1,
@@ -1323,6 +1325,12 @@ def main() -> None:
     parser.add_argument("--decode-timeout-s", type=float, default=60.0)
     parser.add_argument("--request-timeout-s", type=float, default=1800.0)
     args = parser.parse_args()
+    if args.joint_gpu_widths is None:
+        args.joint_gpu_widths = [
+            width for width in (1, 2, 4)
+            if width <= args.gpu_decoder_budget
+        ]
+    args.joint_gpu_widths = sorted(set(args.joint_gpu_widths))
     if args.cpu_decoder_threads is not None:
         if args.cpu_decoder_threads < 1:
             parser.error("--cpu-decoder-threads must be positive")
@@ -1411,8 +1419,12 @@ def main() -> None:
         if (args.gpu_decoder_budget < 1 or
                 not 0 <= args.joint_fixed_lanes <= args.gpu_decoder_budget or
                 not 1 <= args.joint_min_gpu_lanes <= args.gpu_decoder_budget or
+                not args.joint_gpu_widths or
+                any(width < 1 or width > args.gpu_decoder_budget
+                    for width in args.joint_gpu_widths) or
                 (args.joint_fixed_lanes and
-                 args.joint_fixed_lanes < args.joint_min_gpu_lanes)):
+                 (args.joint_fixed_lanes < args.joint_min_gpu_lanes or
+                  args.joint_fixed_lanes not in args.joint_gpu_widths))):
             parser.error("invalid decoder budget or fixed lane count")
         if (not math.isfinite(args.joint_profile_light_s) or args.joint_profile_light_s < 0
                 or not 0 <= args.joint_cpu_light_reserve <= args.prep_workers
@@ -1736,8 +1748,19 @@ def main() -> None:
             alpha=args.prep_cost_ewma_alpha, min_samples=args.cost_profiler_min_samples,
         )
     joint_lane_profile = json.loads(args.joint_lane_profile.read_text()) if args.joint_lane_profile else {}
-    joint_allocator = JointPreparationAllocator(args.prep_workers, args.gpu_decoder_budget, args.gpu_prep_limit, args.gpu_prep_frame_threshold)
-    lane_profilers = {lanes: OnlineStageCostProfiler(stage="prep", mode=prep_cost_profiler_mode, backend=f"parallel_nvdec_{lanes}", alpha=args.prep_cost_ewma_alpha, min_samples=args.cost_profiler_min_samples) for lanes in (1, 2, 4)}
+    joint_allocator = JointPreparationAllocator(
+        args.prep_workers, args.gpu_decoder_budget, args.gpu_prep_limit,
+        args.gpu_prep_frame_threshold, gpu_widths=args.joint_gpu_widths,
+    )
+    lane_profilers = {
+        lanes: OnlineStageCostProfiler(
+            stage="prep", mode=prep_cost_profiler_mode,
+            backend=f"{args.gpu_prep_backend}_{lanes}",
+            alpha=args.prep_cost_ewma_alpha,
+            min_samples=args.cost_profiler_min_samples,
+        )
+        for lanes in args.joint_gpu_widths
+    }
     vlm_cost_profiler = OnlineStageCostProfiler(
         stage="engine",
         mode=engine_cost_profiler_mode,
@@ -2791,6 +2814,7 @@ def main() -> None:
         "decode_backend": args.decode_backend,
         "prep_placement": args.prep_placement,
         "gpu_decoder_budget": args.gpu_decoder_budget,
+        "joint_gpu_widths": args.joint_gpu_widths,
         "joint_cpu_service": joint_allocator.cpu_service,
         "joint_gpu_reserved_lane_service": joint_allocator.gpu_service,
         "prep_total_slots": args.prep_workers + (args.gpu_prep_limit if args.prep_placement != "fixed" else 0),

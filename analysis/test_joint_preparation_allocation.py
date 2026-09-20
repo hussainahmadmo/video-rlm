@@ -176,6 +176,23 @@ class JointTest(unittest.TestCase):
         self.assertEqual(decision['backend'],'gpu')
         self.assertEqual(decision['lanes'],2)
 
+    def test_arbitrary_cpu_capacity_and_gpu_width_set(self):
+        allocator=JointPreparationAllocator(
+            cpu_capacity=7, gpu_capacity=5, gpu_jobs=3,
+            frame_threshold=1, gpu_widths=[2,3,5],
+        )
+        _, decision=allocator.choose(
+            [job('a',0)], [], 'cpu', 'gpu',
+            lambda j:30, lambda j,n:{2:5,3:2,5:3}[n],
+        )
+        self.assertEqual(allocator.cpu_capacity,7)
+        self.assertEqual(allocator.gpu_widths,(2,3,5))
+        self.assertEqual(decision['lanes'],3)
+
+    def test_rejects_gpu_width_outside_lane_budget(self):
+        with self.assertRaises(ValueError):
+            JointPreparationAllocator(4,5,2,gpu_widths=[1,6])
+
 
 if __name__ == '__main__':
     unittest.main()

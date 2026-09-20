@@ -275,3 +275,13 @@ results are almost identical because this trace is preparation-dominated with
 equal output budgets. Treat this as a one-video, one-order mechanism result.
 Exact configuration, metrics, and validation requirements are in
 `docs/noisy_neighbor_fairness_l40s_20260919.md`.
+
+### Generalized placement configuration
+
+The joint allocator now accepts arbitrary positive CPU-worker capacity, GPU
+lane budget, GPU-job capacity, and a configured set of legal GPU widths through
+`--joint-gpu-widths`. Online profilers and startup calibration are constructed
+for that set rather than hardcoding one/two/four lanes. The evaluated L40S
+configuration remains a four-lane budget with widths 1, 2, and 4; generality is
+an implementation property, not evidence that other widths or capacities have
+been performance-tested.

@@ -13,7 +13,7 @@ from pathlib import Path
 from run_fairness_tail_pilot import ROOT, MODEL, SNAPSHOT, VIDEO, measurements
 
 
-def resource_metrics(rows, cpu_capacity=2):
+def resource_metrics(rows, cpu_capacity=2, gpu_capacity=4):
     tenants = sorted({r['tenant'] for r in rows})
     result = {t: dict(cpu_worker_s=sum(r['prep_cpu_worker_s'] for r in rows if r['tenant']==t),
                      gpu_reserved_lane_s=sum(r['prep_gpu_reserved_lane_s'] for r in rows if r['tenant']==t))
@@ -29,7 +29,8 @@ def resource_metrics(rows, cpu_capacity=2):
     for start,end in zip(times,times[1:]):
         midpoint=(start+end)/2
         active=[r for r in rows if r['prep_started_s']<=midpoint<r['prep_ready_s']]
-        if sum(r['prep_gpu_lanes'] for r in active)>4 or sum(r['prep_backend']=='seek_cpu' for r in active)>cpu_capacity:
+        if (sum(r['prep_gpu_lanes'] for r in active) > gpu_capacity or
+                sum(r['prep_backend']=='seek_cpu' for r in active) > cpu_capacity):
             raise RuntimeError('observed reservation capacity exceeded')
         both=all(any(r['tenant']==t and r['arrival_s']<=midpoint<r['prep_ready_s'] for r in rows)
                  for t in contenders) and len(contenders) > 1
@@ -128,6 +129,9 @@ def main():
     parser.add_argument('--bypass-ablation', action='store_true',
                         help='Compare optimized FCFS, tenant FIFO, and profiled within-tenant bypass')
     parser.add_argument('--gpu-backend', choices=['parallel_nvdec','flashstyle_nvdec'], default='parallel_nvdec')
+    parser.add_argument('--gpu-lane-budget', type=int, default=4)
+    parser.add_argument('--gpu-prep-jobs', type=int, default=2)
+    parser.add_argument('--gpu-widths', type=int, nargs='+', default=[1, 2, 4])
     parser.add_argument('--gpu', type=int, default=1)
     parser.add_argument('--model-snapshot', default=SNAPSHOT,
                         help='Local model snapshot passed to vLLM')
@@ -146,6 +150,24 @@ def main():
                          prompt_override='Briefly describe the video.',**{'class':'background'}))
     if args.cpu_workers < 1 or args.max_cpu_workers < args.cpu_workers:
         parser.error('positive CPU workers and max-cpu-workers >= cpu-workers required')
+    args.gpu_widths = sorted(set(args.gpu_widths))
+    if (args.gpu_lane_budget < 1 or args.gpu_prep_jobs < 1 or
+            not args.gpu_widths or
+            any(width < 1 or width > args.gpu_lane_budget
+                for width in args.gpu_widths)):
+        parser.error('GPU widths and job count must fit the positive lane budget')
+    width_text = '/'.join(str(width) for width in args.gpu_widths)
+    fixed_width = min(
+        args.gpu_widths,
+        key=lambda width: (abs(width - min(2, args.gpu_lane_budget)), width),
+    )
+    equal_slot_cpu_workers = args.cpu_workers + args.gpu_prep_jobs
+    if (args.cpu_placement_ablation and
+            args.max_cpu_workers < equal_slot_cpu_workers):
+        parser.error(
+            '--max-cpu-workers must cover CPU workers plus GPU preparation jobs '
+            'for the equal-slot CPU-only control'
+        )
     if args.max_handoff < 8 or args.max_handoff < args.max_cpu_workers:
         parser.error('max-handoff must cover eight fixed slots and max-cpu-workers')
     if sum(map(bool, [args.routing_ablation, args.mechanism_ablation,
@@ -184,11 +206,14 @@ def main():
                 '--arrival-trace',str(trace_path),'--output',str(output/name),'--port','9001','--model',MODEL,
                 '--prep-workers',str(prep_workers),'--vlm-concurrency','4','--prepared-queue-depth',str(handoff),'--urgent-prep-reserve','0',
                 '--decode-backend','seek_cpu','--cpu-decoder-threads','1','--prep-placement','joint','--gpu-prep-backend',args.gpu_backend,
-                '--gpu-prep-limit','2','--gpu-decoder-budget','4','--prep-cost-profiler','frame_ewma',
+                '--gpu-prep-limit',str(args.gpu_prep_jobs),
+                '--gpu-decoder-budget',str(args.gpu_lane_budget),
+                '--joint-gpu-widths',*[str(width) for width in args.gpu_widths],
+                '--prep-cost-profiler','frame_ewma',
                 '--joint-lane-profile',str(output/'lane_profile.json')]+flags
     runs=[dict(variant=name,command=command(name,trace,flags)) for name,flags in [
-        ('parallel_fcfs',['--prep-policy','fcfs','--joint-allocation-order','fcfs','--joint-fixed-routing','--joint-fixed-lanes','2']),
-        ('parallel_fixed_fair',['--prep-policy','prep_max_min','--joint-fixed-routing','--joint-fixed-lanes','2']),
+        ('parallel_fcfs',['--prep-policy','fcfs','--joint-allocation-order','fcfs','--joint-fixed-routing','--joint-fixed-lanes',str(fixed_width)]),
+        ('parallel_fixed_fair',['--prep-policy','prep_max_min','--joint-fixed-routing','--joint-fixed-lanes',str(fixed_width)]),
         ('adaptive_fcfs',['--prep-policy','fcfs','--joint-allocation-order','fcfs']),
         ('joint_allocator',['--prep-policy','prep_max_min'])]]
     if args.mechanism_ablation:
@@ -201,11 +226,11 @@ def main():
                         if args.conservative_placement else [])
         runs=[dict(variant=name,command=command(name,trace,flags)) for name,flags in [
             ('fixed_fcfs',['--prep-policy','fcfs','--joint-allocation-order','fcfs',
-                           '--joint-fixed-routing','--joint-fixed-lanes','2']),
+                           '--joint-fixed-routing','--joint-fixed-lanes',str(fixed_width)]),
             ('fixed_fair',['--prep-policy','prep_max_min',
-                           '--joint-fixed-routing','--joint-fixed-lanes','2']),
+                           '--joint-fixed-routing','--joint-fixed-lanes',str(fixed_width)]),
             ('placement_only_fcfs',['--prep-policy','fcfs','--joint-allocation-order','fcfs',
-                                    '--joint-fixed-lanes','2'] + adaptive_eligibility + conservative),
+                                    '--joint-fixed-lanes',str(fixed_width)] + adaptive_eligibility + conservative),
             ('width_only_fcfs',['--prep-policy','fcfs','--joint-allocation-order','fcfs',
                                 '--joint-fixed-routing']),
             ('adaptive_fcfs',['--prep-policy','fcfs','--joint-allocation-order','fcfs'] + adaptive_eligibility + conservative),
@@ -221,7 +246,7 @@ def main():
         runs=[dict(variant=name,command=command(name,trace,flags)) for name,flags in [
             ('placement_only_fcfs',['--prep-policy','fcfs',
                                     '--joint-allocation-order','fcfs',
-                                    '--joint-fixed-lanes','2'] + adaptive),
+                                    '--joint-fixed-lanes',str(fixed_width)] + adaptive),
             ('full_conductor_min1',['--prep-policy','prep_max_min'] + adaptive),
             ('full_conductor_min2',['--prep-policy','prep_max_min',
                                     '--joint-min-gpu-lanes','2'] + adaptive),
@@ -229,30 +254,30 @@ def main():
     if args.cpu_placement_ablation:
         adaptive = [
             '--gpu-prep-frame-threshold','1',
-            '--joint-fixed-lanes','2',
+            '--joint-fixed-lanes',str(fixed_width),
             '--joint-conservative-routing',
             '--joint-preferred-gpu-frame-threshold','32',
             '--joint-switch-margin-s','2',
             '--joint-switch-margin-ratio','.2',
         ]
         runs = [
-            dict(variant='cpu_only_4', command=command(
-                'cpu_only_4', trace,
+            dict(variant='cpu_only_same_pool', command=command(
+                'cpu_only_same_pool', trace,
                 ['--prep-policy','fcfs','--prep-placement','fixed'],
-                prep_workers=4)),
-            dict(variant='cpu_only_6', command=command(
-                'cpu_only_6', trace,
+                prep_workers=args.cpu_workers)),
+            dict(variant='cpu_only_equal_slots', command=command(
+                'cpu_only_equal_slots', trace,
                 ['--prep-policy','fcfs','--prep-placement','fixed'],
-                prep_workers=6)),
+                prep_workers=equal_slot_cpu_workers)),
             dict(variant='static_split_fcfs', command=command(
                 'static_split_fcfs', trace,
                 ['--prep-policy','fcfs','--joint-allocation-order','fcfs',
-                 '--joint-fixed-routing','--joint-fixed-lanes','2'],
-                prep_workers=4)),
+                 '--joint-fixed-routing','--joint-fixed-lanes',str(fixed_width)],
+                prep_workers=args.cpu_workers)),
             dict(variant='adaptive_placement_fcfs', command=command(
                 'adaptive_placement_fcfs', trace,
                 ['--prep-policy','fcfs','--joint-allocation-order','fcfs'] + adaptive,
-                prep_workers=4)),
+                prep_workers=args.cpu_workers)),
         ]
     if args.integrated_ablation:
         online = [
@@ -265,11 +290,11 @@ def main():
             dict(variant='fixed_fcfs', command=command(
                 'fixed_fcfs', trace,
                 ['--prep-policy','fcfs','--joint-allocation-order','fcfs',
-                 '--joint-fixed-routing','--joint-fixed-lanes','2'])),
+                 '--joint-fixed-routing','--joint-fixed-lanes',str(fixed_width)])),
             dict(variant='fixed_conductor', command=command(
                 'fixed_conductor', trace,
                 ['--prep-policy','max_min','--joint-allocation-order','fair',
-                 '--joint-fixed-routing','--joint-fixed-lanes','2'])),
+                 '--joint-fixed-routing','--joint-fixed-lanes',str(fixed_width)])),
             dict(variant='optimized_fcfs', command=command(
                 'optimized_fcfs', trace,
                 ['--prep-policy','fcfs','--joint-allocation-order','fcfs'] + online,
@@ -317,10 +342,10 @@ def main():
     gpu_name = gpu_query.stdout.strip() if gpu_query.returncode == 0 else 'GPU model unavailable'
     frame_mix=', '.join(f'{n}x{sum(int(r["frame_count"]) == n for r in rows)}' for n in frame_counts)
     interleaved = args.arrival_trace or args.variable_frame_workload
-    (output/'manifest.json').write_text(json.dumps(dict(runs=runs,requests_per_policy=60,tenants=tenant_names,frame_counts=frame_counts,cpu_workers=args.cpu_workers,description=f'{gpu_name} physical GPU {args.gpu}, Qwen2.5-VL-7B; 60 requests per policy with frame-count mix {frame_mix}. ' + ('Interleaved requests; every tenant receives the recorded mix. ' if interleaved else 'Staged tenant arrivals. ') + f'{args.cpu_workers} CPU workers, two GPU preparation job slots, four GPU decoder lanes, four inference slots, FCFS inference admission and handoff capacity eight. Identical video, sampling, prompt, 32-token budget, trace and GOP-parallel NVDEC backend across all policies. Fixed placement routes requests below 32 frames to CPU and requests at or above 32 frames to GPU with two lanes. Adaptive policies choose CPU/GPU and one/two/four lanes. Fair policies use tenant service accounts; adaptive FCFS has no tenant lane-share cap. The same inference occupancy guard applies to all policies.'),indent=2)+'\n')
+    (output/'manifest.json').write_text(json.dumps(dict(runs=runs,requests_per_policy=60,tenants=tenant_names,frame_counts=frame_counts,cpu_workers=args.cpu_workers,gpu_lane_budget=args.gpu_lane_budget,gpu_widths=args.gpu_widths,description=f'{gpu_name} physical GPU {args.gpu}, Qwen2.5-VL-7B; 60 requests per policy with frame-count mix {frame_mix}. ' + ('Interleaved requests; every tenant receives the recorded mix. ' if interleaved else 'Staged tenant arrivals. ') + f'{args.cpu_workers} CPU workers, {args.gpu_prep_jobs} GPU preparation job slots, {args.gpu_lane_budget} GPU decoder lanes with configured widths {width_text}, four inference slots, FCFS inference admission and handoff capacity eight. Identical video, sampling, prompt, 32-token budget, trace and GOP-parallel NVDEC backend across all policies. Fixed placement routes requests below 32 frames to CPU and requests at or above 32 frames to GPU with {fixed_width} lanes. Adaptive policies choose CPU/GPU and a configured GPU width. Fair policies use tenant service accounts; adaptive FCFS has no tenant lane-share cap. The same inference occupancy guard applies to all policies.'),indent=2)+'\n')
     if args.routing_ablation:
         manifest=json.loads((output/'manifest.json').read_text())
-        manifest['description']=f'Four-policy routing/bypass ablation on the identical 60-request mixed trace; {args.cpu_workers} CPU workers, two GPU preparation job slots, four GPU decoder lanes, four inference slots, FCFS inference admission and handoff eight. All variants retain tenant service fairness and adaptive one/two/four GPU lanes. Original joint permits heavy CPU preparation and one candidate per tenant. Bypass-only considers the oldest light and heavy request per tenant. Routing-only sends few-frame requests to CPU and GPU-eligible requests (32+ frames) exclusively to GPU. Corrected joint combines strict routing and bypass. Same video, sampling, prompt and output budget across variants.'
+        manifest['description']=f'Four-policy routing/bypass ablation on the identical 60-request mixed trace; {args.cpu_workers} CPU workers, {args.gpu_prep_jobs} GPU preparation job slots, {args.gpu_lane_budget} GPU decoder lanes with configured widths {width_text}, four inference slots, FCFS inference admission and handoff eight. All variants retain tenant service fairness and adaptive GPU width. Original joint permits heavy CPU preparation and one candidate per tenant. Bypass-only considers the oldest light and heavy request per tenant. Routing-only sends few-frame requests to CPU and GPU-eligible requests (32+ frames) exclusively to GPU. Corrected joint combines strict routing and bypass. Same video, sampling, prompt and output budget across variants.'
         (output/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
     manifest=json.loads((output/'manifest.json').read_text())
     manifest['gpu_backend']=args.gpu_backend
@@ -335,11 +360,12 @@ def main():
     if args.mechanism_ablation:
         manifest['description']=(
             f'Six-policy mechanism ablation on the identical 60-request trace with '
-            f'{args.cpu_workers} CPU workers, two GPU preparation jobs, four decoder '
-            'lanes, four inference slots, and handoff capacity eight. Fixed FCFS is '
+            f'{args.cpu_workers} CPU workers, {args.gpu_prep_jobs} GPU preparation jobs, '
+            f'{args.gpu_lane_budget} decoder lanes with widths {width_text}, four inference '
+            'slots, and handoff capacity eight. Fixed FCFS is '
             'the reference. Fixed fair changes only tenant selection; placement-only '
-            'changes CPU/GPU placement with width fixed at two lanes; width-only keeps '
-            'fixed CPU-small/GPU-heavy routing but chooses one/two/four lanes; adaptive '
+            f'changes CPU/GPU placement with width fixed at {fixed_width} lanes; width-only keeps '
+            f'fixed CPU-small/GPU-heavy routing but chooses among widths {width_text}; adaptive '
             'FCFS changes placement and width without fairness; full Conductor combines '
             'adaptive placement/width with tenant service accounting.' +
             (' Adaptive policies consider both backends for every frame count; fixed '
@@ -351,23 +377,25 @@ def main():
     if args.minimum_lane_ablation:
         manifest['description'] = (
             f'Three-policy minimum-lane ablation on the identical 60-request trace '
-            f'with {args.cpu_workers} CPU workers, two GPU preparation jobs, four '
-            'decoder lanes, four inference slots, and handoff capacity eight. All '
+            f'with {args.cpu_workers} CPU workers, {args.gpu_prep_jobs} GPU preparation jobs, '
+            f'{args.gpu_lane_budget} decoder lanes with widths {width_text}, four '
+            'inference slots, and handoff capacity eight. All '
             'policies use conservative load-aware CPU/GPU placement. Placement-only '
-            'FCFS fixes GPU width at two lanes. Full Conductor min1 uses fair tenant '
-            'selection with dynamic widths one/two/four; min2 uses the same policy '
-            'but restricts dynamic widths to two/four. The comparison isolates the '
+            f'FCFS fixes GPU width at {fixed_width} lanes. Full Conductor min1 uses fair tenant '
+            f'selection with dynamic widths {width_text}; min2 uses the same policy '
+            'but restricts dynamic widths to configured choices of at least two lanes. '
+            'The comparison isolates the '
             'effect of allowing one-lane execution in the fair allocator.'
         )
     if args.cpu_placement_ablation:
         manifest['description'] = (
             'Four-policy CPU/GPU placement ablation on the identical variable-frame '
-            'trace. CPU-only-4 has the same four CPU workers as mixed placement and '
-            'does not use GPU decoding. CPU-only-6 is a stronger control with six CPU '
-            'workers, matching the mixed policies\' total count of four CPU and two GPU '
+            f'trace. CPU-only-same-pool has the same {args.cpu_workers} CPU workers as mixed placement and '
+            f'does not use GPU decoding. CPU-only-equal-slots is a stronger control with {equal_slot_cpu_workers} CPU '
+            f'workers, matching the mixed policies\' total count of {args.cpu_workers} CPU and {args.gpu_prep_jobs} GPU '
             'preparation slots. Static split sends requests below 32 frames to CPU and '
-            '128-frame requests to two GPU lanes. Adaptive placement uses the same '
-            'four CPU and two GPU slots and the same two-lane width, but may change the '
+            f'128-frame requests to {fixed_width} GPU lanes. Adaptive placement uses the same '
+            f'four CPU and {args.gpu_prep_jobs} GPU slots and the same {fixed_width}-lane width, but may change the '
             'backend only when predicted readiness improves by at least two seconds '
             'and 20%. All variants use FCFS request and inference admission. This '
             'isolates backend placement from tenant fairness and dynamic lane width.'
@@ -379,7 +407,7 @@ def main():
             'routing, and two GPU decoder lanes. Optimized policies start from the '
             f'same CPU/handoff configuration and may adapt up to {args.max_cpu_workers} '
             f'CPU workers and handoff {args.max_handoff}; they also select CPU/GPU '
-            'placement and one/two/four decoder lanes. FCFS variants use arrival order. '
+            f'placement and configured decoder widths {width_text}. FCFS variants use arrival order. '
             'Conductor variants use separate preparation and inference tenant-service '
             'accounts; preparation placement additionally uses CPU worker-second and '
             'reserved GPU lane-second accounts. GPU job and lane limits remain two and '
@@ -390,7 +418,7 @@ def main():
             f'Profile-guided within-tenant bypass ablation on {gpu_name}. All '
             f'policies use a fixed capacity of {args.max_cpu_workers} CPU workers '
             f'and handoff {args.max_handoff}, and use identical profiled CPU/GPU '
-            'placement and one/two/four-lane selection. Optimized FCFS uses '
+            f'placement and configured width selection ({width_text}). Optimized FCFS uses '
             'arrival order. Conductor FIFO first selects the tenant with least '
             'accounted service and then its oldest request. Conductor bypass '
             'retains tenant-first selection but permits requests with predicted '
@@ -440,7 +468,8 @@ def main():
         gpu_calibration_frames = (calibration_frames if args.adaptive_all_frame_counts else
                                   [n for n in calibration_frames if n >= 32])
         calibration_options = ([(n, 0) for n in calibration_frames] +
-                               [(n, w) for n in gpu_calibration_frames for w in [1, 2, 4]])
+                               [(n, w) for n in gpu_calibration_frames
+                                for w in args.gpu_widths])
         for frame_count,width in calibration_options:
             calibration.write_text(json.dumps(dict(rows[0],arrival_s=0,frame_count=frame_count))+'\n')
             profile.setdefault(str(frame_count),{})
@@ -468,7 +497,8 @@ def main():
             summary=json.loads((output/name/'summary.json').read_text())
             raw=[json.loads(l) for l in (output/name/'results.jsonl').read_text().splitlines() if l.strip()]
             if summary['errors'] or len(raw)!=60 or {r['request_id'] for r in raw}!={r['request_id'] for r in rows}:raise RuntimeError('failed or missing requests')
-            resources=resource_metrics(raw,summary['prep_workers'])
+            resources=resource_metrics(
+                raw, summary['prep_workers'], summary['gpu_decoder_budget'])
             results.append(dict(variant=name,started_epoch_s=started,finished_epoch_s=time.time(),
                                 all=measurements(raw),tenants={t:measurements([r for r in raw if r['tenant']==t]) for t in tenant_names},
                                 sizes={f'{n}_frames':measurements([r for r in raw if r['frame_count']==n]) for n in frame_counts},
@@ -480,7 +510,8 @@ def main():
                                 capacity_final_handoff=summary.get('capacity_final_handoff'),
                                 capacity_history=summary.get('capacity_history', []),
                                 prep_backend_counts=summary.get('prep_backend_counts', {}),
-                                lane_counts={str(n):sum(r['prep_gpu_lanes']==n for r in raw) for n in [0,1,2,4]}))
+                                lane_counts={str(n):sum(r['prep_gpu_lanes']==n for r in raw)
+                                             for n in [0, *args.gpu_widths]}))
             report(output,results)
         (output/'status.json').write_text(json.dumps(dict(active=None,completed=len(results),total=len(runs)))+'\n')
         (output/'COMPLETE').write_text(f'All {len(runs)} comparison runs completed without errors.\n')
