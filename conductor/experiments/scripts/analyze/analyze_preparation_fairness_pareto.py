@@ -99,7 +99,7 @@ def policy_key(policy: str) -> tuple[int, float]:
         return (1, math.inf)
     if not policy.startswith("fair_slack_"):
         raise ValueError(f"unexpected policy {policy}")
-    return (0, float(policy.removeprefix("fair_slack_").replace("p", ".")))
+    return (0, float(policy[len("fair_slack_"):].replace("p", ".")))
 
 
 def discover(roots: list[Path]) -> list[dict]:
@@ -110,7 +110,8 @@ def discover(roots: list[Path]) -> list[dict]:
             policy = results_path.parent.name
             try:
                 policy_key(policy)
-                seed = int(results_path.parent.parent.name.removeprefix("seed"))
+                seed_name = results_path.parent.parent.name
+                seed = int(seed_name[4:] if seed_name.startswith("seed") else seed_name)
             except ValueError:
                 continue
             identity = (seed, policy)
