@@ -117,6 +117,8 @@ def main():
                         help='Isolate fairness, CPU/GPU placement, and GPU lane width')
     parser.add_argument('--minimum-lane-ablation', action='store_true',
                         help='Compare placement FCFS and fair allocation with minimum GPU widths one and two')
+    parser.add_argument('--cpu-placement-ablation', action='store_true',
+                        help='Compare CPU-only preparation with static and adaptive CPU/GPU placement')
     parser.add_argument('--adaptive-all-frame-counts', action='store_true',
                         help='Allow adaptive policies to consider GPU preparation below the static routing threshold')
     parser.add_argument('--conservative-placement', action='store_true',
@@ -147,7 +149,7 @@ def main():
     if args.max_handoff < 8 or args.max_handoff < args.max_cpu_workers:
         parser.error('max-handoff must cover eight fixed slots and max-cpu-workers')
     if sum(map(bool, [args.routing_ablation, args.mechanism_ablation,
-                      args.minimum_lane_ablation,
+                      args.minimum_lane_ablation, args.cpu_placement_ablation,
                       args.profiled_light_ablation, args.integrated_ablation,
                       args.bypass_ablation])) > 1:
         parser.error('choose only one ablation')
@@ -224,6 +226,34 @@ def main():
             ('full_conductor_min2',['--prep-policy','prep_max_min',
                                     '--joint-min-gpu-lanes','2'] + adaptive),
         ]]
+    if args.cpu_placement_ablation:
+        adaptive = [
+            '--gpu-prep-frame-threshold','1',
+            '--joint-fixed-lanes','2',
+            '--joint-conservative-routing',
+            '--joint-preferred-gpu-frame-threshold','32',
+            '--joint-switch-margin-s','2',
+            '--joint-switch-margin-ratio','.2',
+        ]
+        runs = [
+            dict(variant='cpu_only_4', command=command(
+                'cpu_only_4', trace,
+                ['--prep-policy','fcfs','--prep-placement','fixed'],
+                prep_workers=4)),
+            dict(variant='cpu_only_6', command=command(
+                'cpu_only_6', trace,
+                ['--prep-policy','fcfs','--prep-placement','fixed'],
+                prep_workers=6)),
+            dict(variant='static_split_fcfs', command=command(
+                'static_split_fcfs', trace,
+                ['--prep-policy','fcfs','--joint-allocation-order','fcfs',
+                 '--joint-fixed-routing','--joint-fixed-lanes','2'],
+                prep_workers=4)),
+            dict(variant='adaptive_placement_fcfs', command=command(
+                'adaptive_placement_fcfs', trace,
+                ['--prep-policy','fcfs','--joint-allocation-order','fcfs'] + adaptive,
+                prep_workers=4)),
+        ]
     if args.integrated_ablation:
         online = [
             '--capacity-adaptation','online',
@@ -328,6 +358,19 @@ def main():
             'selection with dynamic widths one/two/four; min2 uses the same policy '
             'but restricts dynamic widths to two/four. The comparison isolates the '
             'effect of allowing one-lane execution in the fair allocator.'
+        )
+    if args.cpu_placement_ablation:
+        manifest['description'] = (
+            'Four-policy CPU/GPU placement ablation on the identical variable-frame '
+            'trace. CPU-only-4 has the same four CPU workers as mixed placement and '
+            'does not use GPU decoding. CPU-only-6 is a stronger control with six CPU '
+            'workers, matching the mixed policies\' total count of four CPU and two GPU '
+            'preparation slots. Static split sends requests below 32 frames to CPU and '
+            '128-frame requests to two GPU lanes. Adaptive placement uses the same '
+            'four CPU and two GPU slots and the same two-lane width, but may change the '
+            'backend only when predicted readiness improves by at least two seconds '
+            'and 20%. All variants use FCFS request and inference admission. This '
+            'isolates backend placement from tenant fairness and dynamic lane width.'
         )
     if args.integrated_ablation:
         manifest['description'] = (
