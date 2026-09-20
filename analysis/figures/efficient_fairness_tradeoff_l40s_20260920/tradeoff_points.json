@@ -1,0 +1,38 @@
+[
+  {
+    "variant": "static_fcfs",
+    "throughput_qps": 0.26849742997434556,
+    "worst_light_p95_ratio": 1.0,
+    "tenant_p95_ratios": {
+      "b": 1.0,
+      "c": 1.0
+    }
+  },
+  {
+    "variant": "adaptive_fcfs",
+    "throughput_qps": 0.25621719765701667,
+    "worst_light_p95_ratio": 0.9401071845415695,
+    "tenant_p95_ratios": {
+      "b": 0.5451772288185304,
+      "c": 0.9401071845415695
+    }
+  },
+  {
+    "variant": "current_full_conductor",
+    "throughput_qps": 0.25550247268400944,
+    "worst_light_p95_ratio": 0.7959998807692923,
+    "tenant_p95_ratios": {
+      "b": 0.42665102562812085,
+      "c": 0.7959998807692923
+    }
+  },
+  {
+    "variant": "efficient_full_conductor",
+    "throughput_qps": 0.2579244429730265,
+    "worst_light_p95_ratio": 0.8063138052371117,
+    "tenant_p95_ratios": {
+      "b": 0.44416988176762,
+      "c": 0.8063138052371117
+    }
+  }
+]
