@@ -32,6 +32,8 @@ class JointPreparationAllocator:
         self.frame_threshold = frame_threshold
         self.cpu_service = {}
         self.gpu_service = {}
+        self.active_tenants = set()
+        self.service_frontier = 0.0
 
     def score(self, tenant):
         return max(self.cpu_service.get(tenant, 0) / self.cpu_capacity,
@@ -40,13 +42,39 @@ class JointPreparationAllocator:
     def gpu_eligible(self, job):
         return job['modality'] == 'video' and job['frame_count'] >= self.frame_threshold
 
+    def update_active_tenants(self, jobs, active, initialize_frontier=False):
+        """Track preparation demand and optionally initialize entering tenants.
+
+        The frontier is virtual normalized service used only for scheduling.  It
+        does not change the observed per-request resource accounting emitted by
+        the runner.
+        """
+        current = {str(job['tenant']) for job in list(jobs) + list(active)}
+        if initialize_frontier:
+            continuing = current & self.active_tenants
+            if continuing:
+                self.service_frontier = max(
+                    self.service_frontier,
+                    min(self.score(tenant) for tenant in continuing),
+                )
+            for tenant in current - self.active_tenants:
+                self.cpu_service[tenant] = self.service_frontier * self.cpu_capacity
+                self.gpu_service[tenant] = self.service_frontier * self.gpu_capacity
+            if current:
+                self.service_frontier = max(
+                    self.service_frontier,
+                    min(self.score(tenant) for tenant in current),
+                )
+        self.active_tenants = current
+
     def choose(self, jobs, active, cpu_backend, gpu_backend, cpu_estimate,
                gpu_estimate, allow_gpu=True, order='fair', fixed_lanes=0,
                fixed_routing=False, now_s=0, bypass_heavy=False,
                profile_light_s=0, cpu_light_reserve=0, light_bypass_age_s=5,
                cpu_limit=None, conservative_routing=False,
                preferred_gpu_frame_threshold=32, switch_margin_s=0,
-               switch_margin_ratio=0, min_gpu_lanes=1):
+               switch_margin_ratio=0, min_gpu_lanes=1,
+               fairness_slack_s=0, initialize_active_frontier=False):
         cpu_limit = self.cpu_capacity if cpu_limit is None else int(cpu_limit)
         if (order not in ('fair', 'fcfs') or fixed_lanes < 0 or
                 fixed_lanes > self.gpu_capacity or min_gpu_lanes < 1 or
@@ -64,8 +92,13 @@ class JointPreparationAllocator:
         if (preferred_gpu_frame_threshold < 1
                 or not math.isfinite(switch_margin_s) or switch_margin_s < 0
                 or not math.isfinite(switch_margin_ratio)
-                or not 0 <= switch_margin_ratio < 1):
+                or not 0 <= switch_margin_ratio < 1
+                or not math.isfinite(fairness_slack_s)
+                or fairness_slack_s < 0):
             raise ValueError('invalid conservative-routing settings')
+        self.update_active_tenants(
+            jobs, active, initialize_frontier=initialize_active_frontier,
+        )
         cpu_costs = {}
         if profile_light_s:
             for job in list(jobs) + list(active):
@@ -238,9 +271,27 @@ class JointPreparationAllocator:
                     switch_margin_s=switch_margin_s,
                     switch_margin_ratio=switch_margin_ratio,
                     min_gpu_lanes=min_gpu_lanes,
+                    fairness_slack_s=fairness_slack_s,
+                    service_frontier=self.service_frontier,
                 )
         if not candidates:
             return None
+        if order == 'fair' and fairness_slack_s:
+            minimum_score = min(item[2]['tenant_score'] for item in candidates)
+            candidates = [
+                item for item in candidates
+                if item[2]['tenant_score'] <= minimum_score + fairness_slack_s
+            ]
+            # Fairness defines the eligible tenant set.  Within that bounded
+            # set, prefer the work predicted to release its resource first.
+            _, job, decision = min(
+                candidates,
+                key=lambda item: (
+                    item[2]['predicted_service_s'], item[1]['sequence'],
+                ),
+            )
+            decision['minimum_tenant_score'] = minimum_score
+            return job, decision
         _, job, decision = min(candidates, key=lambda item: item[0])
         return job, decision
 

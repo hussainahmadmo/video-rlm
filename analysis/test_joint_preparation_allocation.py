@@ -176,6 +176,46 @@ class JointTest(unittest.TestCase):
         self.assertEqual(decision['backend'],'gpu')
         self.assertEqual(decision['lanes'],2)
 
+    def test_minimum_two_lanes_still_borrows_four_when_uncontended(self):
+        _, decision = self.choose([job('a', 0)], min_gpu_lanes=2)
+        self.assertEqual(decision['lanes'], 4)
+        _, decision = self.choose(
+            [job('a', 0), job('b', 1)], min_gpu_lanes=2,
+        )
+        self.assertEqual(decision['lanes'], 2)
+
+    def test_fairness_slack_prefers_shorter_feasible_work(self):
+        self.allocator.cpu_service['fast'] = 4
+        jobs = [job('slow', 0), job('fast', 1, 1)]
+        selected, _ = self.allocator.choose(
+            jobs, [], 'cpu', 'gpu',
+            lambda j: 20 if j['tenant'] == 'slow' else 1,
+            lambda j, n: 30,
+            allow_gpu=False, fairness_slack_s=3,
+        )
+        self.assertEqual(selected['tenant'], 'fast')
+        selected, _ = self.allocator.choose(
+            jobs, [], 'cpu', 'gpu',
+            lambda j: 20 if j['tenant'] == 'slow' else 1,
+            lambda j, n: 30,
+            allow_gpu=False, fairness_slack_s=1,
+        )
+        self.assertEqual(selected['tenant'], 'slow')
+
+    def test_reactivated_tenant_starts_at_active_service_frontier(self):
+        self.allocator.update_active_tenants(
+            [job('a', 0)], [], initialize_frontier=True,
+        )
+        self.allocator.cpu_service.update(a=20, returning=100)
+        self.allocator.update_active_tenants(
+            [job('a', 0)], [], initialize_frontier=True,
+        )
+        self.allocator.update_active_tenants([], [], initialize_frontier=True)
+        self.allocator.update_active_tenants(
+            [job('returning', 1)], [], initialize_frontier=True,
+        )
+        self.assertEqual(self.allocator.score('returning'), 10)
+
     def test_arbitrary_cpu_capacity_and_gpu_width_set(self):
         allocator=JointPreparationAllocator(
             cpu_capacity=7, gpu_capacity=5, gpu_jobs=3,

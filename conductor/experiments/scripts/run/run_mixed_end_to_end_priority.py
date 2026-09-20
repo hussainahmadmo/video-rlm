@@ -1174,6 +1174,10 @@ def main() -> None:
     parser.add_argument("--joint-fixed-lanes", type=int, default=0)
     parser.add_argument("--joint-min-gpu-lanes", type=int, default=1,
                         help="Minimum width considered by dynamic GPU lane allocation")
+    parser.add_argument("--joint-fairness-slack-s", type=float, default=0,
+                        help="Normalized-service window for readiness selection among nearly equal tenants")
+    parser.add_argument("--joint-active-frontier", action="store_true",
+                        help="Initialize tenants entering preparation at the active virtual-service frontier")
     parser.add_argument("--joint-fixed-routing", action="store_true")
     parser.add_argument("--joint-conservative-routing", action="store_true",
                         help="Use the calibrated static route unless an alternative wins by a confidence margin")
@@ -1434,7 +1438,9 @@ def main() -> None:
                 or not math.isfinite(args.joint_switch_margin_s)
                 or args.joint_switch_margin_s < 0
                 or not math.isfinite(args.joint_switch_margin_ratio)
-                or not 0 <= args.joint_switch_margin_ratio < 1):
+                or not 0 <= args.joint_switch_margin_ratio < 1
+                or not math.isfinite(args.joint_fairness_slack_s)
+                or args.joint_fairness_slack_s < 0):
             parser.error("invalid profiled-light threshold, CPU reserve or bypass age")
     elif args.joint_profile_light_s or args.joint_cpu_light_reserve:
         parser.error("profiled-light selection requires --prep-placement joint")
@@ -1993,7 +1999,7 @@ def main() -> None:
             return None
 
         if args.prep_placement == "joint":
-            choice = joint_allocator.choose([job for _, _, job in pending], list(prep_futures.values()), args.decode_backend, args.gpu_prep_backend, lambda job: backend_prep_estimate(job, args.decode_backend), gpu_lane_estimate, allow_gpu=len(vlm_futures) / (args.vlm_concurrency * len(ports)) < args.gpu_prep_inference_guard, order=args.joint_allocation_order, fixed_lanes=args.joint_fixed_lanes, fixed_routing=args.joint_fixed_routing, now_s=elapsed(), bypass_heavy=args.joint_bypass_heavy, profile_light_s=args.joint_profile_light_s, cpu_light_reserve=args.joint_cpu_light_reserve, light_bypass_age_s=args.joint_light_bypass_age_s, cpu_limit=current_prep_capacity, conservative_routing=args.joint_conservative_routing, preferred_gpu_frame_threshold=args.joint_preferred_gpu_frame_threshold, switch_margin_s=args.joint_switch_margin_s, switch_margin_ratio=args.joint_switch_margin_ratio, min_gpu_lanes=args.joint_min_gpu_lanes)
+            choice = joint_allocator.choose([job for _, _, job in pending], list(prep_futures.values()), args.decode_backend, args.gpu_prep_backend, lambda job: backend_prep_estimate(job, args.decode_backend), gpu_lane_estimate, allow_gpu=len(vlm_futures) / (args.vlm_concurrency * len(ports)) < args.gpu_prep_inference_guard, order=args.joint_allocation_order, fixed_lanes=args.joint_fixed_lanes, fixed_routing=args.joint_fixed_routing, now_s=elapsed(), bypass_heavy=args.joint_bypass_heavy, profile_light_s=args.joint_profile_light_s, cpu_light_reserve=args.joint_cpu_light_reserve, light_bypass_age_s=args.joint_light_bypass_age_s, cpu_limit=current_prep_capacity, conservative_routing=args.joint_conservative_routing, preferred_gpu_frame_threshold=args.joint_preferred_gpu_frame_threshold, switch_margin_s=args.joint_switch_margin_s, switch_margin_ratio=args.joint_switch_margin_ratio, min_gpu_lanes=args.joint_min_gpu_lanes, fairness_slack_s=args.joint_fairness_slack_s, initialize_active_frontier=args.joint_active_frontier)
             if choice is None:
                 return None
             selected, decision = choice
@@ -2371,6 +2377,13 @@ def main() -> None:
                     pending, (scheduling_key(job), job["sequence"], job)
                 )
                 event("arrival", job, pending_depth=len(pending))
+
+            if args.prep_placement == "joint":
+                joint_allocator.update_active_tenants(
+                    [job for _, _, job in pending],
+                    list(prep_futures.values()),
+                    initialize_frontier=args.joint_active_frontier,
+                )
 
             while (
                 pending
@@ -2827,6 +2840,9 @@ def main() -> None:
         "joint_switch_margin_s": args.joint_switch_margin_s,
         "joint_switch_margin_ratio": args.joint_switch_margin_ratio,
         "joint_min_gpu_lanes": args.joint_min_gpu_lanes,
+        "joint_fairness_slack_s": args.joint_fairness_slack_s,
+        "joint_active_frontier": args.joint_active_frontier,
+        "joint_service_frontier": joint_allocator.service_frontier,
         "gpu_prep_fixed_cost_s": args.gpu_prep_fixed_cost_s,
         "gpu_prep_seconds_per_frame": args.gpu_prep_seconds_per_frame,
         "prep_backend_counts": dict(Counter(r.get("prep_backend", args.decode_backend) for r in completed)),

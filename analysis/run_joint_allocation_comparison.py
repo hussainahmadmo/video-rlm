@@ -130,6 +130,8 @@ def main():
                         help='Isolate fairness, CPU/GPU placement, and GPU lane width')
     parser.add_argument('--minimum-lane-ablation', action='store_true',
                         help='Compare placement FCFS and fair allocation with minimum GPU widths one and two')
+    parser.add_argument('--efficient-fair-ablation', action='store_true',
+                        help='Compare static/adaptive FCFS, current fairness, and bounded-lag efficient fairness')
     parser.add_argument('--cpu-placement-ablation', action='store_true',
                         help='Compare CPU-only preparation with static and adaptive CPU/GPU placement')
     parser.add_argument('--adaptive-all-frame-counts', action='store_true',
@@ -183,7 +185,8 @@ def main():
     if args.max_handoff < 8 or args.max_handoff < args.max_cpu_workers:
         parser.error('max-handoff must cover eight fixed slots and max-cpu-workers')
     if sum(map(bool, [args.routing_ablation, args.mechanism_ablation,
-                      args.minimum_lane_ablation, args.cpu_placement_ablation,
+                      args.minimum_lane_ablation, args.efficient_fair_ablation,
+                      args.cpu_placement_ablation,
                       args.profiled_light_ablation, args.integrated_ablation,
                       args.bypass_ablation])) > 1:
         parser.error('choose only one ablation')
@@ -262,6 +265,25 @@ def main():
             ('full_conductor_min1',['--prep-policy','prep_max_min'] + adaptive),
             ('full_conductor_min2',['--prep-policy','prep_max_min',
                                     '--joint-min-gpu-lanes','2'] + adaptive),
+        ]]
+    if args.efficient_fair_ablation:
+        adaptive = [
+            '--gpu-prep-frame-threshold','1',
+            '--joint-conservative-routing',
+            '--joint-preferred-gpu-frame-threshold','32',
+            '--joint-switch-margin-s','2',
+            '--joint-switch-margin-ratio','.2',
+        ]
+        runs=[dict(variant=name,command=command(name,trace,flags)) for name,flags in [
+            ('static_fcfs',['--prep-policy','fcfs','--joint-allocation-order','fcfs',
+                            '--joint-fixed-routing','--joint-fixed-lanes',str(fixed_width)]),
+            ('adaptive_fcfs',['--prep-policy','fcfs','--joint-allocation-order','fcfs',
+                              '--joint-min-gpu-lanes','2'] + adaptive),
+            ('current_full_conductor',['--prep-policy','prep_max_min'] + adaptive),
+            ('efficient_full_conductor',['--prep-policy','prep_max_min',
+                                         '--joint-min-gpu-lanes','2',
+                                         '--joint-fairness-slack-s','5',
+                                         '--joint-active-frontier'] + adaptive),
         ]]
     if args.cpu_placement_ablation:
         adaptive = [
@@ -398,6 +420,20 @@ def main():
             'but restricts dynamic widths to configured choices of at least two lanes. '
             'The comparison isolates the '
             'effect of allowing one-lane execution in the fair allocator.'
+        )
+    if args.efficient_fair_ablation:
+        manifest['description'] = (
+            f'Four-policy bounded-lag fairness comparison on an identical 60-request '
+            f'trace with {args.cpu_workers} CPU workers, {args.gpu_prep_jobs} GPU jobs, '
+            f'{args.gpu_lane_budget} decoder lanes with widths {width_text}, four inference '
+            'slots, and handoff capacity eight. Static FCFS uses calibrated fixed routing '
+            f'and {fixed_width} lanes. Adaptive FCFS uses conservative load-aware placement, '
+            'a minimum width of two, and no tenant fairness. Current Full Conductor permits '
+            'one-lane execution and strict least-service selection. Efficient Full Conductor '
+            'uses a two-lane minimum, work-conserving borrowing, active-frontier initialization, '
+            'and a five-second normalized-service window in which predicted completion time '
+            'breaks tenant-ordering ties. The five-second value is fixed before these runs and '
+            'is not tuned on their results.'
         )
     if args.cpu_placement_ablation:
         manifest['description'] = (
