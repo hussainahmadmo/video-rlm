@@ -15,8 +15,20 @@ from run_fairness_tail_pilot import ROOT, MODEL, SNAPSHOT, VIDEO, measurements
 
 def resource_metrics(rows, cpu_capacity=2, gpu_capacity=4):
     tenants = sorted({r['tenant'] for r in rows})
-    result = {t: dict(cpu_worker_s=sum(r['prep_cpu_worker_s'] for r in rows if r['tenant']==t),
-                     gpu_reserved_lane_s=sum(r['prep_gpu_reserved_lane_s'] for r in rows if r['tenant']==t))
+    def cpu_service(row):
+        recorded = row.get('prep_cpu_worker_s')
+        if recorded is not None:
+            return recorded
+        return row['prep_service_s'] if row.get('prep_backend') == 'seek_cpu' else 0.0
+
+    def gpu_service(row):
+        recorded = row.get('prep_gpu_reserved_lane_s')
+        if recorded is not None:
+            return recorded
+        return row['prep_service_s'] * (row.get('prep_gpu_lanes') or 0)
+
+    result = {t: dict(cpu_worker_s=sum(cpu_service(r) for r in rows if r['tenant']==t),
+                     gpu_reserved_lane_s=sum(gpu_service(r) for r in rows if r['tenant']==t))
               for t in tenants}
     for key in ['cpu_worker_s', 'gpu_reserved_lane_s']:
         total = sum(v[key] for v in result.values())
@@ -29,7 +41,7 @@ def resource_metrics(rows, cpu_capacity=2, gpu_capacity=4):
     for start,end in zip(times,times[1:]):
         midpoint=(start+end)/2
         active=[r for r in rows if r['prep_started_s']<=midpoint<r['prep_ready_s']]
-        if (sum(r['prep_gpu_lanes'] for r in active) > gpu_capacity or
+        if (sum(r.get('prep_gpu_lanes') or 0 for r in active) > gpu_capacity or
                 sum(r['prep_backend']=='seek_cpu' for r in active) > cpu_capacity):
             raise RuntimeError('observed reservation capacity exceeded')
         both=all(any(r['tenant']==t and r['arrival_s']<=midpoint<r['prep_ready_s'] for r in rows)
@@ -37,7 +49,7 @@ def resource_metrics(rows, cpu_capacity=2, gpu_capacity=4):
         if both:
             common_duration+=end-start
             for r in active:
-                common[r['tenant']]+=(end-start)*r['prep_gpu_lanes']
+                common[r['tenant']]+=(end-start)*(r.get('prep_gpu_lanes') or 0)
     total=sum(common.values())
     return dict(tenants=result, joint_heavy_backlog_window_s=common_duration,
                 gpu_service_during_joint_heavy_backlog=common,
