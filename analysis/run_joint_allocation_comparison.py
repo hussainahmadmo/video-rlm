@@ -283,7 +283,8 @@ def main():
             ('efficient_full_conductor',['--prep-policy','prep_max_min',
                                          '--joint-min-gpu-lanes','2',
                                          '--joint-fairness-slack-s','5',
-                                         '--joint-active-frontier'] + adaptive),
+                                         '--joint-active-frontier',
+                                         '--joint-fair-work-conserving-borrow'] + adaptive),
         ]]
     if args.cpu_placement_ablation:
         adaptive = [

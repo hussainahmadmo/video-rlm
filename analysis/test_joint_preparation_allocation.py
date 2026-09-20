@@ -184,6 +184,27 @@ class JointTest(unittest.TestCase):
         )
         self.assertEqual(decision['lanes'], 2)
 
+    def test_fair_borrowing_uses_all_lanes_for_a_least_served_tenant(self):
+        self.allocator.gpu_service['a'] = 8
+        selected, decision = self.choose(
+            [job('a', 0), job('b', 1)], min_gpu_lanes=2,
+            fair_work_conserving_borrow=True,
+        )
+        self.assertEqual(selected['tenant'], 'b')
+        self.assertEqual(decision['lanes'], 4)
+
+    def test_fair_borrowing_caps_an_ahead_tenant_selected_with_slack(self):
+        self.allocator.gpu_service['a'] = 4
+        selected, decision = self.allocator.choose(
+            [job('a', 0), job('b', 1)], [], 'cpu', 'gpu',
+            lambda j: 30,
+            lambda j, n: (1 if j['tenant'] == 'a' else 20) / n,
+            min_gpu_lanes=2, fairness_slack_s=2,
+            fair_work_conserving_borrow=True,
+        )
+        self.assertEqual(selected['tenant'], 'a')
+        self.assertEqual(decision['lanes'], 2)
+
     def test_fairness_slack_prefers_shorter_feasible_work(self):
         self.allocator.cpu_service['fast'] = 4
         jobs = [job('slow', 0), job('fast', 1, 1)]

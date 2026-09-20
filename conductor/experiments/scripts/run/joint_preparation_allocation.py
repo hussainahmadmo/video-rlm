@@ -74,7 +74,8 @@ class JointPreparationAllocator:
                cpu_limit=None, conservative_routing=False,
                preferred_gpu_frame_threshold=32, switch_margin_s=0,
                switch_margin_ratio=0, min_gpu_lanes=1,
-               fairness_slack_s=0, initialize_active_frontier=False):
+               fairness_slack_s=0, initialize_active_frontier=False,
+               fair_work_conserving_borrow=False):
         cpu_limit = self.cpu_capacity if cpu_limit is None else int(cpu_limit)
         if (order not in ('fair', 'fcfs') or fixed_lanes < 0 or
                 fixed_lanes > self.gpu_capacity or min_gpu_lanes < 1 or
@@ -123,10 +124,24 @@ class JointPreparationAllocator:
         available = self.gpu_capacity - used_lanes
         if used_lanes > self.gpu_capacity or cpu_used > self.cpu_capacity:
             raise RuntimeError('preparation allocation exceeds capacity')
-        gpu_tenants = {str(job['tenant']) for job in jobs if self.gpu_eligible(job) and not light(job)}
+        def preferred_gpu_demand(job):
+            return (self.gpu_eligible(job) and not light(job) and
+                    (not conservative_routing or
+                     job['frame_count'] >= preferred_gpu_frame_threshold))
+        gpu_tenants = {str(job['tenant']) for job in jobs
+                       if preferred_gpu_demand(job)}
         gpu_tenants.update(str(job['tenant']) for job in gpu_active)
-        cap = (math.ceil(self.gpu_capacity / max(1, len(gpu_tenants)))
-               if order == 'fair' else self.gpu_capacity)
+        fair_share_cap = (math.ceil(self.gpu_capacity / max(1, len(gpu_tenants)))
+                          if order == 'fair' else self.gpu_capacity)
+        def tenant_cap(tenant):
+            if order != 'fair' or not fair_work_conserving_borrow:
+                return fair_share_cap
+            tenant_score = self.score(tenant)
+            another_is_behind = any(
+                other != tenant and self.score(other) < tenant_score - 1e-9
+                for other in gpu_tenants
+            )
+            return fair_share_cap if another_is_behind else self.gpu_capacity
         candidates = []
         # FCFS chooses the oldest feasible request. A saturated GPU lane does
         # not deliberately prevent CPU-routed work from using a free CPU slot.
@@ -134,6 +149,7 @@ class JointPreparationAllocator:
                       else list(oldest.values()))
         for job in considered:
             tenant = str(job['tenant'])
+            cap = tenant_cap(tenant)
             heavy = self.gpu_eligible(job)
             prefers_gpu = (job['modality'] == 'video' and
                            job['frame_count'] >= preferred_gpu_frame_threshold)
@@ -273,6 +289,7 @@ class JointPreparationAllocator:
                     min_gpu_lanes=min_gpu_lanes,
                     fairness_slack_s=fairness_slack_s,
                     service_frontier=self.service_frontier,
+                    fair_work_conserving_borrow=fair_work_conserving_borrow,
                 )
         if not candidates:
             return None
