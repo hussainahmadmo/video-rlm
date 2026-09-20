@@ -1,6 +1,7 @@
 """Same-decoder comparison of FCFS, fixed-width fairness and joint allocation."""
 import argparse
 import json
+import math
 import os
 import random
 import signal
@@ -132,6 +133,11 @@ def main():
                         help='Compare placement FCFS and fair allocation with minimum GPU widths one and two')
     parser.add_argument('--efficient-fair-ablation', action='store_true',
                         help='Compare static/adaptive FCFS, current fairness, and bounded-lag efficient fairness')
+    parser.add_argument('--fairness-slack-ablation', action='store_true',
+                        help='Sweep bounded preparation-service slack with identical adaptive placement')
+    parser.add_argument('--fairness-slacks', type=float, nargs='+',
+                        default=[0, 1, 2, 5, 10, 20],
+                        help='Nonnegative normalized-service slack values in seconds')
     parser.add_argument('--cpu-placement-ablation', action='store_true',
                         help='Compare CPU-only preparation with static and adaptive CPU/GPU placement')
     parser.add_argument('--adaptive-all-frame-counts', action='store_true',
@@ -149,6 +155,8 @@ def main():
     parser.add_argument('--gpu', type=int, default=1)
     parser.add_argument('--model-snapshot', default=SNAPSHOT,
                         help='Local model snapshot passed to vLLM')
+    parser.add_argument('--policy-order-rotation', type=int, default=0,
+                        help='Rotate measured policy order by this many positions')
     parser.add_argument('--profiled-light-ablation', action='store_true')
     parser.add_argument('--max-cpu-workers', type=int, default=8)
     parser.add_argument('--max-handoff', type=int, default=16)
@@ -186,10 +194,15 @@ def main():
         parser.error('max-handoff must cover eight fixed slots and max-cpu-workers')
     if sum(map(bool, [args.routing_ablation, args.mechanism_ablation,
                       args.minimum_lane_ablation, args.efficient_fair_ablation,
+                      args.fairness_slack_ablation,
                       args.cpu_placement_ablation,
                       args.profiled_light_ablation, args.integrated_ablation,
                       args.bypass_ablation])) > 1:
         parser.error('choose only one ablation')
+    if (not args.fairness_slacks or
+            any(not math.isfinite(value) or value < 0
+                for value in args.fairness_slacks)):
+        parser.error('--fairness-slacks must contain finite nonnegative values')
     if args.arrival_trace and args.variable_frame_workload:
         parser.error('choose --arrival-trace or --variable-frame-workload')
     if args.variable_frame_workload:
@@ -286,6 +299,35 @@ def main():
                                          '--joint-active-frontier',
                                          '--joint-fair-work-conserving-borrow'] + adaptive),
         ]]
+    if args.fairness_slack_ablation:
+        adaptive = [
+            '--gpu-prep-frame-threshold','1',
+            '--joint-conservative-routing',
+            '--joint-preferred-gpu-frame-threshold','32',
+            '--joint-switch-margin-s','2',
+            '--joint-switch-margin-ratio','.2',
+            '--joint-min-gpu-lanes','2',
+        ]
+        unique_slacks = sorted(set(float(value) for value in args.fairness_slacks))
+        policies = [
+            ('adaptive_fcfs', [
+                '--prep-policy','fcfs',
+                '--joint-allocation-order','fcfs',
+            ] + adaptive),
+        ]
+        for slack in unique_slacks:
+            label = str(slack).replace('.', 'p')
+            if label.endswith('p0'):
+                label = label[:-2]
+            policies.append((f'fair_slack_{label}', [
+                '--prep-policy','prep_max_min',
+                '--joint-allocation-order','fair',
+                '--joint-fairness-slack-s',str(slack),
+                '--joint-active-frontier',
+                '--joint-fair-work-conserving-borrow',
+            ] + adaptive))
+        runs = [dict(variant=name, command=command(name, trace, flags))
+                for name, flags in policies]
     if args.cpu_placement_ablation:
         adaptive = [
             '--gpu-prep-frame-threshold','1',
@@ -370,6 +412,9 @@ def main():
         runs=[dict(variant=name,command=command(name,trace,['--prep-policy','prep_max_min']+flags)) for name,flags in [
             ('original_joint',[]),
             ('profiled_light_joint',['--joint-profile-light-s','1','--joint-cpu-light-reserve','1','--joint-light-bypass-age-s','5'])]]
+    if runs:
+        rotation = args.policy_order_rotation % len(runs)
+        runs = runs[rotation:] + runs[:rotation]
     gpu_query = subprocess.run(
         ['nvidia-smi', f'--id={args.gpu}', '--query-gpu=name', '--format=csv,noheader'],
         capture_output=True, text=True,
@@ -436,19 +481,38 @@ def main():
             'breaks tenant-ordering ties. The five-second value is fixed before these runs and '
             'is not tuned on their results.'
         )
+    if args.fairness_slack_ablation:
+        slack_text = ', '.join(str(value) for value in sorted(set(args.fairness_slacks)))
+        manifest['description'] = (
+            f'Preparation fairness--efficiency sweep on an identical 60-request '
+            f'noisy-neighbor trace with {args.cpu_workers} CPU workers, '
+            f'{args.gpu_prep_jobs} GPU preparation jobs, {args.gpu_lane_budget} '
+            f'decoder lanes with widths {width_text}, four inference slots, and '
+            'handoff capacity eight. Every policy uses the same conservative '
+            'load-aware CPU/GPU placement and a minimum GPU width of two. Adaptive '
+            'FCFS provides the efficiency endpoint without tenant service ordering. '
+            'Fair policies use preparation-only service accounting, active-frontier '
+            'initialization, and work-conserving lane borrowing while sweeping '
+            f'normalized-service slack in seconds over [{slack_text}]. A zero slack '
+            'strictly prioritizes the least-served tenant; larger values permit '
+            'readiness-based selection among tenants within the service window. '
+            'Inference admission remains FCFS to isolate preparation allocation.'
+        )
     if args.cpu_placement_ablation:
         manifest['description'] = (
-            'Four-policy CPU/GPU placement ablation on the identical variable-frame '
-            f'trace. CPU-only-same-pool has the same {args.cpu_workers} CPU workers as mixed placement and '
+            'Four-policy CPU/GPU placement ablation on the identical request trace. '
+            f'CPU-only-same-pool has the same {args.cpu_workers} CPU workers as mixed placement and '
             f'does not use GPU decoding. CPU-only-equal-slots is a stronger control with {equal_slot_cpu_workers} CPU '
             f'workers, matching the mixed policies\' total count of {args.cpu_workers} CPU and {args.gpu_prep_jobs} GPU '
             'preparation slots. Static split sends requests below 32 frames to CPU and '
-            f'128-frame requests to {fixed_width} GPU lanes. Adaptive placement uses the same '
+            f'requests at or above 32 frames to {fixed_width} GPU lanes. Adaptive placement uses the same '
             f'four CPU and {args.gpu_prep_jobs} GPU slots and the same {fixed_width}-lane width, but may change the '
             'backend only when predicted readiness improves by at least two seconds '
             'and 20%. All variants use FCFS request and inference admission. This '
             'isolates backend placement from tenant fairness and dynamic lane width.'
         )
+    manifest['policy_order_rotation'] = args.policy_order_rotation
+    manifest['measured_policy_order'] = [run['variant'] for run in runs]
     if args.integrated_ablation:
         manifest['description'] = (
             f'Integrated four-policy comparison on {gpu_name}. Fixed policies use '
