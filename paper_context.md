@@ -285,3 +285,26 @@ for that set rather than hardcoding one/two/four lanes. The evaluated L40S
 configuration remains a four-lane budget with widths 1, 2, and 4; generality is
 an implementation property, not evidence that other widths or capacities have
 been performance-tested.
+
+## 2026-09-20 repeated L40S CPU/GPU placement result
+
+The three-seed comparison in
+`large_sweeps/cpu_placement_multiseed_l40s_20260920/` isolates preparation
+placement under FCFS selection and inference admission. Each run contains 60
+requests split evenly across three tenants, with 15 one-frame, 30 16-frame, and
+15 128-frame requests. Policy order rotates, calibration is repeated per seed,
+and the experiment is pinned to CPUs 0--7 on the L40S GPU's NUMA node.
+
+Relative to the six-worker equal-slot CPU-only baseline, adaptive CPU/GPU
+placement reduces median and p95 end-to-end latency by 44.1% and 26.5% and
+increases throughput by 31.5%, averaging paired per-seed ratios. Static placement
+reduces median and p95 by 44.2% and 27.4% and increases throughput by 37.1%.
+Both policies route every one-/16-frame request to CPU and every 128-frame
+request to GPU, so this result supports heterogeneous preparation placement but
+does not establish an adaptive-routing advantage. Exact results and limitations
+are in `docs/cpu_gpu_placement_l40s_multiseed_20260920.md`.
+
+The experiment ran in the pod exposed on port 40526 and completed. A separate
+placement-rate sweep remains assigned to the port-32002 pod. The pods use
+different L40S GPUs and NUMA nodes on the same physical host; this is resource
+separation rather than independent-host replication.
