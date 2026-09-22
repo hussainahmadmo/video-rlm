@@ -10,9 +10,9 @@ CPUSET=${CPUSET:-0-7}
 OUT_ROOT=${OUT_ROOT:-/workspace/results/azure_peak_segments_$(date -u +%Y%m%d_%H%M%S)}
 LAUNCHER=$ROOT/scripts/runpod/run_end_to_end_components_l40s.sh
 
-forward="full_fcfs full_tenant_round_robin full_prep_sjf full_prep_sjf_aging full_conductor_strict_fifo"
-reverse="full_conductor_strict_fifo full_prep_sjf_aging full_prep_sjf full_tenant_round_robin full_fcfs"
-rotate="full_prep_sjf full_conductor_strict_fifo full_fcfs full_prep_sjf_aging full_tenant_round_robin"
+forward="full_fcfs full_prep_sjf full_prep_sjf_aging"
+reverse="full_prep_sjf_aging full_prep_sjf full_fcfs"
+rotate="full_prep_sjf full_fcfs full_prep_sjf_aging"
 orders=("$forward" "$reverse" "$rotate")
 
 for required in "$PY" "$LANE_PROFILE" "$LAUNCHER" "$TRACE_ROOT/manifest.json"; do
@@ -26,7 +26,7 @@ mkdir -p "$OUT_ROOT"
   echo "placement=joint_predicted_readiness"
   echo "capacity=fixed"
   echo "profile=piecewise_linear_from_1_16_128_calibration"
-  echo "policies=fcfs tenant_round_robin prep_sjf prep_sjf_aging conductor_strict_fifo"
+  echo "policies=fcfs prep_sjf prep_sjf_aging"
   echo "started=$(date -u +%FT%TZ)"
 } >"$OUT_ROOT/manifest.txt"
 

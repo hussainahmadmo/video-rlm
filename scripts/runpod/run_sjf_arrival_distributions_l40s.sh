@@ -14,6 +14,7 @@ CPUSET=${CPUSET:-0-7}
 RATE=${RATE:-1.0}
 SCV=${SCV:-4.0}
 REQUESTS_PER_TENANT=${REQUESTS_PER_TENANT:-42}
+POLICY_MODE=${POLICY_MODE:-sjf}
 OUT_ROOT=${OUT_ROOT:-/workspace/results/sjf_arrival_distributions_$(date -u +%Y%m%d_%H%M%S)}
 GENERATOR=$ROOT/analysis/make_sjf_arrival_distribution_traces.py
 LAUNCHER=$ROOT/scripts/runpod/run_end_to_end_components_l40s.sh
@@ -26,9 +27,21 @@ for required in "$PY" "$VIDEO" "$LANE_PROFILE" "$GENERATOR" "$LAUNCHER"; do
   test -e "$required" || { echo "missing: $required" >&2; exit 2; }
 done
 
-forward="full_fcfs full_tenant_round_robin full_prep_sjf full_prep_sjf_aging full_conductor_strict_fifo"
-reverse="full_conductor_strict_fifo full_prep_sjf_aging full_prep_sjf full_tenant_round_robin full_fcfs"
-rotate="full_prep_sjf full_conductor_strict_fifo full_fcfs full_prep_sjf_aging full_tenant_round_robin"
+case "$POLICY_MODE" in
+  sjf)
+    forward="full_fcfs full_prep_sjf full_prep_sjf_aging"
+    reverse="full_prep_sjf_aging full_prep_sjf full_fcfs"
+    rotate="full_prep_sjf full_fcfs full_prep_sjf_aging"
+    policies="fcfs prep_sjf prep_sjf_aging"
+    ;;
+  all)
+    forward="full_fcfs full_tenant_round_robin full_prep_sjf full_prep_sjf_aging full_conductor_strict_fifo"
+    reverse="full_conductor_strict_fifo full_prep_sjf_aging full_prep_sjf full_tenant_round_robin full_fcfs"
+    rotate="full_prep_sjf full_conductor_strict_fifo full_fcfs full_prep_sjf_aging full_tenant_round_robin"
+    policies="fcfs tenant_round_robin prep_sjf prep_sjf_aging conductor_strict_fifo"
+    ;;
+  *) echo "unknown POLICY_MODE: $POLICY_MODE" >&2; exit 2 ;;
+esac
 
 mkdir -p "$OUT_ROOT"/{traces,logs}
 {
@@ -39,7 +52,7 @@ mkdir -p "$OUT_ROOT"/{traces,logs}
   echo "frame_counts=1 16 128"
   echo "placement=joint_predicted_readiness"
   echo "capacity=fixed"
-  echo "policies=fcfs tenant_round_robin prep_sjf prep_sjf_aging conductor_strict_fifo"
+  echo "policies=$policies"
   echo "jobs=$*"
   echo "started=$(date -u +%FT%TZ)"
 } >"$OUT_ROOT/manifest.txt"
