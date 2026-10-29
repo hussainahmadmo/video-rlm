@@ -1,0 +1,22 @@
+[
+  {
+    "path": "conductor/experiments/scripts/run/joint_preparation_allocation.py",
+    "source_commit": "8155f557ce9b55929b8e10a7eac544385f3f3548",
+    "sha256": "b5033bbcd815088f205b14c4a0118033ab4c2103b23c26c6d50212b6c495f626"
+  },
+  {
+    "path": "analysis/test_joint_preparation_allocation.py",
+    "source_commit": "8155f557ce9b55929b8e10a7eac544385f3f3548",
+    "sha256": "1a2b2c664dc8ec1747805d7ac6e6827c35018361b7d7c7b21229b89b669edfe4"
+  },
+  {
+    "path": "docs/joint_preparation_allocation.md",
+    "source_commit": "8155f557ce9b55929b8e10a7eac544385f3f3548",
+    "sha256": "d668bcb361cbe697c43e17663bcd4332ead3b80f69489ff367a6ab3ea1b65631"
+  },
+  {
+    "path": "docs/cpu_gpu_placement_l40s_multiseed_20260920.md",
+    "source_commit": "8155f557ce9b55929b8e10a7eac544385f3f3548",
+    "sha256": "a01bed1fc49707e79cf6a81b03368070ece9212e0710bf16366ea563c965c440"
+  }
+]

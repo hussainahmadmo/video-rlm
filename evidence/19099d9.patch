@@ -1,0 +1,1060 @@
+From 19099d94469d39aaa8b433783f3c76a2877f945f Mon Sep 17 00:00:00 2001
+From: Hussain Ahmad Mohammad <hussainahmad@heart.cs.uchicago.edu>
+Date: Sat, 15 Aug 2026 23:56:01 -0500
+Subject: [PATCH] Add learned resource-aware config selector
+
+---
+ .../build/build_config_selection_labels.py    | 242 ++++++++++
+ .../build/build_resource_aware_schedule.py    |  55 ++-
+ .../run/run_resource_aware_fixed_policy.sh    |   5 +
+ .../scripts/train/train_config_selector.py    | 188 ++++++++
+ conductor/profiler/resource_aware_selector.py | 451 ++++++++++++++++++
+ 5 files changed, 935 insertions(+), 6 deletions(-)
+ create mode 100644 conductor/experiments/scripts/build/build_config_selection_labels.py
+ create mode 100644 conductor/experiments/scripts/train/train_config_selector.py
+ create mode 100644 conductor/profiler/resource_aware_selector.py
+
+diff --git a/conductor/experiments/scripts/build/build_config_selection_labels.py b/conductor/experiments/scripts/build/build_config_selection_labels.py
+new file mode 100644
+index 0000000..483d536
+--- /dev/null
++++ b/conductor/experiments/scripts/build/build_config_selection_labels.py
+@@ -0,0 +1,242 @@
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from collections import defaultdict
++from pathlib import Path
++from typing import Any
++
++ROOT = Path(__file__).resolve().parents[4]
++if str(ROOT) not in sys.path:
++    sys.path.insert(0, str(ROOT))
++
++from conductor.profiler.resource_aware_selector import TIER_ORDER, tier_index
++
++
++def load_jsonl_path(path: Path) -> list[dict[str, Any]]:
++    rows = []
++    with path.open() as handle:
++        for line in handle:
++            if line.strip():
++                rows.append(json.loads(line))
++    return rows
++
++
++def load_result_rows(path: Path) -> list[dict[str, Any]]:
++    if path.is_file():
++        return load_jsonl_path(path)
++
++    rows = []
++    files = sorted(path.glob("results*.jsonl"))
++    if not files:
++        files = sorted(path.glob("*.jsonl"))
++    for file in files:
++        rows.extend(load_jsonl_path(file))
++    return rows
++
++
++def write_jsonl(rows: list[dict[str, Any]], path: Path) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open("w") as handle:
++        for row in rows:
++            handle.write(json.dumps(row) + "\n")
++
++
++def qid(row: dict[str, Any]) -> str:
++    return str(row.get("qid") or row.get("question_id") or row.get("id"))
++
++
++def config_name(row: dict[str, Any]) -> str:
++    return str(
++        row.get("config_name")
++        or row.get("chosen_config")
++        or row.get("config")
++        or row.get("name")
++        or ""
++    )
++
++
++def latency_s(row: dict[str, Any]) -> float:
++    for key in (
++        "latency_s",
++        "wall_latency_s",
++        "execution_latency_s",
++        "agent_internal_latency_s",
++    ):
++        if row.get(key) is not None:
++            try:
++                return float(row[key])
++            except (TypeError, ValueError):
++                pass
++    return 0.0
++
++
++def is_correct(row: dict[str, Any]) -> bool:
++    for key in ("correct", "is_correct", "final_correct"):
++        if key in row:
++            return bool(row[key])
++
++    pred = str(
++        row.get("prediction")
++        or row.get("prediction_label")
++        or row.get("final_answer")
++        or row.get("answer")
++        or ""
++    ).strip().upper()
++    gold = str(
++        row.get("gold")
++        or row.get("answer_label")
++        or row.get("label")
++        or ""
++    ).strip().upper()
++    return bool(pred and gold and pred[0] == gold[0])
++
++
++def row_for_training(
++    source: dict[str, Any],
++    *,
++    label_config: str,
++    oracle_correct: bool,
++    cheapest_correct_config: str | None,
++    fastest_config: str | None,
++    num_correct_configs: int,
++) -> dict[str, Any]:
++    return {
++        "dataset": source.get("dataset"),
++        "qid": qid(source),
++        "video_id": source.get("video_id"),
++        "duration_s": source.get("duration_s"),
++        "duration_bucket": source.get("duration_bucket"),
++        "question": source.get("question"),
++        "choices": source.get("choices"),
++        "answer_idx": source.get("answer_idx"),
++        "answer_label": source.get("answer_label"),
++        "answer": source.get("answer"),
++        "question_category": source.get("question_category"),
++        "topic_category": source.get("topic_category"),
++        "vimio_profile": source.get("vimio_profile"),
++        "label_config": label_config,
++        "oracle_correct": oracle_correct,
++        "cheapest_correct_config": cheapest_correct_config,
++        "fastest_config": fastest_config,
++        "num_correct_configs": num_correct_configs,
++    }
++
++
++def choose_label(
++    rows: list[dict[str, Any]],
++    *,
++    fallback: str,
++) -> tuple[str, bool, str | None, str | None, int]:
++    tier_rows = [
++        row
++        for row in rows
++        if config_name(row) in TIER_ORDER
++    ]
++    if not tier_rows:
++        raise ValueError(
++            "no rows use supported selector configs: "
++            + ", ".join(TIER_ORDER)
++        )
++
++    correct_rows = [
++        row
++        for row in tier_rows
++        if is_correct(row)
++    ]
++    fastest = min(
++        tier_rows,
++        key=lambda row: (latency_s(row), tier_index(config_name(row))),
++    )
++    fastest_name = config_name(fastest)
++
++    if correct_rows:
++        chosen = min(
++            correct_rows,
++            key=lambda row: (
++                tier_index(config_name(row)),
++                latency_s(row),
++            ),
++        )
++        chosen_name = config_name(chosen)
++        return (
++            chosen_name,
++            True,
++            chosen_name,
++            fastest_name,
++            len({config_name(row) for row in correct_rows}),
++        )
++
++    if fallback == "fastest":
++        return fastest_name, False, None, fastest_name, 0
++    if fallback in TIER_ORDER:
++        return fallback, False, None, fastest_name, 0
++    raise ValueError(f"unsupported fallback: {fallback}")
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--fixed-results", required=True)
++    parser.add_argument("--output", required=True)
++    parser.add_argument(
++        "--fallback",
++        default="scan0.0039_k8_budget32",
++        help=(
++            "Label to use when no supported config is correct. "
++            "Use a tier name or 'fastest'."
++        ),
++    )
++    parser.add_argument(
++        "--only-oracle-correct",
++        action="store_true",
++        help="Write only questions where at least one supported config was correct.",
++    )
++    args = parser.parse_args()
++
++    rows = load_result_rows(Path(args.fixed_results))
++    by_qid: dict[str, list[dict[str, Any]]] = defaultdict(list)
++    for row in rows:
++        if qid(row) != "None":
++            by_qid[qid(row)].append(row)
++
++    labels = []
++    for question_id, question_rows in sorted(by_qid.items()):
++        (
++            label,
++            oracle_correct,
++            cheapest_correct,
++            fastest,
++            num_correct,
++        ) = choose_label(question_rows, fallback=args.fallback)
++        if args.only_oracle_correct and not oracle_correct:
++            continue
++        labels.append(
++            row_for_training(
++                question_rows[0],
++                label_config=label,
++                oracle_correct=oracle_correct,
++                cheapest_correct_config=cheapest_correct,
++                fastest_config=fastest,
++                num_correct_configs=num_correct,
++            )
++        )
++
++    write_jsonl(labels, Path(args.output))
++    print(f"fixed rows: {len(rows)}")
++    print(f"questions: {len(by_qid)}")
++    print(f"labels written: {len(labels)}")
++    counts: dict[str, int] = defaultdict(int)
++    oracle_correct_count = 0
++    for row in labels:
++        counts[str(row["label_config"])] += 1
++        oracle_correct_count += int(bool(row["oracle_correct"]))
++    print(f"oracle-correct labels: {oracle_correct_count}")
++    print("label counts:")
++    for name in TIER_ORDER:
++        if counts.get(name):
++            print(f"  {name}: {counts[name]}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/conductor/experiments/scripts/build/build_resource_aware_schedule.py b/conductor/experiments/scripts/build/build_resource_aware_schedule.py
+index 01b0505..c4e77b2 100644
+--- a/conductor/experiments/scripts/build/build_resource_aware_schedule.py
++++ b/conductor/experiments/scripts/build/build_resource_aware_schedule.py
+@@ -3,10 +3,17 @@ from __future__ import annotations
+ import argparse
+ import json
+ import subprocess
++import sys
+ from pathlib import Path
+ from statistics import mean
+ from typing import Any
+ 
++ROOT = Path(__file__).resolve().parents[4]
++if str(ROOT) not in sys.path:
++    sys.path.insert(0, str(ROOT))
++
++from conductor.profiler.resource_aware_selector import ResourceAwareSelector
++
+ 
+ PARETO_CONFIGS = {
+     "budget2": {
+@@ -255,6 +262,7 @@ def schedule_row(
+     tier: str,
+     reason: str,
+     gpu_state: dict[str, Any],
++    selector_meta: dict[str, Any] | None = None,
+ ) -> dict[str, Any]:
+     config = dict(PARETO_CONFIGS[tier])
+     hard_query = is_hard_query(row)
+@@ -282,6 +290,7 @@ def schedule_row(
+         "scheduler_reason": reason,
+         "scheduler_query_class": query_class,
+         "scheduler_gpu_state": gpu_state,
++        "scheduler_selector_meta": selector_meta or {},
+         "probe_fps": config["probe_fps"],
+         "probe_topk": config["probe_topk"],
+         "window_len_s": config["window_len_s"],
+@@ -300,6 +309,13 @@ def main() -> None:
+     parser.add_argument("--dataset", required=True)
+     parser.add_argument("--output", required=True)
+     parser.add_argument("--force-tier", choices=TIER_ORDER)
++    parser.add_argument(
++        "--selector-model",
++        help=(
++            "Optional model from train_config_selector.py. "
++            "When set, learned per-question selection replaces keyword rules."
++        ),
++    )
+     parser.add_argument("--low-util-pct", type=float, default=35.0)
+     parser.add_argument("--high-util-pct", type=float, default=75.0)
+     parser.add_argument("--critical-util-pct", type=float, default=92.0)
+@@ -314,6 +330,11 @@ def main() -> None:
+ 
+     dataset = load_jsonl(Path(args.dataset))
+     gpu_state = query_gpu_state()
++    selector = (
++        ResourceAwareSelector.load(args.selector_model)
++        if args.selector_model and not args.force_tier
++        else None
++    )
+     base_tier = args.force_tier or base_tier_from_gpu(
+         gpu_state,
+         low_util_pct=args.low_util_pct,
+@@ -325,12 +346,32 @@ def main() -> None:
+     scheduled = []
+     counts: dict[str, int] = {}
+     for row in dataset:
+-        tier, reason = choose_tier(
+-            row,
+-            base_tier=base_tier,
+-            allow_hard_query_upgrade=not args.no_hard_query_upgrade,
+-            long_video_s=args.long_video_s,
+-        )
++        selector_meta: dict[str, Any] | None = None
++        if selector is not None:
++            tier, reason, selector_meta = selector.choose_config(
++                row,
++                gpu_state,
++            )
++            dur = duration_s(row)
++            if dur is not None and dur >= args.long_video_s:
++                capped = min(
++                    tier,
++                    "scan0.0039_k8_budget32",
++                    key=TIER_ORDER.index,
++                )
++                if capped != tier:
++                    reason = (
++                        f"{reason};long_video_downgrade "
++                        f"{tier}->{capped} duration_s={dur:.1f}"
++                    )
++                    tier = capped
++        else:
++            tier, reason = choose_tier(
++                row,
++                base_tier=base_tier,
++                allow_hard_query_upgrade=not args.no_hard_query_upgrade,
++                long_video_s=args.long_video_s,
++            )
+         counts[tier] = counts.get(tier, 0) + 1
+         scheduled.append(
+             schedule_row(
+@@ -338,6 +379,7 @@ def main() -> None:
+                 tier=tier,
+                 reason=reason,
+                 gpu_state=gpu_state,
++                selector_meta=selector_meta,
+             )
+         )
+ 
+@@ -356,6 +398,7 @@ def main() -> None:
+         ),
+     )
+     print(f"base_tier: {base_tier}")
++    print(f"selector_model: {args.selector_model or 'none'}")
+     print("selected configs:")
+     for name in TIER_ORDER:
+         if counts.get(name):
+diff --git a/conductor/experiments/scripts/run/run_resource_aware_fixed_policy.sh b/conductor/experiments/scripts/run/run_resource_aware_fixed_policy.sh
+index 33993bc..6601ec0 100755
+--- a/conductor/experiments/scripts/run/run_resource_aware_fixed_policy.sh
++++ b/conductor/experiments/scripts/run/run_resource_aware_fixed_policy.sh
+@@ -10,6 +10,7 @@ PORTS="${PORTS:-9000}"
+ CLIP_DEVICE="${CLIP_DEVICE:-cpu}"
+ MAX_EXAMPLES="${MAX_EXAMPLES:-}"
+ FORCE_TIER="${FORCE_TIER:-}"
++SELECTOR_MODEL="${SELECTOR_MODEL:-}"
+ NO_HARD_QUERY_UPGRADE="${NO_HARD_QUERY_UPGRADE:-0}"
+ 
+ mkdir -p "$OUT_DIR"
+@@ -30,6 +31,10 @@ if [ -n "$FORCE_TIER" ]; then
+   SCHEDULER_ARGS+=(--force-tier "$FORCE_TIER")
+ fi
+ 
++if [ -n "$SELECTOR_MODEL" ]; then
++  SCHEDULER_ARGS+=(--selector-model "$SELECTOR_MODEL")
++fi
++
+ if [ "$NO_HARD_QUERY_UPGRADE" = "1" ]; then
+   SCHEDULER_ARGS+=(--no-hard-query-upgrade)
+ fi
+diff --git a/conductor/experiments/scripts/train/train_config_selector.py b/conductor/experiments/scripts/train/train_config_selector.py
+new file mode 100644
+index 0000000..a614c69
+--- /dev/null
++++ b/conductor/experiments/scripts/train/train_config_selector.py
+@@ -0,0 +1,188 @@
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from collections import Counter, defaultdict
++from pathlib import Path
++from typing import Any
++
++ROOT = Path(__file__).resolve().parents[4]
++if str(ROOT) not in sys.path:
++    sys.path.insert(0, str(ROOT))
++
++from conductor.profiler.resource_aware_selector import (
++    TIER_ORDER,
++    ResourceAwareSelector,
++    train_nearest_centroid,
++)
++
++
++def load_jsonl(path: Path) -> list[dict[str, Any]]:
++    rows = []
++    with path.open() as handle:
++        for line in handle:
++            if line.strip():
++                rows.append(json.loads(line))
++    return rows
++
++
++def split_rows(
++    rows: list[dict[str, Any]],
++    *,
++    holdout_fraction: float,
++) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
++    if holdout_fraction <= 0:
++        return rows, []
++
++    train = []
++    holdout = []
++    by_dataset: dict[str, list[dict[str, Any]]] = defaultdict(list)
++    for row in rows:
++        by_dataset[str(row.get("dataset") or "UNKNOWN")].append(row)
++
++    for dataset_rows in by_dataset.values():
++        cutoff = max(1, int(round(len(dataset_rows) * holdout_fraction)))
++        holdout.extend(dataset_rows[:cutoff])
++        train.extend(dataset_rows[cutoff:])
++
++    if not train:
++        return rows, []
++    return train, holdout
++
++
++def evaluate(
++    selector: ResourceAwareSelector,
++    rows: list[dict[str, Any]],
++    *,
++    label_key: str,
++) -> dict[str, Any]:
++    total = 0
++    correct = 0
++    labels = Counter()
++    predictions = Counter()
++    confusion: dict[str, Counter[str]] = defaultdict(Counter)
++
++    for row in rows:
++        label = str(row.get(label_key) or "")
++        if label not in TIER_ORDER:
++            continue
++        pred, _meta = selector.predict_base_config(row)
++        total += 1
++        correct += int(pred == label)
++        labels[label] += 1
++        predictions[pred] += 1
++        confusion[label][pred] += 1
++
++    return {
++        "total": total,
++        "correct": correct,
++        "accuracy": correct / total if total else 0.0,
++        "labels": dict(labels),
++        "predictions": dict(predictions),
++        "confusion": {
++            label: dict(counts)
++            for label, counts in sorted(confusion.items())
++        },
++    }
++
++
++def print_eval(name: str, metrics: dict[str, Any]) -> None:
++    total = int(metrics["total"])
++    correct = int(metrics["correct"])
++    accuracy = float(metrics["accuracy"])
++    print(f"{name}: n={total} correct={correct} acc={100 * accuracy:.2f}%")
++    print("  labels:")
++    for label in TIER_ORDER:
++        count = metrics["labels"].get(label, 0)
++        if count:
++            print(f"    {label}: {count}")
++    print("  predictions:")
++    for label in TIER_ORDER:
++        count = metrics["predictions"].get(label, 0)
++        if count:
++            print(f"    {label}: {count}")
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--labels", required=True)
++    parser.add_argument("--model-out", required=True)
++    parser.add_argument("--label-key", default="label_config")
++    parser.add_argument(
++        "--holdout-fraction",
++        type=float,
++        default=0.0,
++        help="Optional per-dataset holdout fraction for a quick sanity check.",
++    )
++    parser.add_argument(
++        "--k-neighbors",
++        type=int,
++        default=7,
++        help="Number of nearest labeled questions to vote over.",
++    )
++    parser.add_argument(
++        "--metadata-out",
++        help="Optional JSON summary path for training/eval metadata.",
++    )
++    args = parser.parse_args()
++
++    rows = load_jsonl(Path(args.labels))
++    rows = [
++        row
++        for row in rows
++        if row.get(args.label_key) in TIER_ORDER
++    ]
++    if not rows:
++        raise SystemExit(
++            f"no rows have {args.label_key} in {', '.join(TIER_ORDER)}"
++        )
++
++    train_rows, holdout_rows = split_rows(
++        rows,
++        holdout_fraction=args.holdout_fraction,
++    )
++    selector = train_nearest_centroid(
++        train_rows,
++        label_key=args.label_key,
++        k_neighbors=args.k_neighbors,
++    )
++    selector.save(args.model_out)
++
++    train_metrics = evaluate(
++        selector,
++        train_rows,
++        label_key=args.label_key,
++    )
++    holdout_metrics = evaluate(
++        selector,
++        holdout_rows,
++        label_key=args.label_key,
++    )
++
++    print(f"labels: {args.labels}")
++    print(f"model: {args.model_out}")
++    print_eval("train", train_metrics)
++    if holdout_rows:
++        print_eval("holdout", holdout_metrics)
++
++    metadata = {
++        "labels": str(args.labels),
++        "model_out": str(args.model_out),
++        "label_key": args.label_key,
++        "holdout_fraction": args.holdout_fraction,
++        "k_neighbors": args.k_neighbors,
++        "training_examples": len(train_rows),
++        "holdout_examples": len(holdout_rows),
++        "train": train_metrics,
++        "holdout": holdout_metrics,
++        "model": selector.model,
++    }
++    if args.metadata_out:
++        path = Path(args.metadata_out)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/conductor/profiler/resource_aware_selector.py b/conductor/profiler/resource_aware_selector.py
+new file mode 100644
+index 0000000..584a793
+--- /dev/null
++++ b/conductor/profiler/resource_aware_selector.py
+@@ -0,0 +1,451 @@
++from __future__ import annotations
++
++import math
++import pickle
++import re
++import subprocess
++from collections import Counter, defaultdict
++from pathlib import Path
++from statistics import mean
++from typing import Any
++
++
++TIER_ORDER = [
++    "budget2",
++    "scan0.0039_k8_budget32",
++    "w4_k8_budget16",
++    "budget32",
++    "scan0.03125_k8_budget32",
++]
++
++
++CONFIG_TO_TIER = {
++    "budget2": "budget2",
++    "scan0.0039_k8_budget32": "scan0.0039_k8_budget32",
++    "w4_k8_budget16": "w4_k8_budget16",
++    "budget32": "budget32",
++    "scan0.03125_k8_budget32": "scan0.03125_k8_budget32",
++}
++
++
++QUESTION_TERMS = [
++    "after",
++    "before",
++    "compare",
++    "first",
++    "how",
++    "key",
++    "overall",
++    "pattern",
++    "primary",
++    "process",
++    "sequence",
++    "summarize",
++    "then",
++    "why",
++    "workflow",
++]
++
++
++def tier_index(config_name: str) -> int:
++    tier = CONFIG_TO_TIER.get(config_name, config_name)
++    if tier not in TIER_ORDER:
++        raise KeyError(f"unknown selector tier/config: {config_name}")
++    return TIER_ORDER.index(tier)
++
++
++def clamp_tier(config_name: str) -> str:
++    return CONFIG_TO_TIER.get(config_name, config_name)
++
++
++def upgrade_tier(config_name: str, steps: int = 1) -> str:
++    idx = tier_index(config_name)
++    return TIER_ORDER[min(len(TIER_ORDER) - 1, idx + steps)]
++
++
++def downgrade_tier(config_name: str, steps: int = 1) -> str:
++    idx = tier_index(config_name)
++    return TIER_ORDER[max(0, idx - steps)]
++
++
++def text_tokens(text: str) -> list[str]:
++    return re.findall(r"[a-z0-9]+", text.lower())
++
++
++def safe_float(value: Any, default: float = 0.0) -> float:
++    try:
++        if value is None:
++            return default
++        return float(value)
++    except (TypeError, ValueError):
++        return default
++
++
++def feature_names() -> list[str]:
++    names = [
++        "bias",
++        "duration_log",
++        "duration_short",
++        "duration_medium",
++        "duration_long",
++        "question_len_log",
++        "choice_count",
++        "avg_choice_len_log",
++        "dataset_egoschema",
++        "dataset_intentqa",
++        "dataset_nextqa",
++        "dataset_lvbench",
++        "dataset_vrbench",
++        "dataset_temporalbench",
++        "dataset_star",
++        "category_reasoning",
++        "category_temporal",
++        "category_sequence",
++        "category_process",
++    ]
++    names.extend(f"term_{term}" for term in QUESTION_TERMS)
++    return names
++
++
++def extract_features(row: dict[str, Any]) -> dict[str, float]:
++    question = str(row.get("question") or "")
++    tokens = text_tokens(question)
++    token_set = set(tokens)
++    choices = row.get("choices") or []
++    if not isinstance(choices, list):
++        choices = []
++
++    duration_s = safe_float(row.get("duration_s"))
++    dataset = str(row.get("dataset") or "").lower()
++    category = " ".join(
++        str(row.get(key) or "").lower()
++        for key in (
++            "question_category",
++            "topic_category",
++            "vimio_profile",
++            "reasoning_type",
++            "scheduler_query_class",
++        )
++    )
++
++    avg_choice_len = (
++        mean(len(text_tokens(str(choice))) for choice in choices)
++        if choices
++        else 0.0
++    )
++
++    feats = {
++        "bias": 1.0,
++        "duration_log": math.log1p(max(duration_s, 0.0)),
++        "duration_short": 1.0 if 0 < duration_s < 300 else 0.0,
++        "duration_medium": 1.0 if 300 <= duration_s < 1200 else 0.0,
++        "duration_long": 1.0 if duration_s >= 1200 else 0.0,
++        "question_len_log": math.log1p(len(tokens)),
++        "choice_count": float(len(choices)),
++        "avg_choice_len_log": math.log1p(avg_choice_len),
++        "dataset_egoschema": 1.0 if "egoschema" in dataset else 0.0,
++        "dataset_intentqa": 1.0 if "intent" in dataset else 0.0,
++        "dataset_nextqa": 1.0 if "next" in dataset else 0.0,
++        "dataset_lvbench": 1.0 if "lvbench" in dataset else 0.0,
++        "dataset_vrbench": 1.0 if "vrbench" in dataset else 0.0,
++        "dataset_temporalbench": 1.0 if "temporalbench" in dataset else 0.0,
++        "dataset_star": 1.0 if "star" in dataset else 0.0,
++        "category_reasoning": 1.0 if "reason" in category else 0.0,
++        "category_temporal": 1.0 if "temporal" in category else 0.0,
++        "category_sequence": 1.0 if "sequence" in category else 0.0,
++        "category_process": 1.0 if "process" in category else 0.0,
++    }
++
++    for term in QUESTION_TERMS:
++        feats[f"term_{term}"] = 1.0 if term in token_set else 0.0
++
++    return feats
++
++
++def vectorize(row: dict[str, Any], names: list[str] | None = None) -> list[float]:
++    names = names or feature_names()
++    feats = extract_features(row)
++    return [float(feats.get(name, 0.0)) for name in names]
++
++
++def fit_standardizer(vectors: list[list[float]]) -> tuple[list[float], list[float]]:
++    if not vectors:
++        raise ValueError("cannot fit selector with no training vectors")
++    cols = list(zip(*vectors))
++    means = [mean(col) for col in cols]
++    stds = []
++    for col, mu in zip(cols, means):
++        var = mean((x - mu) ** 2 for x in col)
++        stds.append(math.sqrt(var) or 1.0)
++    return means, stds
++
++
++def standardize(
++    vector: list[float],
++    means: list[float],
++    stds: list[float],
++) -> list[float]:
++    return [
++        (value - mu) / sd
++        for value, mu, sd in zip(vector, means, stds)
++    ]
++
++
++def euclidean(a: list[float], b: list[float]) -> float:
++    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
++
++
++class ResourceAwareSelector:
++    def __init__(self, model: dict[str, Any]):
++        self.model = model
++        self.features = list(model["features"])
++        self.means = list(model["means"])
++        self.stds = list(model["stds"])
++        self.centroids = {
++            label: list(values)
++            for label, values in model["centroids"].items()
++        }
++        self.examples = [
++            {
++                "label": str(example["label"]),
++                "vector": list(example["vector"]),
++            }
++            for example in model.get("examples", [])
++        ]
++        self.k_neighbors = int(model.get("k_neighbors") or 7)
++        self.priors = dict(model.get("priors") or {})
++        self.default_config = str(
++            model.get("default_config")
++            or "scan0.0039_k8_budget32"
++        )
++
++    @classmethod
++    def load(cls, path: str | Path) -> "ResourceAwareSelector":
++        with Path(path).open("rb") as handle:
++            return cls(pickle.load(handle))
++
++    def save(self, path: str | Path) -> None:
++        Path(path).parent.mkdir(parents=True, exist_ok=True)
++        with Path(path).open("wb") as handle:
++            pickle.dump(self.model, handle)
++
++    def predict_base_config(self, row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
++        if not self.centroids and not self.examples:
++            return self.default_config, {
++                "selector": "nearest_neighbor",
++                "fallback": "no_examples",
++            }
++
++        raw = vectorize(row, self.features)
++        vec = standardize(raw, self.means, self.stds)
++
++        if self.examples:
++            neighbors = []
++            for example in self.examples:
++                distance = euclidean(vec, example["vector"])
++                neighbors.append((distance, example["label"]))
++            neighbors.sort()
++
++            votes: dict[str, float] = defaultdict(float)
++            for distance, label in neighbors[: self.k_neighbors]:
++                votes[label] += 1.0 / (distance + 1e-6)
++            ranked = sorted(
++                votes.items(),
++                key=lambda item: (-item[1], tier_index(item[0])),
++            )
++            label = ranked[0][0]
++            return label, {
++                "selector": "nearest_neighbor",
++                "k_neighbors": self.k_neighbors,
++                "votes": [
++                    {"config": key, "score": value}
++                    for key, value in ranked
++                ],
++                "neighbors": [
++                    {"config": label, "distance": distance}
++                    for distance, label in neighbors[: self.k_neighbors]
++                ],
++            }
++
++        scored = []
++        for label, centroid in self.centroids.items():
++            distance = euclidean(vec, centroid)
++            prior = float(self.priors.get(label, 0.0))
++            scored.append((distance - 0.05 * prior, distance, label))
++        scored.sort()
++        _, distance, label = scored[0]
++        return label, {
++            "selector": "nearest_centroid",
++            "distance": distance,
++            "scores": [
++                {"config": label, "distance": dist}
++                for _, dist, label in scored[:5]
++            ],
++        }
++
++    def choose_config(
++        self,
++        row: dict[str, Any],
++        gpu_state: dict[str, Any] | None = None,
++    ) -> tuple[str, str, dict[str, Any]]:
++        predicted, meta = self.predict_base_config(row)
++        chosen, reason = apply_gpu_pressure(predicted, gpu_state or {})
++        if chosen != predicted:
++            reason = f"learned={predicted};{reason}"
++        else:
++            reason = f"learned={predicted};gpu_keep"
++        return chosen, reason, meta
++
++
++def train_nearest_centroid(
++    rows: list[dict[str, Any]],
++    *,
++    label_key: str = "label_config",
++    k_neighbors: int = 7,
++) -> ResourceAwareSelector:
++    names = feature_names()
++    training = [
++        row
++        for row in rows
++        if row.get(label_key) in TIER_ORDER
++    ]
++    if not training:
++        raise ValueError(
++            f"no rows with {label_key} in selector tier set"
++        )
++
++    labels = [str(row[label_key]) for row in training]
++    vectors = [vectorize(row, names) for row in training]
++    means, stds = fit_standardizer(vectors)
++    standardized = [
++        standardize(vector, means, stds)
++        for vector in vectors
++    ]
++
++    by_label: dict[str, list[list[float]]] = defaultdict(list)
++    for label, vector in zip(labels, standardized):
++        by_label[label].append(vector)
++
++    centroids = {}
++    for label, label_vectors in by_label.items():
++        cols = list(zip(*label_vectors))
++        centroids[label] = [mean(col) for col in cols]
++
++    counts = Counter(labels)
++    total = sum(counts.values())
++    priors = {
++        label: count / total
++        for label, count in counts.items()
++    }
++    default_config = counts.most_common(1)[0][0]
++
++    return ResourceAwareSelector(
++        {
++            "model_type": "nearest_centroid_config_selector",
++            "features": names,
++            "means": means,
++            "stds": stds,
++            "centroids": centroids,
++            "examples": [
++                {"label": label, "vector": vector}
++                for label, vector in zip(labels, standardized)
++            ],
++            "k_neighbors": k_neighbors,
++            "priors": priors,
++            "default_config": default_config,
++            "label_key": label_key,
++            "training_examples": len(training),
++            "label_counts": dict(counts),
++        }
++    )
++
++
++def query_gpu_state() -> dict[str, Any]:
++    try:
++        output = subprocess.check_output(
++            [
++                "nvidia-smi",
++                "--query-gpu=index,utilization.gpu,memory.used,memory.total",
++                "--format=csv,noheader,nounits",
++            ],
++            text=True,
++            stderr=subprocess.DEVNULL,
++        )
++    except Exception as exc:
++        return {
++            "available": False,
++            "error": repr(exc),
++            "avg_gpu_util_pct": None,
++            "avg_mem_used_pct": None,
++            "gpus": [],
++        }
++
++    gpus = []
++    for line in output.splitlines():
++        parts = [part.strip() for part in line.split(",")]
++        if len(parts) != 4:
++            continue
++        idx, util, mem_used, mem_total = parts
++        try:
++            mem_used_f = float(mem_used)
++            mem_total_f = float(mem_total)
++            gpus.append(
++                {
++                    "index": int(idx),
++                    "gpu_util_pct": float(util),
++                    "mem_used_mib": mem_used_f,
++                    "mem_total_mib": mem_total_f,
++                    "mem_used_pct": (
++                        100.0 * mem_used_f / mem_total_f
++                        if mem_total_f
++                        else 0.0
++                    ),
++                }
++            )
++        except ValueError:
++            continue
++
++    if not gpus:
++        return {
++            "available": False,
++            "error": "nvidia-smi returned no parseable GPUs",
++            "avg_gpu_util_pct": None,
++            "avg_mem_used_pct": None,
++            "gpus": [],
++        }
++
++    return {
++        "available": True,
++        "error": None,
++        "avg_gpu_util_pct": mean(gpu["gpu_util_pct"] for gpu in gpus),
++        "avg_mem_used_pct": mean(gpu["mem_used_pct"] for gpu in gpus),
++        "gpus": gpus,
++    }
++
++
++def apply_gpu_pressure(
++    config_name: str,
++    gpu_state: dict[str, Any],
++    *,
++    high_util_pct: float = 75.0,
++    critical_util_pct: float = 92.0,
++    high_mem_pct: float = 88.0,
++) -> tuple[str, str]:
++    config_name = clamp_tier(config_name)
++    if not gpu_state.get("available"):
++        return config_name, "gpu_unknown_keep"
++
++    util = safe_float(gpu_state.get("avg_gpu_util_pct"))
++    mem = safe_float(gpu_state.get("avg_mem_used_pct"))
++
++    if util >= critical_util_pct or mem >= high_mem_pct:
++        return "budget2", (
++            f"gpu_critical util={util:.1f} mem={mem:.1f}"
++        )
++    if util >= high_util_pct:
++        return min(
++            config_name,
++            "scan0.0039_k8_budget32",
++            key=tier_index,
++        ), f"gpu_high util={util:.1f} mem={mem:.1f}"
++    return config_name, f"gpu_ok util={util:.1f} mem={mem:.1f}"
+-- 
+2.25.1
+

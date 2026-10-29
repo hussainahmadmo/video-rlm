@@ -1,0 +1,149 @@
+From 26f15bec2aaaa14e750a82af2c64b350b59ab87b Mon Sep 17 00:00:00 2001
+From: Hussain Ahmad Mohammad <hussainahmad@heart.cs.uchicago.edu>
+Date: Sat, 19 Sep 2026 21:42:47 -0500
+Subject: [PATCH] Permit fair work-conserving lane borrowing
+
+---
+ analysis/run_joint_allocation_comparison.py   |  3 ++-
+ analysis/test_joint_preparation_allocation.py | 21 ++++++++++++++++
+ .../run/joint_preparation_allocation.py       | 25 ++++++++++++++++---
+ .../run/run_mixed_end_to_end_priority.py      |  5 +++-
+ 4 files changed, 48 insertions(+), 6 deletions(-)
+
+diff --git a/analysis/run_joint_allocation_comparison.py b/analysis/run_joint_allocation_comparison.py
+index ea8f335..8bdf6c4 100644
+--- a/analysis/run_joint_allocation_comparison.py
++++ b/analysis/run_joint_allocation_comparison.py
+@@ -283,7 +283,8 @@ def main():
+             ('efficient_full_conductor',['--prep-policy','prep_max_min',
+                                          '--joint-min-gpu-lanes','2',
+                                          '--joint-fairness-slack-s','5',
+-                                         '--joint-active-frontier'] + adaptive),
++                                         '--joint-active-frontier',
++                                         '--joint-fair-work-conserving-borrow'] + adaptive),
+         ]]
+     if args.cpu_placement_ablation:
+         adaptive = [
+diff --git a/analysis/test_joint_preparation_allocation.py b/analysis/test_joint_preparation_allocation.py
+index 600a408..23be267 100644
+--- a/analysis/test_joint_preparation_allocation.py
++++ b/analysis/test_joint_preparation_allocation.py
+@@ -184,6 +184,27 @@ class JointTest(unittest.TestCase):
+         )
+         self.assertEqual(decision['lanes'], 2)
+ 
++    def test_fair_borrowing_uses_all_lanes_for_a_least_served_tenant(self):
++        self.allocator.gpu_service['a'] = 8
++        selected, decision = self.choose(
++            [job('a', 0), job('b', 1)], min_gpu_lanes=2,
++            fair_work_conserving_borrow=True,
++        )
++        self.assertEqual(selected['tenant'], 'b')
++        self.assertEqual(decision['lanes'], 4)
++
++    def test_fair_borrowing_caps_an_ahead_tenant_selected_with_slack(self):
++        self.allocator.gpu_service['a'] = 4
++        selected, decision = self.allocator.choose(
++            [job('a', 0), job('b', 1)], [], 'cpu', 'gpu',
++            lambda j: 30,
++            lambda j, n: (1 if j['tenant'] == 'a' else 20) / n,
++            min_gpu_lanes=2, fairness_slack_s=2,
++            fair_work_conserving_borrow=True,
++        )
++        self.assertEqual(selected['tenant'], 'a')
++        self.assertEqual(decision['lanes'], 2)
++
+     def test_fairness_slack_prefers_shorter_feasible_work(self):
+         self.allocator.cpu_service['fast'] = 4
+         jobs = [job('slow', 0), job('fast', 1, 1)]
+diff --git a/conductor/experiments/scripts/run/joint_preparation_allocation.py b/conductor/experiments/scripts/run/joint_preparation_allocation.py
+index 729af8c..5676079 100644
+--- a/conductor/experiments/scripts/run/joint_preparation_allocation.py
++++ b/conductor/experiments/scripts/run/joint_preparation_allocation.py
+@@ -74,7 +74,8 @@ class JointPreparationAllocator:
+                cpu_limit=None, conservative_routing=False,
+                preferred_gpu_frame_threshold=32, switch_margin_s=0,
+                switch_margin_ratio=0, min_gpu_lanes=1,
+-               fairness_slack_s=0, initialize_active_frontier=False):
++               fairness_slack_s=0, initialize_active_frontier=False,
++               fair_work_conserving_borrow=False):
+         cpu_limit = self.cpu_capacity if cpu_limit is None else int(cpu_limit)
+         if (order not in ('fair', 'fcfs') or fixed_lanes < 0 or
+                 fixed_lanes > self.gpu_capacity or min_gpu_lanes < 1 or
+@@ -123,10 +124,24 @@ class JointPreparationAllocator:
+         available = self.gpu_capacity - used_lanes
+         if used_lanes > self.gpu_capacity or cpu_used > self.cpu_capacity:
+             raise RuntimeError('preparation allocation exceeds capacity')
+-        gpu_tenants = {str(job['tenant']) for job in jobs if self.gpu_eligible(job) and not light(job)}
++        def preferred_gpu_demand(job):
++            return (self.gpu_eligible(job) and not light(job) and
++                    (not conservative_routing or
++                     job['frame_count'] >= preferred_gpu_frame_threshold))
++        gpu_tenants = {str(job['tenant']) for job in jobs
++                       if preferred_gpu_demand(job)}
+         gpu_tenants.update(str(job['tenant']) for job in gpu_active)
+-        cap = (math.ceil(self.gpu_capacity / max(1, len(gpu_tenants)))
+-               if order == 'fair' else self.gpu_capacity)
++        fair_share_cap = (math.ceil(self.gpu_capacity / max(1, len(gpu_tenants)))
++                          if order == 'fair' else self.gpu_capacity)
++        def tenant_cap(tenant):
++            if order != 'fair' or not fair_work_conserving_borrow:
++                return fair_share_cap
++            tenant_score = self.score(tenant)
++            another_is_behind = any(
++                other != tenant and self.score(other) < tenant_score - 1e-9
++                for other in gpu_tenants
++            )
++            return fair_share_cap if another_is_behind else self.gpu_capacity
+         candidates = []
+         # FCFS chooses the oldest feasible request. A saturated GPU lane does
+         # not deliberately prevent CPU-routed work from using a free CPU slot.
+@@ -134,6 +149,7 @@ class JointPreparationAllocator:
+                       else list(oldest.values()))
+         for job in considered:
+             tenant = str(job['tenant'])
++            cap = tenant_cap(tenant)
+             heavy = self.gpu_eligible(job)
+             prefers_gpu = (job['modality'] == 'video' and
+                            job['frame_count'] >= preferred_gpu_frame_threshold)
+@@ -273,6 +289,7 @@ class JointPreparationAllocator:
+                     min_gpu_lanes=min_gpu_lanes,
+                     fairness_slack_s=fairness_slack_s,
+                     service_frontier=self.service_frontier,
++                    fair_work_conserving_borrow=fair_work_conserving_borrow,
+                 )
+         if not candidates:
+             return None
+diff --git a/conductor/experiments/scripts/run/run_mixed_end_to_end_priority.py b/conductor/experiments/scripts/run/run_mixed_end_to_end_priority.py
+index a963bb4..89a35ab 100644
+--- a/conductor/experiments/scripts/run/run_mixed_end_to_end_priority.py
++++ b/conductor/experiments/scripts/run/run_mixed_end_to_end_priority.py
+@@ -1178,6 +1178,8 @@ def main() -> None:
+                         help="Normalized-service window for readiness selection among nearly equal tenants")
+     parser.add_argument("--joint-active-frontier", action="store_true",
+                         help="Initialize tenants entering preparation at the active virtual-service frontier")
++    parser.add_argument("--joint-fair-work-conserving-borrow", action="store_true",
++                        help="Allow a tenant to borrow idle lanes unless another GPU tenant has less service")
+     parser.add_argument("--joint-fixed-routing", action="store_true")
+     parser.add_argument("--joint-conservative-routing", action="store_true",
+                         help="Use the calibrated static route unless an alternative wins by a confidence margin")
+@@ -1999,7 +2001,7 @@ def main() -> None:
+             return None
+ 
+         if args.prep_placement == "joint":
+-            choice = joint_allocator.choose([job for _, _, job in pending], list(prep_futures.values()), args.decode_backend, args.gpu_prep_backend, lambda job: backend_prep_estimate(job, args.decode_backend), gpu_lane_estimate, allow_gpu=len(vlm_futures) / (args.vlm_concurrency * len(ports)) < args.gpu_prep_inference_guard, order=args.joint_allocation_order, fixed_lanes=args.joint_fixed_lanes, fixed_routing=args.joint_fixed_routing, now_s=elapsed(), bypass_heavy=args.joint_bypass_heavy, profile_light_s=args.joint_profile_light_s, cpu_light_reserve=args.joint_cpu_light_reserve, light_bypass_age_s=args.joint_light_bypass_age_s, cpu_limit=current_prep_capacity, conservative_routing=args.joint_conservative_routing, preferred_gpu_frame_threshold=args.joint_preferred_gpu_frame_threshold, switch_margin_s=args.joint_switch_margin_s, switch_margin_ratio=args.joint_switch_margin_ratio, min_gpu_lanes=args.joint_min_gpu_lanes, fairness_slack_s=args.joint_fairness_slack_s, initialize_active_frontier=args.joint_active_frontier)
++            choice = joint_allocator.choose([job for _, _, job in pending], list(prep_futures.values()), args.decode_backend, args.gpu_prep_backend, lambda job: backend_prep_estimate(job, args.decode_backend), gpu_lane_estimate, allow_gpu=len(vlm_futures) / (args.vlm_concurrency * len(ports)) < args.gpu_prep_inference_guard, order=args.joint_allocation_order, fixed_lanes=args.joint_fixed_lanes, fixed_routing=args.joint_fixed_routing, now_s=elapsed(), bypass_heavy=args.joint_bypass_heavy, profile_light_s=args.joint_profile_light_s, cpu_light_reserve=args.joint_cpu_light_reserve, light_bypass_age_s=args.joint_light_bypass_age_s, cpu_limit=current_prep_capacity, conservative_routing=args.joint_conservative_routing, preferred_gpu_frame_threshold=args.joint_preferred_gpu_frame_threshold, switch_margin_s=args.joint_switch_margin_s, switch_margin_ratio=args.joint_switch_margin_ratio, min_gpu_lanes=args.joint_min_gpu_lanes, fairness_slack_s=args.joint_fairness_slack_s, initialize_active_frontier=args.joint_active_frontier, fair_work_conserving_borrow=args.joint_fair_work_conserving_borrow)
+             if choice is None:
+                 return None
+             selected, decision = choice
+@@ -2842,6 +2844,7 @@ def main() -> None:
+         "joint_min_gpu_lanes": args.joint_min_gpu_lanes,
+         "joint_fairness_slack_s": args.joint_fairness_slack_s,
+         "joint_active_frontier": args.joint_active_frontier,
++        "joint_fair_work_conserving_borrow": args.joint_fair_work_conserving_borrow,
+         "joint_service_frontier": joint_allocator.service_frontier,
+         "gpu_prep_fixed_cost_s": args.gpu_prep_fixed_cost_s,
+         "gpu_prep_seconds_per_frame": args.gpu_prep_seconds_per_frame,
+-- 
+2.25.1
+

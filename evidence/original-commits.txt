@@ -1,0 +1,19 @@
+a019e51f04defff56dd0554c56b623c4c5104e58
+Hussain Ahmad Mohammad <hussainahmad@heart.cs.uchicago.edu>
+2026-09-19T21:08:18-05:00
+Add bounded-lag efficient fairness policy
+
+26f15bec2aaaa14e750a82af2c64b350b59ab87b
+Hussain Ahmad Mohammad <hussainahmad@heart.cs.uchicago.edu>
+2026-09-19T21:42:47-05:00
+Permit fair work-conserving lane borrowing
+
+19099d94469d39aaa8b433783f3c76a2877f945f
+Hussain Ahmad Mohammad <hussainahmad@heart.cs.uchicago.edu>
+2026-08-15T23:56:01-05:00
+Add learned resource-aware config selector
+
+b7b2185b5b481b22cb7e46c22a5877a1261dbca5
+Hussain Ahmad Mohammad <hussainahmad@heart.cs.uchicago.edu>
+2026-09-20T01:31:19-05:00
+Add repeated CPU-GPU placement evaluation

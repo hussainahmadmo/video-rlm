@@ -1,0 +1,481 @@
+From b7b2185b5b481b22cb7e46c22a5877a1261dbca5 Mon Sep 17 00:00:00 2001
+From: Hussain Ahmad Mohammad <hussainahmad@heart.cs.uchicago.edu>
+Date: Sun, 20 Sep 2026 01:31:19 -0500
+Subject: [PATCH] Add repeated CPU-GPU placement evaluation
+
+---
+ 69f58e9744973ad74e35062f                      |   2 +-
+ .../analyze_cpu_placement_multiseed.py        | 220 ++++++++++++++++++
+ .../make_variable_frame_placement_trace.py    |  53 +++++
+ ...u_gpu_placement_l40s_multiseed_20260920.md |  78 +++++++
+ paper_context.md                              |  23 ++
+ .../run_cpu_placement_multiseed_l40s.sh       |  47 ++++
+ 6 files changed, 422 insertions(+), 1 deletion(-)
+ create mode 100755 conductor/experiments/scripts/analyze/analyze_cpu_placement_multiseed.py
+ create mode 100755 conductor/experiments/scripts/run/make_variable_frame_placement_trace.py
+ create mode 100644 docs/cpu_gpu_placement_l40s_multiseed_20260920.md
+ create mode 100755 scripts/runpod/run_cpu_placement_multiseed_l40s.sh
+
+diff --git a/69f58e9744973ad74e35062f b/69f58e9744973ad74e35062f
+index 598e773..ecfc2f6 160000
+--- a/69f58e9744973ad74e35062f
++++ b/69f58e9744973ad74e35062f
+@@ -1 +1 @@
+-Subproject commit 598e773435ddf5b9e816759afb4206199c633036
++Subproject commit ecfc2f602d3c33c347990097a7916bcd2ad67e86
+diff --git a/conductor/experiments/scripts/analyze/analyze_cpu_placement_multiseed.py b/conductor/experiments/scripts/analyze/analyze_cpu_placement_multiseed.py
+new file mode 100755
+index 0000000..a261b6a
+--- /dev/null
++++ b/conductor/experiments/scripts/analyze/analyze_cpu_placement_multiseed.py
+@@ -0,0 +1,220 @@
++#!/usr/bin/env python3
++"""Aggregate repeated CPU/GPU preparation-placement comparisons."""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import json
++import statistics
++from collections import defaultdict
++from pathlib import Path
++
++import matplotlib.pyplot as plt
++import numpy as np
++
++
++POLICIES = (
++    "cpu_only_same_pool",
++    "cpu_only_equal_slots",
++    "static_split_fcfs",
++    "adaptive_placement_fcfs",
++)
++LABELS = {
++    "cpu_only_same_pool": "CPU only\n(4 workers)",
++    "cpu_only_equal_slots": "CPU only\n(6 workers)",
++    "static_split_fcfs": "Static\nCPU/GPU",
++    "adaptive_placement_fcfs": "Adaptive\nCPU/GPU",
++}
++COLORS = {
++    "cpu_only_same_pool": "#9E9E9E",
++    "cpu_only_equal_slots": "#5F6368",
++    "static_split_fcfs": "#56B4E9",
++    "adaptive_placement_fcfs": "#0072B2",
++}
++
++
++def write_csv(path: Path, rows: list[dict]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open("w", newline="") as handle:
++        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
++        writer.writeheader()
++        writer.writerows(rows)
++
++
++def discover(root: Path) -> list[dict]:
++    rows = []
++    for path in sorted(root.glob("seed*/comparison.json")):
++        seed = int(path.parent.name[4:])
++        if not (path.parent / "COMPLETE").is_file():
++            raise SystemExit(f"incomplete seed: {path.parent}")
++        variants = {row["variant"]: row for row in json.loads(path.read_text())}
++        if set(variants) != set(POLICIES):
++            raise SystemExit(f"unexpected variants in {path}: {sorted(variants)}")
++        for policy in POLICIES:
++            source = variants[policy]
++            result = {
++                "seed": seed,
++                "policy": policy,
++                "mean_e2e_s": float(source["all"]["end_to_end_s"]["mean"]),
++                "median_e2e_s": float(source["all"]["end_to_end_s"]["median"]),
++                "p95_e2e_s": float(source["all"]["end_to_end_s"]["p95"]),
++                "throughput_qps": float(source["throughput_qps"]),
++            }
++            for frames in (1, 16, 128):
++                result[f"median_{frames}_frames_s"] = float(
++                    source["sizes"][f"{frames}_frames"]["end_to_end_s"]["median"]
++                )
++            rows.append(result)
++    seeds = sorted({row["seed"] for row in rows})
++    expected = {(seed, policy) for seed in seeds for policy in POLICIES}
++    observed = {(row["seed"], row["policy"]) for row in rows}
++    if len(seeds) < 3 or observed != expected:
++        raise SystemExit(f"incomplete matrix; seeds={seeds}, missing={sorted(expected-observed)}")
++    return rows
++
++
++def aggregate(rows: list[dict]) -> list[dict]:
++    fields = (
++        "mean_e2e_s",
++        "median_e2e_s",
++        "p95_e2e_s",
++        "throughput_qps",
++        "median_1_frames_s",
++        "median_16_frames_s",
++        "median_128_frames_s",
++    )
++    grouped = defaultdict(list)
++    for row in rows:
++        grouped[row["policy"]].append(row)
++    output = []
++    for policy in POLICIES:
++        group = sorted(grouped[policy], key=lambda row: row["seed"])
++        item = {"policy": policy, "runs": len(group)}
++        for field in fields:
++            values = [float(row[field]) for row in group]
++            item[f"{field}_mean"] = statistics.fmean(values)
++            item[f"{field}_std"] = statistics.stdev(values)
++        output.append(item)
++    return output
++
++
++def paired_changes(rows: list[dict]) -> dict:
++    by_key = {(row["seed"], row["policy"]): row for row in rows}
++    seeds = sorted({row["seed"] for row in rows})
++    output = {}
++    comparisons = {
++        "static_vs_equal_slot_cpu": ("static_split_fcfs", "cpu_only_equal_slots"),
++        "adaptive_vs_same_pool_cpu": ("adaptive_placement_fcfs", "cpu_only_same_pool"),
++        "adaptive_vs_equal_slot_cpu": ("adaptive_placement_fcfs", "cpu_only_equal_slots"),
++        "adaptive_vs_static": ("adaptive_placement_fcfs", "static_split_fcfs"),
++    }
++    for name, (candidate, baseline) in comparisons.items():
++        output[name] = {}
++        for field in ("mean_e2e_s", "median_e2e_s", "p95_e2e_s"):
++            values = [
++                100.0
++                * (
++                    1.0
++                    - by_key[(seed, candidate)][field]
++                    / by_key[(seed, baseline)][field]
++                )
++                for seed in seeds
++            ]
++            output[name][f"{field}_reduction_pct_mean"] = statistics.fmean(values)
++            output[name][f"{field}_reduction_pct_std"] = statistics.stdev(values)
++        throughput = [
++            100.0
++            * (
++                by_key[(seed, candidate)]["throughput_qps"]
++                / by_key[(seed, baseline)]["throughput_qps"]
++                - 1.0
++            )
++            for seed in seeds
++        ]
++        output[name]["throughput_gain_pct_mean"] = statistics.fmean(throughput)
++        output[name]["throughput_gain_pct_std"] = statistics.stdev(throughput)
++    return output
++
++
++def plot(aggregates: list[dict], output: Path) -> None:
++    lookup = {row["policy"]: row for row in aggregates}
++    fig, axes = plt.subplots(1, 2, figsize=(7.15, 2.85))
++
++    metrics = (("median_e2e_s", "Median"), ("p95_e2e_s", "p95"))
++    x = np.arange(len(metrics), dtype=float)
++    width = 0.19
++    for index, policy in enumerate(POLICIES):
++        means = [lookup[policy][f"{field}_mean"] for field, _ in metrics]
++        stds = [lookup[policy][f"{field}_std"] for field, _ in metrics]
++        axes[0].bar(
++            x + (index - 1.5) * width,
++            means,
++            width,
++            yerr=stds,
++            capsize=2,
++            color=COLORS[policy],
++            label=LABELS[policy].replace("\n", " "),
++        )
++    axes[0].set_xticks(x, [label for _, label in metrics])
++    axes[0].set_ylabel("End-to-end latency (s)")
++    axes[0].set_title("(a) Overall latency", fontweight="bold", fontsize=9.5)
++
++    frames = np.array([1, 16, 128])
++    positions = np.arange(len(frames), dtype=float)
++    for policy in POLICIES:
++        means = [lookup[policy][f"median_{frame}_frames_s_mean"] for frame in frames]
++        stds = [lookup[policy][f"median_{frame}_frames_s_std"] for frame in frames]
++        axes[1].errorbar(
++            positions,
++            means,
++            yerr=stds,
++            marker="o",
++            capsize=2,
++            linewidth=1.5,
++            color=COLORS[policy],
++            label=LABELS[policy].replace("\n", " "),
++        )
++    axes[1].set_xticks(positions, [str(frame) for frame in frames])
++    axes[1].set_xlabel("Input frames")
++    axes[1].set_ylabel("Median end-to-end latency (s)")
++    axes[1].set_title("(b) Latency by request size", fontweight="bold", fontsize=9.5)
++
++    for axis in axes:
++        axis.set_ylim(bottom=0)
++        axis.grid(axis="y", alpha=0.22)
++        axis.spines[["top", "right"]].set_visible(False)
++    handles, labels = axes[0].get_legend_handles_labels()
++    fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False, fontsize=7.5)
++    fig.tight_layout(rect=(0, 0, 1, 0.86), w_pad=1.4)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    fig.savefig(output.with_suffix(".pdf"), bbox_inches="tight")
++    fig.savefig(output.with_suffix(".png"), dpi=240, bbox_inches="tight")
++    plt.close(fig)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--input", type=Path, required=True)
++    parser.add_argument("--output", type=Path, required=True)
++    args = parser.parse_args()
++    runs = discover(args.input)
++    aggregates = aggregate(runs)
++    changes = paired_changes(runs)
++    write_csv(args.output.with_name(args.output.name + "_runs.csv"), runs)
++    write_csv(args.output.with_name(args.output.name + "_aggregate.csv"), aggregates)
++    args.output.with_name(args.output.name + "_paired_changes.json").write_text(
++        json.dumps(changes, indent=2) + "\n"
++    )
++    plot(aggregates, args.output)
++    for row in aggregates:
++        print(
++            f"{row['policy']:26s} mean={row['mean_e2e_s_mean']:.2f}s "
++            f"median={row['median_e2e_s_mean']:.2f}s p95={row['p95_e2e_s_mean']:.2f}s "
++            f"throughput={row['throughput_qps_mean']:.3f} req/s"
++        )
++    print(json.dumps(changes, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/conductor/experiments/scripts/run/make_variable_frame_placement_trace.py b/conductor/experiments/scripts/run/make_variable_frame_placement_trace.py
+new file mode 100755
+index 0000000..2db7ea3
+--- /dev/null
++++ b/conductor/experiments/scripts/run/make_variable_frame_placement_trace.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++"""Generate a matched variable-frame trace for preparation placement."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import random
++from pathlib import Path
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--video", type=Path, required=True)
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--seed", type=int, required=True)
++    parser.add_argument("--arrival-window-s", type=float, default=15.0)
++    args = parser.parse_args()
++    if not args.video.is_file():
++        raise SystemExit(f"video does not exist: {args.video}")
++    if args.arrival_window_s <= 0:
++        raise SystemExit("arrival window must be positive")
++
++    rng = random.Random(args.seed)
++    rows = []
++    for tenant in ("a", "b", "c"):
++        frame_counts = [1] * 5 + [16] * 10 + [128] * 5
++        rng.shuffle(frame_counts)
++        for index, frame_count in enumerate(frame_counts):
++            rows.append(
++                {
++                    "request_id": f"{tenant}-{index}",
++                    "qid": f"{tenant}-{index}",
++                    "tenant": tenant,
++                    "class": "background",
++                    "modality": "video",
++                    "video": str(args.video),
++                    "frame_count": frame_count,
++                    "max_tokens": 32,
++                    "arrival_s": rng.uniform(0.0, args.arrival_window_s),
++                    "priority": 0,
++                    "prompt_override": "Briefly describe the video.",
++                    "scenario": "variable_frame_placement",
++                }
++            )
++    rows.sort(key=lambda row: (float(row["arrival_s"]), str(row["request_id"])))
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    args.output.write_text("".join(json.dumps(row) + "\n" for row in rows))
++    print(f"wrote {len(rows)} requests to {args.output}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/docs/cpu_gpu_placement_l40s_multiseed_20260920.md b/docs/cpu_gpu_placement_l40s_multiseed_20260920.md
+new file mode 100644
+index 0000000..3153e5c
+--- /dev/null
++++ b/docs/cpu_gpu_placement_l40s_multiseed_20260920.md
+@@ -0,0 +1,78 @@
++# CPU/GPU preparation placement on L40S (2026-09-20)
++
++## Question
++
++Does using heterogeneous CPU/GPU preparation capacity improve end-to-end
++serving latency after matching the number of preparation slots, and does the
++current adaptive policy improve on a calibrated static split?
++
++## Isolation and workload
++
++The comparison holds tenant selection, inference admission, and GPU width
++fixed. All policies use FCFS at preparation and inference. GPU preparation uses
++the independently implemented FlashCodec-inspired shared-chunk backend with a
++fixed width of two decoder lanes.
++
++Each of three tenants submits five one-frame, ten 16-frame, and five 128-frame
++requests, for 60 requests per policy. Arrivals are independently randomized
++over 15 seconds for each of three seeds. Policy order rotates across seeds.
++Each seed starts a fresh model server and recalibrates complete preparation
++time for every frame count on CPU and at GPU widths one, two, and four.
++
++The four policies are:
++
++- CPU-only with four preparation workers;
++- CPU-only with six workers, matching the mixed policies' four CPU plus two GPU
++  preparation-job slots;
++- static CPU/GPU placement, sending one-/16-frame work to CPU and 128-frame work
++  to GPU;
++- adaptive CPU/GPU placement with four CPU and two GPU slots. It retains the
++  calibrated static route unless another option improves predicted readiness
++  by at least two seconds and 20%.
++
++All runs use Qwen2.5-VL-7B on one L40S, one repeated source video, four
++inference-submission slots, handoff capacity eight, and 32 output tokens. The
++experiment runs in the pod exposed on port 40526 and is pinned to logical CPUs
++0--7 on NUMA node 0. A separate placement-rate sweep runs in the port-32002 pod
++on NUMA node 1; both pods share the same physical server, so this separation
++reduces CPU interference but is not independent-host replication.
++
++## Results
++
++Values are means across three seeds; uncertainty is one sample standard
++deviation.
++
++| Policy | Mean E2E (s) | Median E2E (s) | p95 E2E (s) | Throughput (req/s) |
++|---|---:|---:|---:|---:|
++| CPU-only, 4 workers | 80.78 ± 8.25 | 76.66 ± 10.42 | 141.97 ± 5.07 | 0.336 ± 0.006 |
++| CPU-only, 6 workers | 57.13 ± 5.79 | 54.41 ± 6.96 | 103.89 ± 1.88 | 0.434 ± 0.016 |
++| Static CPU/GPU | 33.25 ± 2.64 | 30.40 ± 4.63 | 75.40 ± 3.85 | 0.595 ± 0.018 |
++| Adaptive CPU/GPU | 33.16 ± 3.23 | 30.46 ± 4.56 | 76.39 ± 1.14 | 0.571 ± 0.006 |
++
++Averaging paired per-seed ratios, static CPU/GPU placement lowers mean,
++median, and p95 E2E latency by 41.7%, 44.2%, and 27.4% relative to the
++six-worker equal-slot CPU baseline, while increasing throughput by 37.1%.
++Adaptive placement lowers those latency metrics by 41.9%, 44.1%, and 26.5%
++and increases throughput by 31.5%.
++
++Both mixed policies route all 45 one-frame requests and all 90 16-frame
++requests across the three seeds to CPU, and all 45 128-frame requests to GPU.
++Adaptive placement therefore does not improve on the calibrated static split
++in this balanced workload: relative to static, it changes mean E2E by -0.4%,
++median by +0.2%, p95 by +1.4%, and throughput by -4.0%. The defensible result
++is the benefit of heterogeneous CPU/GPU preparation capacity; a separate rate
++sweep tests whether adaptive placement helps when contention changes the
++fastest route.
++
++## Claim boundary
++
++This experiment can establish the benefit of adding and selecting heterogeneous
++preparation capacity relative to matched CPU-only capacity. If static and
++adaptive policies select the same routes, it does not establish an adaptive
++routing advantage. It uses one source video and one L40S; the independent
++arrival seeds and rotated order do not provide video or hardware generality.
++
++Raw artifacts are stored in
++`large_sweeps/cpu_placement_multiseed_l40s_20260920/`. Derived CSV files and the
++paper figure are produced by
++`conductor/experiments/scripts/analyze/analyze_cpu_placement_multiseed.py`.
+diff --git a/paper_context.md b/paper_context.md
+index e36f016..c5755f5 100644
+--- a/paper_context.md
++++ b/paper_context.md
+@@ -285,3 +285,26 @@ for that set rather than hardcoding one/two/four lanes. The evaluated L40S
+ configuration remains a four-lane budget with widths 1, 2, and 4; generality is
+ an implementation property, not evidence that other widths or capacities have
+ been performance-tested.
++
++## 2026-09-20 repeated L40S CPU/GPU placement result
++
++The three-seed comparison in
++`large_sweeps/cpu_placement_multiseed_l40s_20260920/` isolates preparation
++placement under FCFS selection and inference admission. Each run contains 60
++requests split evenly across three tenants, with 15 one-frame, 30 16-frame, and
++15 128-frame requests. Policy order rotates, calibration is repeated per seed,
++and the experiment is pinned to CPUs 0--7 on the L40S GPU's NUMA node.
++
++Relative to the six-worker equal-slot CPU-only baseline, adaptive CPU/GPU
++placement reduces median and p95 end-to-end latency by 44.1% and 26.5% and
++increases throughput by 31.5%, averaging paired per-seed ratios. Static placement
++reduces median and p95 by 44.2% and 27.4% and increases throughput by 37.1%.
++Both policies route every one-/16-frame request to CPU and every 128-frame
++request to GPU, so this result supports heterogeneous preparation placement but
++does not establish an adaptive-routing advantage. Exact results and limitations
++are in `docs/cpu_gpu_placement_l40s_multiseed_20260920.md`.
++
++The experiment ran in the pod exposed on port 40526 and completed. A separate
++placement-rate sweep remains assigned to the port-32002 pod. The pods use
++different L40S GPUs and NUMA nodes on the same physical host; this is resource
++separation rather than independent-host replication.
+diff --git a/scripts/runpod/run_cpu_placement_multiseed_l40s.sh b/scripts/runpod/run_cpu_placement_multiseed_l40s.sh
+new file mode 100755
+index 0000000..80e5ee1
+--- /dev/null
++++ b/scripts/runpod/run_cpu_placement_multiseed_l40s.sh
+@@ -0,0 +1,47 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT=${VIDEO_RLM_ROOT:-/workspace/video-rlm}
++PY=${VLLM_PYTHON:-/workspace/venvs/vllm-mm/bin/python}
++VIDEO=${VIDEO:-/workspace/data/kN88RP3XWUU.mp4}
++MODEL_PATH=${MODEL_PATH:?Set MODEL_PATH to the pinned Qwen2.5-VL-7B snapshot}
++OUT=${OUT:-/workspace/results/cpu_placement_multiseed_l40s_20260920}
++CPUSET=${CPUSET:-0-7}
++SEEDS=${SEEDS:-"1 2 3"}
++GENERATOR=$ROOT/conductor/experiments/scripts/run/make_variable_frame_placement_trace.py
++RUNNER=$ROOT/analysis/run_joint_allocation_comparison.py
++
++test -x "$PY"
++test -f "$VIDEO"
++test -d "$MODEL_PATH"
++test -f "$GENERATOR"
++test -f "$RUNNER"
++test ! -e "$OUT/COMPLETE"
++mkdir -p "$OUT/traces" "$OUT/logs"
++
++for seed in $SEEDS; do
++  trace="$OUT/traces/seed${seed}.jsonl"
++  run_out="$OUT/seed${seed}"
++  log="$OUT/logs/seed${seed}.log"
++  if [[ -f "$run_out/COMPLETE" ]]; then
++    echo "SKIP seed=$seed"
++    continue
++  fi
++  "$PY" "$GENERATOR" --video "$VIDEO" --output "$trace" --seed "$seed"
++  [[ ! -e "$run_out" ]] || mv "$run_out" "${run_out}.partial_$(date -u +%Y%m%d_%H%M%S)"
++  echo "START seed=$seed rotation=$(( (seed - 1) % 4 )) $(date -u +%FT%TZ)"
++  VIDEO_RLM_ROOT="$ROOT" VIDEO_RLM_MODEL_SNAPSHOT="$MODEL_PATH" \
++    VIDEO_RLM_SOURCE_VIDEO="$VIDEO" VIDEO_RLM_NVDEC_GPU_ID=0 \
++    MPLCONFIGDIR="$OUT/matplotlib" \
++    taskset -c "$CPUSET" "$PY" "$RUNNER" \
++      --output "$run_out" --arrival-trace "$trace" --video "$VIDEO" \
++      --model-snapshot "$MODEL_PATH" --gpu 0 --cpu-workers 4 \
++      --max-cpu-workers 6 --gpu-backend flashstyle_nvdec \
++      --cpu-placement-ablation --adaptive-all-frame-counts \
++      --conservative-placement --policy-order-rotation "$(( (seed - 1) % 4 ))" \
++      >"$log" 2>&1
++  echo "DONE seed=$seed $(date -u +%FT%TZ)"
++done
++
++touch "$OUT/COMPLETE"
++echo "CPU_PLACEMENT_MULTISEED_COMPLETE OUT=$OUT"
+-- 
+2.25.1
+
